@@ -1,149 +1,154 @@
-<div align="center">
+# vchord
 
-# VectorChord
+[![Website: vchord.pgsty.com](https://img.shields.io/badge/Website-vchord.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://vchord.pgsty.com/)
+[![Docs: vchord](https://img.shields.io/badge/Docs-vchord-slategray?style=flat)](https://vchord.pgsty.com/docs/)
+[![PGEXT: vchord](https://img.shields.io/badge/PGEXT-vchord-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
+[![Pigsty: vchord](https://img.shields.io/badge/Pigsty-vchord-slategray?style=flat)](https://pigsty.io/ext/e/vchord)
+[![Version: v1.1.1](https://img.shields.io/badge/Version-v1.1.1-slategray?style=flat)](https://github.com/pgsty/vchord/releases)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](https://github.com/pgsty/vchord/blob/main/LICENSE)
+[![GitHub Stars](https://img.shields.io/github/stars/pgsty/vchord?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/vchord&Date)
+[![PostgreSQL: 14-18](https://img.shields.io/badge/PostgreSQL-14--18-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
 
-**Ready for the Billion-Scale Era. Host 100M vectors on a single i4i.xlarge ($247/mo) and [scale seamlessly to 1B+](https://blog.vectorchord.ai/scaling-vector-search-to-1-billion-on-postgresql).**
+**`vchord`** is a PostgreSQL extension engineered for scalable, high-performance, and disk-friendly vector similarity search, serving as the successor to `pgvecto.rs`.
 
-[Official Site][official-site-link] · [Blog][blog-link] · [Docs][docs-link] · [Feedback][github-issues-link] · [Contact Us][email-link]
+[Website](https://vchord.pgsty.com/) | [Documentation](https://vchord.pgsty.com/docs/) | [vchord_bm25](https://github.com/pgsty/vchord_bm25) | [pg_tokenizer](https://github.com/pgsty/pg_tokenizer) | [Blog](https://vchord.pgsty.com/blog/) | [PGEXT](https://pgext.cloud/ext/vchord) | [Pigsty](https://pigsty.io/ext/e/vchord) ([中文](https://pigsty.cc/ext/e/vchord)) | [Releases](https://github.com/pgsty/vchord/releases) | [Issues](https://github.com/pgsty/vchord/issues)
 
-[![][github-release-shield]][github-release-link]
-[![][docker-release-shield]][docker-release-link]
-[![][docker-pulls-shield]][docker-pulls-link]
-[![][ghcr-release-shield]][ghcr-release-link]
-[![][github-downloads-shield]][github-downloads-link]
-[![][discord-shield]][discord-link]
-[![][X-shield]][X-link]
-[![][deepwiki-shield]][deepwiki-link]
-[![][license-1-shield]][license-1-link]
+---
 
-</div>
+To store vectors compactly while preserving recall, `vchord` combines **RaBitQ**[^1] quantization with inverted-file (`vchordrq`) and single-layer graph (`vchordg`) indexes plus in-database reranking. It stores up to 400,000 vectors per $1—roughly 6x more vectors per dollar than Pinecone's storage-optimized tier and 26x more than in-memory `pgvector` / `pgvecto.rs` HNSW indexes.
 
-VectorChord (vchord) is a PostgreSQL extension engineered for scalable, high-performance, and cost-effective vector search.
+![vchord Cost and Performance Comparison](https://github.com/user-attachments/assets/2d985f1e-7093-4c3a-8bf3-9f0b92c0e7e7)
 
-To efficiently store vectors while preserving search quality, VectorChord applies RaBitQ[^1] compression together with autonomous reranking. With VectorChord, you can store 400,000 vectors for just $1, enabling significant savings: 6x more vectors compared to Pinecone's optimized storage and 26x more than pgvector/pgvecto.rs for the same price.
+[^1]: Gao, Jianyang, and Cheng Long. "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search." *Proceedings of the ACM on Management of Data* 2.3 (2024): 1–27.
 
-[^1]: Gao, Jianyang, and Cheng Long. "RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search." Proceedings of the ACM on Management of Data 2.3 (2024): 1-27.
+---
 
-![][image-compare]
+## Vchord Suite
+
+`vchord` is the core extension of the **Vchord** family maintained by [PGSTY](https://pgsty.com):
+
+- **[`vchord`](https://github.com/pgsty/vchord)** ([`pgsty/vchord`](https://github.com/pgsty/vchord) · [PGEXT](https://pgext.cloud/ext/vchord) · [Pigsty](https://pigsty.io/ext/e/vchord)): Scalable, high-performance, and disk-friendly vector similarity search (`vchordrq` & `vchordg`).
+- **[`vchord_bm25`](https://github.com/pgsty/vchord_bm25)** ([`pgsty/vchord_bm25`](https://github.com/pgsty/vchord_bm25) · [PGEXT](https://pgext.cloud/ext/vchord_bm25) · [Pigsty](https://pigsty.io/ext/e/vchord_bm25)): Native BM25 full-text ranking index (`Block-WeakAnd`).
+- **[`pg_tokenizer`](https://github.com/pgsty/pg_tokenizer)** ([`pgsty/pg_tokenizer`](https://github.com/pgsty/pg_tokenizer) · [PGEXT](https://pgext.cloud/ext/pg_tokenizer) · [Pigsty](https://pigsty.io/ext/e/pg_tokenizer)): Standalone multilingual text analyzer and vocabulary tokenizer.
+
+---
 
 ## Features
 
-VectorChord introduces remarkable enhancements over pgvecto.rs and pgvector:
+- **Cost-Effective Storage**: Host 100M × 768-dim vectors on a single AWS `i4i.xlarge` ($247/mo)[^2], or [scale to 1B × 96-dim vectors](https://vchord.pgsty.com/blog/post/scaling-vector-search-to-1-billion-on-postgresql/) on an `i7ie.6xlarge` ($2,246/mo)[^3] by keeping only compact centroids in RAM and streaming quantized lists from NVMe SSD.
+- **Fast Index Construction**: Build a 100M-vector index in ~20 minutes using [hierarchical K-means](https://vchord.pgsty.com/docs/usage/partitioning-tuning/#hierarchical-k-means)[^4] or [external index precomputation](https://vchord.pgsty.com/docs/usage/external-build/).
+- **Bounded Memory Growth**: Control index build memory via [dimensionality reduction and sampling](https://vchord.pgsty.com/docs/usage/partitioning-tuning/#reduce-sampling-factor)[^5], enabling billion-scale index builds on 128 GB RAM nodes.
+- **Drop-In `pgvector` Compatibility**: Directly indexes `pgvector` data types (`vector`, `halfvec`) and supports standard distance operators (`<->`, `<#>`, `<=>`) alongside multi-vector MaxSim (`@#`) retrieval.
+- **Native Low-Bit Quantization Types**: Provides [native 4-bit (`rabitq4`) and 8-bit (`rabitq8`) vector types](https://vchord.pgsty.com/docs/usage/quantization-types/) with <1% recall loss on `rabitq8`.
 
-**💰 Affordable Vector Search**: Host 100M × 768-dimensional vectors → AWS i4i.xlarge ($247/month)[^2], host 1B × 96-dimensional vectors → i7ie.6xlarge ($2246/month)[^3], helping you keep infrastructure costs down while maintaining competitive search quality.
+[^2]: See [Store 400k Vectors for $1 in PostgreSQL](https://vchord.pgsty.com/blog/post/vectorchord-store-400k-vectors-for-1-in-postgresql/).
+[^3]: See [Scaling Vector Search to 1 Billion on PostgreSQL](https://vchord.pgsty.com/blog/post/scaling-vector-search-to-1-billion-on-postgresql/).
+[^4]: See [How We Made 100M Vector Indexing in 20 Minutes Possible on PostgreSQL](https://vchord.pgsty.com/blog/post/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql/#hierarchical-k-means) and [Partitioning Tuning](https://vchord.pgsty.com/docs/usage/partitioning-tuning/#hierarchical-k-means).
+[^5]: See [Dimensionality Reduction](https://vchord.pgsty.com/blog/post/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql/#dimensionality-reduction) and [Sampling Factor Tuning](https://vchord.pgsty.com/docs/usage/partitioning-tuning/#reduce-sampling-factor).
 
-[^2]: Please check out our [blog post](https://blog.vectorchord.ai/vectorchord-store-400k-vectors-for-1-in-postgresql) for more details.
-[^3]: Please check out our [blog post](https://blog.vectorchord.ai/scaling-vector-search-to-1-billion-on-postgresql) for more details.
-
-**⚡ Accelerated Index Build**: Index 100 million vectors in just 20 minutes. Powered by hierarchical K-means and highly optimized disk operations, VectorChord eliminates the bottleneck of vector indexing on a single machine with limited hardware resources.
-
-[^4]: Please check out our [blog post](https://blog.vectorchord.ai/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql#heading-hierarchical-k-means) for more technique details and [document](https://docs.vectorchord.ai/vectorchord/usage/partitioning-tuning.html#hierarchical-k-means) for usages.
-
-**📈 Smoothly Scale Up**: Scale with confidence as your data grows. Through dimensionality reduction and sampling[^5], VectorChord effectively controls memory growth, enabling 1B-vector indexes to be built on machines with 128GB of memory in practice.
-
-[^5]: Please check out our [blog post](https://blog.vectorchord.ai/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql#heading-dimensionality-reduction) for more technique details and [document](https://docs.vectorchord.ai/vectorchord/usage/partitioning-tuning.html#reduce-sampling-factor) for usages.
-
-**🔌 Seamless Integration**: Fully compatible with pgvector data types and syntax while providing optimal defaults out of the box - no complex parameter tuning needed. Just drop in VectorChord for enhanced experience.
-
-**💾 Efficient Storage with Low-Bit Data type**: Drastically reduce storage costs with our [native 4-bit (RaBitQ4) and 8-bit (RaBitQ8) vector types](https://docs.vectorchord.ai/vectorchord/usage/quantization-types.html). Achieve massive space savings without compromising search quality—RaBitQ8 maintains high precision with <1% recall loss.
+---
 
 ## Quick Start
 
-For new users, we recommend using the Docker image to get started quickly. If you do not prefer Docker, please read [installation guide](https://docs.vectorchord.ai/vectorchord/getting-started/installation.html) for other installation methods.
+For full setup instructions (Debian/Ubuntu packages, PGXN, Kubernetes, and source builds), see the [Installation Guide](https://vchord.pgsty.com/docs/getting-started/installation/).
+
+### 1. Install via Native Linux Packages ([`pig`](https://pig.pgsty.com/))
+
+On EL 8/9/10, Debian 12/13, and Ubuntu 22.04/24.04 (PostgreSQL 14–18), you can install pre-built native packages from the [Pigsty repository](https://pigsty.io/ext/e/vchord) (see package matrix on [pgext.cloud](https://pgext.cloud/ext/vchord)):
+
+```bash
+curl -fsSL https://repo.pigsty.io/pig | bash
+pig repo add pgsql -u
+pig ext add vchord
+```
+
+Then add `vchord` to `shared_preload_libraries` and restart PostgreSQL:
+
+```bash
+psql -U postgres -c 'ALTER SYSTEM SET shared_preload_libraries = "vchord"'
+sudo systemctl restart postgresql
+```
+
+### 2. Run with Docker
+
+To spin up a ready-to-use PostgreSQL 18 container with `vchord` preloaded:
 
 ```bash
 docker run \
-  --name vectorchord-demo \
+  --name vchord-demo \
   -e POSTGRES_PASSWORD=mysecretpassword \
   -p 5432:5432 \
   -d ghcr.io/tensorchord/vchord-postgres:pg18-v1.1.1
 ```
 
 > [!NOTE]
-> In addition to the base image with the VectorChord extension, we provide an all-in-one image, `tensorchord/vchord-suite:pg17-latest`. This comprehensive image includes all official TensorChord extensions, including `VectorChord`, `VectorChord-bm25` and `pg_tokenizer.rs` . Developers should select an image tag that is compatible with their extension's version, as indicated in [the support matrix](https://github.com/tensorchord/VectorChord-images?tab=readme-ov-file#support-matrix).
+> For hybrid vector + full-text search, use the all-in-one [`tensorchord/vchord-suite:pg18-latest`](https://vchord.pgsty.com/docs/getting-started/vectorchord-suite/) image, which bundles [`vchord`](https://github.com/pgsty/vchord), [`vchord_bm25`](https://github.com/pgsty/vchord_bm25), and [`pg_tokenizer`](https://github.com/pgsty/pg_tokenizer).
 
-Then you can connect to the database using the `psql` command line tool. The default username is `postgres`, and the default password is `mysecretpassword`.
+Connect to the instance with `psql`:
 
 ```bash
 psql -h localhost -p 5432 -U postgres
 ```
 
-Now you can play with VectorChord!
+### 3. Basic SQL Usage
 
-VectorChord depends on pgvector, including the vector representation. Since you can use them directly, your application can be easily migrated without pain!
+Enable the extension (this automatically enables `pgvector` as well):
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vchord CASCADE;
 ```
 
-Similar to pgvector, you can create a table with vector column and insert some rows to it.
+Create a table with a `vector` column and insert sample data:
 
 ```sql
 CREATE TABLE items (id bigserial PRIMARY KEY, embedding vector(3));
-INSERT INTO items (embedding) SELECT ARRAY[random(), random(), random()]::real[] FROM generate_series(1, 1000);
+
+INSERT INTO items (embedding)
+SELECT ARRAY[random(), random(), random()]::real[]
+FROM generate_series(1, 1000);
 ```
 
-With VectorChord, you can create `vchordrq` indexes.
+Build a `vchordrq` index and run a nearest-neighbor query:
 
-```SQL
+```sql
 CREATE INDEX ON items USING vchordrq (embedding vector_l2_ops);
+
+SELECT * FROM items ORDER BY embedding <-> '[3, 1, 2]' LIMIT 5;
 ```
 
-And then perform a vector search using `SELECT ... ORDER BY ... LIMIT ...`.
+---
 
-```SQL
-SELECT * FROM items ORDER BY embedding <-> '[3,1,2]' LIMIT 5;
-```
+## Documentation
 
-For more usage, please read:
+Full documentation is available at **[vchord.pgsty.com/docs](https://vchord.pgsty.com/docs/)**:
 
-- [Indexing](https://docs.vectorchord.ai/vectorchord/usage/indexing.html)
-- [Multi-Vector Retrieval](https://docs.vectorchord.ai/vectorchord/usage/indexing-with-maxsim-operators.html)
-- [Quantization Types](https://docs.vectorchord.ai/vectorchord/usage/quantization-types.html)
-- [Graph Index](https://docs.vectorchord.ai/vectorchord/usage/graph-index.html)
-- [Quantization Types](https://docs.vectorchord.ai/vectorchord/usage/quantization-types.html)
-- [Similarity Filter](https://docs.vectorchord.ai/vectorchord/usage/range-query.html)
-- [PostgreSQL Tuning](https://docs.vectorchord.ai/vectorchord/usage/performance-tuning.html)
-- [Monitoring](https://docs.vectorchord.ai/vectorchord/usage/monitoring.html)
-- [Fallback Parameters](https://docs.vectorchord.ai/vectorchord/usage/fallback-parameters.html)
-- [Measure Recall](https://docs.vectorchord.ai/vectorchord/usage/measure-recall.html)
-- [Prewarm](https://docs.vectorchord.ai/vectorchord/usage/prewarm.html)
-- [Prefilter](https://docs.vectorchord.ai/vectorchord/usage/prefilter.html)
-- [Prefetch](https://docs.vectorchord.ai/vectorchord/usage/prefetch.html)
-- [Rerank in Table](https://docs.vectorchord.ai/vectorchord/usage/rerank-in-table.html)
-- [Partitioning Tuning](https://docs.vectorchord.ai/vectorchord/usage/partitioning-tuning.html)
-- [External Build](https://docs.vectorchord.ai/vectorchord/usage/external-index-precomputation.html)
+- **Getting Started**
+  - [Overview](https://vchord.pgsty.com/docs/getting-started/overview/)
+  - [Installation](https://vchord.pgsty.com/docs/getting-started/installation/)
+  - [Vchord Suite](https://vchord.pgsty.com/docs/getting-started/vectorchord-suite/)
+- **Indexing & Querying**
+  - [Indexing (`vchordrq`)](https://vchord.pgsty.com/docs/usage/indexing/)
+  - [Graph Index (`vchordg`)](https://vchord.pgsty.com/docs/usage/graph-index/)
+  - [Quantization Types (`rabitq4` / `rabitq8`)](https://vchord.pgsty.com/docs/usage/quantization-types/)
+  - [Multi-Vector Retrieval (MaxSim)](https://vchord.pgsty.com/docs/usage/multi-vector-retrieval/)
+  - [Similarity Filter (Range Query)](https://vchord.pgsty.com/docs/usage/similarity-filter/)
+  - [Prefilter](https://vchord.pgsty.com/docs/usage/prefilter/) & [Rerank in Table](https://vchord.pgsty.com/docs/usage/rerank-in-table/)
+- **Tuning & Operations**
+  - [Partitioning Tuning](https://vchord.pgsty.com/docs/usage/partitioning-tuning/)
+  - [External Index Build](https://vchord.pgsty.com/docs/usage/external-build/)
+  - [PostgreSQL Tuning](https://vchord.pgsty.com/docs/usage/postgresql-tuning/)
+  - [Prewarm](https://vchord.pgsty.com/docs/usage/prewarm/) & [Prefetch](https://vchord.pgsty.com/docs/usage/prefetch/)
+  - [Monitoring](https://vchord.pgsty.com/docs/usage/monitoring/), [Measure Recall](https://vchord.pgsty.com/docs/usage/measure-recall/), & [Fallback Parameters](https://vchord.pgsty.com/docs/usage/fallback-parameters/)
+- **Benchmarks & Use Cases**
+  - [Performance](https://vchord.pgsty.com/docs/benchmark/performance/) & [Price Benchmarks](https://vchord.pgsty.com/docs/benchmark/price/)
+  - [Hybrid Search](https://vchord.pgsty.com/docs/use-case/hybrid-search/) & [ColBERT Rerank](https://vchord.pgsty.com/docs/use-case/colbert-rerank/)
+
+---
 
 ## License
 
-This program is free software: you can redistribute it and/or modify it under the terms of the **GNU Affero General Public License v3.0 (AGPL-3.0-only)**. See [LICENSE](LICENSE) for details.
+This software is licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**. You may use, modify, and distribute this software under the terms of the [AGPLv3](LICENSE).
 
-[cost-estimation]: https://github.com/user-attachments/assets/168fe550-6465-4eee-a224-8c848c301e3d
-[image-compare]: https://github.com/user-attachments/assets/2d985f1e-7093-4c3a-8bf3-9f0b92c0e7e7
-[license-1-link]: https://github.com/tensorchord/VectorChord#license
-[license-1-shield]: https://img.shields.io/badge/License-AGPLv3-green?logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI0IiBoZWlnaHQ9IjI0IiBmaWxsPSIjZmZmZmZmIj48cGF0aCBmaWxsLXJ1bGU9ImV2ZW5vZGQiIGQ9Ik0xMi43NSAyLjc1YS43NS43NSAwIDAwLTEuNSAwVjQuNUg5LjI3NmExLjc1IDEuNzUgMCAwMC0uOTg1LjMwM0w2LjU5NiA1Ljk1N0EuMjUuMjUgMCAwMTYuNDU1IDZIMi4zNTNhLjc1Ljc1IDAgMTAwIDEuNUgzLjkzTC41NjMgMTUuMThhLjc2Mi43NjIgMCAwMC4yMS44OGMuMDguMDY0LjE2MS4xMjUuMzA5LjIyMS4xODYuMTIxLjQ1Mi4yNzguNzkyLjQzMy42OC4zMTEgMS42NjIuNjIgMi44NzYuNjJhNi45MTkgNi45MTkgMCAwMDIuODc2LS42MmMuMzQtLjE1NS42MDYtLjMxMi43OTItLjQzMy4xNS0uMDk3LjIzLS4xNTguMzEtLjIyM2EuNzUuNzUgMCAwMC4yMDktLjg3OEw1LjU2OSA3LjVoLjg4NmMuMzUxIDAgLjY5NC0uMTA2Ljk4NC0uMzAzbDEuNjk2LTEuMTU0QS4yNS4yNSAwIDAxOS4yNzUgNmgxLjk3NXYxNC41SDYuNzYzYS43NS43NSAwIDAwMCAxLjVoMTAuNDc0YS43NS43NSAwIDAwMC0xLjVIMTIuNzVWNmgxLjk3NGMuMDUgMCAuMS4wMTUuMTQuMDQzbDEuNjk3IDEuMTU0Yy4yOS4xOTcuNjMzLjMwMy45ODQuMzAzaC44ODZsLTMuMzY4IDcuNjhhLjc1Ljc1IDAgMDAuMjMuODk2Yy4wMTIuMDA5IDAgMCAuMDAyIDBhMy4xNTQgMy4xNTQgMCAwMC4zMS4yMDZjLjE4NS4xMTIuNDUuMjU2Ljc5LjRhNy4zNDMgNy4zNDMgMCAwMDIuODU1LjU2OCA3LjM0MyA3LjM0MyAwIDAwMi44NTYtLjU2OWMuMzM4LS4xNDMuNjA0LS4yODcuNzktLjM5OWEzLjUgMy41IDAgMDAuMzEtLjIwNi43NS43NSAwIDAwLjIzLS44OTZMMjAuMDcgNy41aDEuNTc4YS43NS43NSAwIDAwMC0xLjVoLTQuMTAyYS4yNS4yNSAwIDAxLS4xNC0uMDQzbC0xLjY5Ny0xLjE1NGExLjc1IDEuNzUgMCAwMC0uOTg0LS4zMDNIMTIuNzVWMi43NXpNMi4xOTMgMTUuMTk4YTUuNDE4IDUuNDE4IDAgMDAyLjU1Ny42MzUgNS40MTggNS40MTggMCAwMDIuNTU3LS42MzVMNC43NSA5LjM2OGwtMi41NTcgNS44M3ptMTQuNTEtLjAyNGMuMDgyLjA0LjE3NC4wODMuMjc1LjEyNi41My4yMjMgMS4zMDUuNDUgMi4yNzIuNDVhNS44NDYgNS44NDYgMCAwMDIuNTQ3LS41NzZMMTkuMjUgOS4zNjdsLTIuNTQ3IDUuODA3eiI+PC9wYXRoPjwvc3ZnPgo=
-
-[docker-release-link]: https://hub.docker.com/r/tensorchord/vchord-postgres
-[docker-release-shield]: https://img.shields.io/docker/v/tensorchord/vchord-postgres?color=369eff&label=docker&labelColor=black&logo=docker&logoColor=white&style=flat
-[github-release-link]: https://github.com/tensorchord/VectorChord/releases
-[github-release-shield]: https://img.shields.io/github/v/release/tensorchord/VectorChord?color=369eff&labelColor=black&logo=github&style=flat
-[ghcr-release-link]: https://github.com/orgs/tensorchord/packages/container/package/vchord-postgres
-<!-- GHCR badge is not supported by shields.io yet, use docker badge instead -->
-[ghcr-release-shield]: https://img.shields.io/docker/v/tensorchord/vchord-postgres?color=369eff&label=GHCR&labelColor=black&logo=github&logoColor=white&style=flat
-[docker-pulls-link]: https://hub.docker.com/r/tensorchord/vchord-postgres
-[docker-pulls-shield]: https://img.shields.io/docker/pulls/tensorchord/vchord-postgres?color=45cc11&labelColor=black&style=flat&sort=semver
-[previous-docker-pulls-link]: https://hub.docker.com/r/tensorchord/pgvecto-rs
-[previous-docker-pulls-shield]: https://img.shields.io/docker/pulls/tensorchord/pgvecto-rs?color=45cc11&labelColor=black&style=flat&sort=semver
-[github-downloads-link]: https://github.com/tensorchord/VectorChord/releases
-[github-downloads-shield]: https://img.shields.io/github/downloads/tensorchord/VectorChord/total?color=45cc11&labelColor=black&style=flat&sort=semver
-[discord-link]: https://discord.gg/KqswhpVgdU
-[discord-shield]: https://img.shields.io/discord/974584200327991326?&logoColor=white&color=5865F2&style=flat&logo=discord&cacheSeconds=60
-[X-link]: https://x.com/TensorChord
-[X-shield]: https://img.shields.io/badge/follow-%40tensorchord-1DA1F2?logo=x&style=flat&logoColor=white&color=1da1f2
-[deepwiki-link]: https://deepwiki.com/tensorchord/VectorChord
-[deepwiki-shield]: https://deepwiki.com/badge.svg
-[blog-link]: https://blog.vectorchord.ai/
-[official-site-link]: https://vectorchord.ai/
-[github-issues-link]: https://github.com/tensorchord/VectorChord/issues
-[email-link]: mailto:support@tensorchord.ai
-[docs-link]: https://docs.vectorchord.ai/vectorchord/
+- Copyright (c) 2025-2026 TensorChord Inc.
+- Copyright (c) 2026 PGSTY PTE. LTD.
+- Maintained by [Ruohang Feng](mailto:rh@vonng.com) @ [PGSTY](https://pgsty.com)

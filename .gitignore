@@ -3,3 +3,10 @@
 .vscode
 .ignore
 build
+.DS_Store
+.idea
+.code
+.codex
+.claude
+AGENTS.md
+CLAUDE.md
