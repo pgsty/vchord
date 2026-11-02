@@ -100,18 +100,16 @@ jobs:
           make DESTDIR="~/debian" install
           mkdir -p ~/debian/usr/share/doc/postgresql-${VERSION}-vchord/
           echo "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-          Upstream-Name: VectorChord
-          Source: https://github.com/tensorchord/VectorChord
+          Upstream-Name: vchord
+          Source: https://github.com/pgsty/vchord
 
           Files: *
           Copyright: Copyright (c) 2025-2026 TensorChord Inc.
-          License: AGPL-3.0-only OR Elastic-2.0
+                     Copyright (c) 2026 PGSTY PTE. LTD.
+          License: AGPL-3.0-only
 
           License: AGPL-3.0-only
-           $(cat ./licenses/LICENSE.AGPLv3 | sed 's/^$/./' | sed 's/^/ /')
-
-          License: Elastic-2.0
-            $(cat ./licenses/LICENSE.ELv2 | sed 's/^$/./' | sed 's/^/ /')
+           $(cat ./LICENSE | sed 's/^$/./' | sed 's/^/ /')
           " \
           >> ~/debian/usr/share/doc/postgresql-${VERSION}-vchord/copyright
           ARCH=$(uname -m)
@@ -123,12 +121,12 @@ jobs:
           Section: database
           Priority: optional
           Architecture: ${PLATFORM}
-          Maintainer: Tensorchord <support@tensorchord.ai>
+          Maintainer: Ruohang Feng <rh@vonng.com>
           Description: Scalable, fast, and disk-friendly vector search in Postgres
-           VectorChord is a PostgreSQL extension designed for scalable,
+           vchord is a PostgreSQL extension designed for scalable,
            high-performance, and disk-efficient vector similarity search. It
            supports L2 distance, inner product, cosine distance and maxsim.
-          Homepage: https://vectorchord.ai/" \
+          Homepage: https://vchord.pgsty.com/" \
           > ~/debian/DEBIAN/control
           (cd ~/debian && find usr -type f -print0 | xargs -0 md5sum) > ~/debian/DEBIAN/md5sums
           dpkg-deb --root-owner-group -Zxz --build ~/debian ~/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
@@ -137,15 +135,17 @@ jobs:
   pgxn:
     runs-on: "ubuntu-latest"
     needs: ["semver", "build"]
+    env:
+      SEMVER: ${{ needs.semver.outputs.SEMVER }}
+      PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
 
     steps:
       - name: Checkout
+        if: env.PGXN_PASSWORD != ''
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Upload
-        env:
-          SEMVER: ${{ needs.semver.outputs.SEMVER }}
-          PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
+        if: env.PGXN_PASSWORD != ''
         run: |
           mkdir -p ./build
 
@@ -153,7 +153,7 @@ jobs:
           git archive --format zip --prefix "vchord-${SEMVER}/" --add-file META.json -o "./build/vchord--${SEMVER}.zip" HEAD
 
           curl --fail -sS \
-            --user "tensorchord:${PGXN_PASSWORD}" \
+            --user "vonng:${PGXN_PASSWORD}" \
             -F "submit=Release It!" \
             -F "archive=@./build/vchord--${SEMVER}.zip" \
             -H "X-Requested-With: XMLHttpRequest" \

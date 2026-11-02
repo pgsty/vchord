@@ -160,7 +160,7 @@ impl WithReader for MetaTuple {
                 if VERSION != *checker.prefix::<u64>(size_of::<Tag>()) {
                     panic!(
                         "deserialization: bad version number; {}",
-                        "after upgrading VectorChord, please use REINDEX to rebuild the index."
+                        "after upgrading vchord, please use REINDEX to rebuild the index."
                     );
                 }
                 let header: &MetaTupleHeader = checker.prefix(size_of::<Tag>());
