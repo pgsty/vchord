@@ -1,0 +1,87 @@
+# Both session settings and index fallback settings use the same parser.
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+CREATE TABLE probes_validation (v vector(3));
+
+statement ok
+INSERT INTO probes_validation VALUES ('[1,2,3]'), ('[2,3,4]');
+
+statement ok
+CREATE INDEX probes_validation_idx ON probes_validation USING vchordrq (v vector_l2_ops)
+WITH (options = 'build.internal.lists = [2, 2]', probes = '2,2');
+
+statement ok
+SET vchordrq.probes = ',5';
+
+statement error empty entry in probes
+SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+
+statement ok
+SET vchordrq.probes = '1,,2';
+
+statement error empty entry in probes
+SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+
+statement ok
+SET vchordrq.probes = '10, ';
+
+statement error empty entry in probes
+SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+
+statement ok
+SET vchordrq.probes = '4294967296,2';
+
+statement error probe value is out of range for u32
+SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+
+statement ok
+SET vchordrq.probes = '999999999999999999999,2';
+
+statement error probe value is out of range for u32
+SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+
+statement ok
+SET vchordrq.probes = '2,x';
+
+statement error unknown character in probes
+SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+
+# Each component and their sum must be safe at the u32 boundary.
+statement ok
+SET vchordrq.probes = '4294967295,4294967295';
+
+query I
+SELECT count(*) FROM (SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 2) s;
+----
+2
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+ALTER INDEX probes_validation_idx SET (probes = '2,');
+
+statement error empty entry in probes
+SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+
+statement ok
+ALTER INDEX probes_validation_idx SET (probes = '4294967296,2');
+
+statement error probe value is out of range for u32
+SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+
+statement ok
+ALTER INDEX probes_validation_idx SET (probes = ' 2 , 2 ');
+
+query I
+SELECT count(*) FROM (SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 2) s;
+----
+2
+
+statement ok
+DROP TABLE probes_validation;
+
+statement ok
+RESET enable_seqscan;

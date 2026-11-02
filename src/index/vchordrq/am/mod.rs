@@ -353,7 +353,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 let mut pages = 0_f64;
                 pages += 1.0;
                 pages += node_count * cost.dim as f64 / 60000.0;
-                pages += probes.iter().sum::<u32>() as f64 * {
+                pages += probes.iter().map(|&probe| f64::from(probe)).sum::<f64>() * {
                     let x = (opfamily.vector_kind().number_of_bits_of_an_elements() * cost.dim)
                         .div_ceil(8);
                     x.div_ceil(3840 * x.div_ceil(5120).min(2)) as f64

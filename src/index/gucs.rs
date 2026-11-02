@@ -378,23 +378,35 @@ pub fn vchordrq_enable_scan() -> bool {
 pub unsafe fn vchordrq_probes(index: pgrx::pg_sys::Relation) -> Vec<u32> {
     fn parse(value: &CStr) -> Vec<u32> {
         let mut result = Vec::new();
-        let mut current = None;
+        let mut current: Option<u32> = None;
+        let mut saw_separator = false;
         for &c in value.to_bytes() {
             match c {
                 b' ' => continue,
-                b',' => result.push(current.take().expect("empty probes")),
-                b'0'..=b'9' => {
-                    if let Some(x) = current.as_mut() {
-                        *x = *x * 10 + (c - b'0') as u32;
-                    } else {
-                        current = Some((c - b'0') as u32);
+                b',' => {
+                    saw_separator = true;
+                    match current.take() {
+                        Some(value) => result.push(value),
+                        None => pgrx::error!("empty entry in probes"),
                     }
+                }
+                b'0'..=b'9' => {
+                    let value = current.unwrap_or_default();
+                    let Some(value) = value
+                        .checked_mul(10)
+                        .and_then(|value| value.checked_add((c - b'0') as u32))
+                    else {
+                        pgrx::error!("probe value is out of range for u32");
+                    };
+                    current = Some(value);
                 }
                 c => pgrx::error!("unknown character in probes: ASCII = {c}"),
             }
         }
         if let Some(current) = current {
             result.push(current);
+        } else if saw_separator {
+            pgrx::error!("empty entry in probes");
         }
         result
     }
