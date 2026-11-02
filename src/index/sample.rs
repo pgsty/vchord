@@ -113,14 +113,18 @@ pub struct HeapSample {
 
 impl Drop for HeapSample {
     fn drop(&mut self) {
+        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+            unsafe {
+                pgrx::pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
+                // free common resources
+                pgrx::pg_sys::table_endscan(self.table_scan_desc);
+                pgrx::pg_sys::ExecDropSingleTupleTableSlot(self.slot);
+                pgrx::pg_sys::FreeExecutorState(self.estate);
+            }
+        }
         unsafe {
-            pgrx::pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
-            // free common resources
-            pgrx::pg_sys::table_endscan(self.table_scan_desc);
             let _ = Box::from_raw(self.sample_scan_state.as_ptr());
             let _ = Box::from_raw(self.state.as_ptr());
-            pgrx::pg_sys::ExecDropSingleTupleTableSlot(self.slot);
-            pgrx::pg_sys::FreeExecutorState(self.estate);
         }
     }
 }
@@ -169,6 +173,16 @@ impl Sample for HeapSample {
 
 pub struct HeapTuple<'a> {
     this: &'a mut HeapSample,
+}
+
+impl Drop for HeapTuple<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+            unsafe {
+                pgrx::pg_sys::ExecClearTuple(self.this.slot);
+            }
+        }
+    }
 }
 
 impl Tuple for HeapTuple<'_> {

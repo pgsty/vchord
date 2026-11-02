@@ -201,8 +201,10 @@ impl<Opaque> Deref for PostgresBufferReadGuard<Opaque> {
 
 impl<Opaque> Drop for PostgresBufferReadGuard<Opaque> {
     fn drop(&mut self) {
-        unsafe {
-            pgrx::pg_sys::UnlockReleaseBuffer(self.buf);
+        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+            unsafe {
+                pgrx::pg_sys::UnlockReleaseBuffer(self.buf);
+            }
         }
     }
 }

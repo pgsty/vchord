@@ -82,11 +82,13 @@ impl HeapFetcher {
 
 impl Drop for HeapFetcher {
     fn drop(&mut self) {
-        unsafe {
-            pgrx::pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
-            // free common resources
-            pgrx::pg_sys::ExecDropSingleTupleTableSlot(self.slot);
-            pgrx::pg_sys::FreeExecutorState(self.estate);
+        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+            unsafe {
+                pgrx::pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
+                // free common resources
+                pgrx::pg_sys::ExecDropSingleTupleTableSlot(self.slot);
+                pgrx::pg_sys::FreeExecutorState(self.estate);
+            }
         }
     }
 }
@@ -151,6 +153,16 @@ impl Fetcher for HeapFetcher {
 
 pub struct HeapTuple<'a> {
     this: &'a mut HeapFetcher,
+}
+
+impl Drop for HeapTuple<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+            unsafe {
+                pgrx::pg_sys::ExecClearTuple(self.this.slot);
+            }
+        }
+    }
 }
 
 impl Tuple for HeapTuple<'_> {

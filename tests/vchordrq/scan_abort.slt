@@ -1,0 +1,87 @@
+# Errors after an index scan has returned a heap tuple must preserve the
+# original error and leave the connection usable after resource cleanup.
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+CREATE TABLE scan_abort (id int, v vector(3));
+
+statement ok
+INSERT INTO scan_abort SELECT i, ARRAY[i,i,i]::real[]::vector
+FROM generate_series(1, 100) i;
+
+statement ok
+CREATE INDEX scan_abort_idx ON scan_abort USING vchordrq (v vector_l2_ops)
+WITH (options = 'rerank_in_table = true');
+
+statement ok
+CREATE FUNCTION scan_abort_error(int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'intentional scan error';
+END $$;
+
+statement error intentional scan error
+SELECT scan_abort_error(id) FROM scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+
+query I
+SELECT id FROM scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 1;
+----
+1
+
+# Also cover cleanup while unwinding a PL/pgSQL subtransaction.
+statement ok
+DO $$
+BEGIN
+  PERFORM scan_abort_error(id) FROM scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+EXCEPTION WHEN raise_exception THEN
+  IF SQLERRM <> 'intentional scan error' THEN RAISE; END IF;
+END $$;
+
+query I
+SELECT id FROM scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 1;
+----
+1
+
+# The sleep guarantees that cancellation happens with an active index scan.
+statement ok
+CREATE FUNCTION scan_abort_cancel(int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_cancel_backend(pg_backend_pid());
+  PERFORM pg_sleep(1);
+  RETURN $1;
+END $$;
+
+statement error canceling statement due to user request
+SELECT scan_abort_cancel(id) FROM scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+
+query I
+SELECT id FROM scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 1;
+----
+1
+
+# The shared fetcher is also used by graph scans.
+statement ok
+DROP INDEX scan_abort_idx;
+
+statement ok
+CREATE INDEX scan_abort_idx ON scan_abort USING vchordg (v vector_l2_ops);
+
+statement error intentional scan error
+SELECT scan_abort_error(id) FROM scan_abort WHERE id > 0 ORDER BY v <-> '[0,0,0]' LIMIT 10;
+
+query I
+SELECT id FROM scan_abort WHERE id > 0 ORDER BY v <-> '[0,0,0]' LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE scan_abort;
+
+statement ok
+DROP FUNCTION scan_abort_error(int);
+
+statement ok
+DROP FUNCTION scan_abort_cancel(int);
+
+statement ok
+RESET enable_seqscan;
