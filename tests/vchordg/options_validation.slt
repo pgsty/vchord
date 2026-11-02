@@ -1,0 +1,17 @@
+statement ok
+CREATE TABLE alpha_validation (v vector(3));
+
+statement error error while validating options
+CREATE INDEX ON alpha_validation USING vchordg (v vector_l2_ops)
+WITH (options = 'alpha = []');
+
+statement error error while validating options
+CREATE INDEX ON alpha_validation USING vchordg (v vector_l2_ops)
+WITH (options = 'alpha = [1.2]');
+
+statement ok
+CREATE INDEX ON alpha_validation USING vchordg (v vector_l2_ops)
+WITH (options = 'alpha = [1.0, 1.2]');
+
+statement ok
+DROP TABLE alpha_validation;
