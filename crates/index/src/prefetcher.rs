@@ -23,7 +23,6 @@ pub trait Sequence {
     fn next(&mut self) -> Option<Self::Item>;
     #[must_use]
     fn peek(&mut self) -> Option<&Self::Item>;
-    #[must_use]
     fn into_inner(self) -> Self::Inner;
 }
 

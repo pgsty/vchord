@@ -226,21 +226,21 @@ unsafe impl pgrx::datum::UnboxDatum for Rabitq8Output {
 // SqlTranslatable
 
 unsafe impl SqlTranslatable for Rabitq8Input<'_> {
-    fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("rabitq8")))
-    }
-    fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("rabitq8"))))
-    }
+    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(Rabitq8Input<'_>);
+    const TYPE_ORIGIN: TypeOrigin = TypeOrigin::External;
+    const ARGUMENT_SQL: Result<SqlMappingRef, ArgumentError> =
+        Ok(SqlMappingRef::literal("rabitq8"));
+    const RETURN_SQL: Result<ReturnsRef, ReturnsError> =
+        Ok(ReturnsRef::One(SqlMappingRef::literal("rabitq8")));
 }
 
 unsafe impl SqlTranslatable for Rabitq8Output {
-    fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("rabitq8")))
-    }
-    fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("rabitq8"))))
-    }
+    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(Rabitq8Output);
+    const TYPE_ORIGIN: TypeOrigin = TypeOrigin::External;
+    const ARGUMENT_SQL: Result<SqlMappingRef, ArgumentError> =
+        Ok(SqlMappingRef::literal("rabitq8"));
+    const RETURN_SQL: Result<ReturnsRef, ReturnsError> =
+        Ok(ReturnsRef::One(SqlMappingRef::literal("rabitq8")));
 }
 
 // ArgAbi
