@@ -209,21 +209,21 @@ unsafe impl pgrx::datum::UnboxDatum for HalfvecOutput {
 // SqlTranslatable
 
 unsafe impl SqlTranslatable for HalfvecInput<'_> {
-    fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("halfvec")))
-    }
-    fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("halfvec"))))
-    }
+    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(HalfvecInput<'_>);
+    const TYPE_ORIGIN: TypeOrigin = TypeOrigin::External;
+    const ARGUMENT_SQL: Result<SqlMappingRef, ArgumentError> =
+        Ok(SqlMappingRef::literal("halfvec"));
+    const RETURN_SQL: Result<ReturnsRef, ReturnsError> =
+        Ok(ReturnsRef::One(SqlMappingRef::literal("halfvec")));
 }
 
 unsafe impl SqlTranslatable for HalfvecOutput {
-    fn argument_sql() -> Result<SqlMapping, ArgumentError> {
-        Ok(SqlMapping::As(String::from("halfvec")))
-    }
-    fn return_sql() -> Result<Returns, ReturnsError> {
-        Ok(Returns::One(SqlMapping::As(String::from("halfvec"))))
-    }
+    const TYPE_IDENT: &'static str = pgrx::pgrx_resolved_type!(HalfvecOutput);
+    const TYPE_ORIGIN: TypeOrigin = TypeOrigin::External;
+    const ARGUMENT_SQL: Result<SqlMappingRef, ArgumentError> =
+        Ok(SqlMappingRef::literal("halfvec"));
+    const RETURN_SQL: Result<ReturnsRef, ReturnsError> =
+        Ok(ReturnsRef::One(SqlMappingRef::literal("halfvec")));
 }
 
 // ArgAbi

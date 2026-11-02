@@ -13,7 +13,6 @@ pub type BorrowedIter<'b> = small_iter::borrowed::Iter<'b, u32, 1>;
 
 pub trait Fetch<'b> {
     type Iter: ExactSizeIterator<Item = u32> + 'b;
-    #[must_use]
     fn fetch(&self) -> Self::Iter;
 }
 
