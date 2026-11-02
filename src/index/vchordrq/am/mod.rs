@@ -286,20 +286,23 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             *index_pages = 1.0;
             return;
         }
-        let selectivity = {
-            use pgrx::pg_sys::{
-                JoinType, add_predicate_to_index_quals, clauselist_selectivity,
-                get_quals_from_indexclauses,
+        // Non-vector filters are heap quals. Estimate how many candidates must
+        // be retrieved to satisfy LIMIT separately from their survival rate.
+        let (total_rows, filter_selectivity) = {
+            let baserel = (*index_opt_info).rel;
+            let total_rows = (*baserel).tuples;
+            let param_info = (*path).path.param_info;
+            let filtered_rows = if !param_info.is_null() {
+                (*param_info).ppi_rows
+            } else {
+                (*baserel).rows
             };
-            let index_quals = get_quals_from_indexclauses((*path).indexclauses);
-            let selectivity_quals = add_predicate_to_index_quals(index_opt_info, index_quals);
-            clauselist_selectivity(
-                root,
-                selectivity_quals,
-                (*(*index_opt_info).rel).relid as _,
-                JoinType::JOIN_INNER,
-                std::ptr::null_mut(),
-            )
+            let filter_selectivity = if total_rows > 0.0 {
+                (filtered_rows / total_rows).clamp(1e-9, 1.0)
+            } else {
+                1.0
+            };
+            (total_rows, filter_selectivity)
         };
         // index exists
         if !(*index_opt_info).hypothetical {
@@ -361,18 +364,28 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 pages += cost.cells[0] as f64;
                 pages
             };
-            let next_count =
-                f64::max(1.0, (*root).limit_tuples) * f64::min(1000.0, 1.0 / selectivity);
+            // The scan cannot process more candidates than the configured IVF
+            // budget, even for very selective filters or an unbounded query.
+            let next_count = if (*root).limit_tuples > 0.0 {
+                ((*root).limit_tuples * f64::min(1000.0, 1.0 / filter_selectivity)).min(node_count)
+            } else {
+                node_count
+            };
+            let scan_selectivity = if total_rows > 0.0 {
+                (next_count / total_rows).clamp(1e-9, 1.0)
+            } else {
+                1.0
+            };
             *index_startup_cost = 0.001 * node_count;
             *index_total_cost = 0.001 * node_count + next_count;
-            *index_selectivity = selectivity;
+            *index_selectivity = scan_selectivity;
             *index_correlation = 0.0;
             *index_pages = page_count;
             return;
         }
         *index_startup_cost = 0.0;
         *index_total_cost = 0.0;
-        *index_selectivity = selectivity;
+        *index_selectivity = filter_selectivity;
         *index_correlation = 0.0;
         *index_pages = 1.0;
     }

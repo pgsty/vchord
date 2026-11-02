@@ -1,3 +1,8 @@
+# Query recording only runs for index scans. Force that path so the recorder
+# assertions do not depend on planner costs for queries without LIMIT.
+statement ok
+SET enable_seqscan = off;
+
 statement ok
 CREATE TABLE t (id SERIAL PRIMARY KEY, val vector(3));
 
@@ -180,3 +185,6 @@ SELECT pg_reload_conf();
 
 statement ok
 DROP TABLE t, t_dim4, t_expr;
+
+statement ok
+RESET enable_seqscan;
