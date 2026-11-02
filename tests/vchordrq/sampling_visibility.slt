@@ -1,0 +1,47 @@
+# Dead tuples are irrelevant to clustering and must not be evaluated by its
+# sampling scan. Commit the deletion first so the main index-build scan can
+# also skip these rows as DEAD rather than indexing RECENTLY_DEAD tuples.
+statement ok
+CREATE FUNCTION visible_vector(v vector, deleted boolean) RETURNS vector
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF deleted THEN RAISE EXCEPTION 'sampled an invisible tuple'; END IF;
+  RETURN v;
+END $$;
+
+statement ok
+CREATE TABLE sampling_visibility (v vector(2048), deleted boolean)
+WITH (autovacuum_enabled = false);
+
+statement ok
+ALTER TABLE sampling_visibility ALTER COLUMN v SET STORAGE EXTERNAL;
+
+statement ok
+INSERT INTO sampling_visibility
+SELECT array_fill(i::real, ARRAY[2048])::vector, i <= 16
+FROM generate_series(1, 32) i;
+
+statement ok
+DELETE FROM sampling_visibility WHERE deleted;
+
+statement ok
+CREATE INDEX sampling_visibility_idx ON sampling_visibility USING vchordrq
+((visible_vector(v, deleted)::vector(2048)) vector_l2_ops)
+WITH (options = 'build.internal.lists = [2]');
+
+statement ok
+REINDEX INDEX sampling_visibility_idx;
+
+statement ok
+REINDEX INDEX CONCURRENTLY sampling_visibility_idx;
+
+query I
+SELECT count(*) FROM sampling_visibility;
+----
+16
+
+statement ok
+DROP TABLE sampling_visibility;
+
+statement ok
+DROP FUNCTION visible_vector(vector, boolean);

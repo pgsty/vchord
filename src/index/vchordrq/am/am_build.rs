@@ -232,18 +232,15 @@ pub unsafe extern "C-unwind" fn ambuild(
         }
         VchordrqBuildSourceOptions::Internal(internal_build) => {
             reporter.phase(BuildPhase::from_code(BuildPhaseCode::InternalBuild));
-            let snapshot = if unsafe { (*index_info).ii_Concurrent } {
-                unsafe { pgrx::pg_sys::RegisterSnapshot(pgrx::pg_sys::GetTransactionSnapshot()) }
-            } else {
-                &raw mut pgrx::pg_sys::SnapshotAnyData
-            };
+            // Sampling only needs visible rows. SnapshotAny can expose dead heap
+            // tuples whose external TOAST values have already been vacuumed.
+            let snapshot =
+                unsafe { pgrx::pg_sys::RegisterSnapshot(pgrx::pg_sys::GetTransactionSnapshot()) };
             let sampler = unsafe { HeapSampler::new(index_relation, heap_relation, snapshot) };
             let result =
                 make_internal_build(vector_options, opfamily, internal_build, sampler, &reporter);
-            if is_mvcc_snapshot(snapshot) {
-                unsafe {
-                    pgrx::pg_sys::UnregisterSnapshot(snapshot);
-                }
+            unsafe {
+                pgrx::pg_sys::UnregisterSnapshot(snapshot);
             }
             result
         }
