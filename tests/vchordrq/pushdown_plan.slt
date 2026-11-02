@@ -70,6 +70,15 @@ SELECT val0 FROM t WHERE val0 <-> '[0, 0, 0]' < 1;
    Disabled: true 
    Filter: ((val0 <-> '[0,0,0]'::vector) < '1'::double precision)
 
+onlyif pg19
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE)
+SELECT val0 FROM t WHERE val0 <-> '[0, 0, 0]' < 1;
+----
+ Seq Scan on t
+   Disabled: true
+   Filter: ((val0 <-> '[0,0,0]'::vector) < '1'::double precision)
+
 # 1 vector key + 0 order_by key + sphere style
 query I
 EXPLAIN (COSTS FALSE, TIMING FALSE) 
@@ -196,6 +205,13 @@ EXPLAIN (COSTS FALSE, TIMING FALSE) SELECT val0 FROM t;
  Seq Scan on t
 
 onlyif pg18
+query I
+EXPLAIN (COSTS FALSE, TIMING FALSE) SELECT val0 FROM t;
+----
+ Seq Scan on t
+   Disabled: true
+
+onlyif pg19
 query I
 EXPLAIN (COSTS FALSE, TIMING FALSE) SELECT val0 FROM t;
 ----

@@ -1,0 +1,123 @@
+name: PostgreSQL 19 RC1
+
+# Keep manual execution consistent with the other fork workflows.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  psql:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+      PGHOST: 127.0.0.1
+      PGPORT: "29919"
+      PGDATABASE: vchord_pg19
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential bison flex libclang-dev zlib1g-dev
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust and SQLLogicTest
+        run: |
+          rustup update
+          mkdir -p "$RUNNER_TEMP/tools"
+          curl -fsSL --retry 3 https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-${{ matrix.target }}.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP/tools"
+          echo "$RUNNER_TEMP/tools" >> "$GITHUB_PATH"
+          echo "PGUSER=$(whoami)" >> "$GITHUB_ENV"
+
+      - name: Build PostgreSQL 19 RC1 with assertions
+        run: |
+          bash .github/scripts/install-pg19.sh "$RUNNER_TEMP/pg19" --enable-cassert --enable-debug
+          echo "$RUNNER_TEMP/pg19/bin" >> "$GITHUB_PATH"
+          echo "PG_CONFIG=$RUNNER_TEMP/pg19/bin/pg_config" >> "$GITHUB_ENV"
+
+      - name: Install pgvector
+        run: |
+          curl -fsSL --retry 3 https://github.com/pgvector/pgvector/archive/refs/tags/v0.8.7.tar.gz \
+            | tar -xz -C "$RUNNER_TEMP"
+          make -C "$RUNNER_TEMP/pgvector-0.8.7" -j4 PG_CONFIG="$PG_CONFIG" OPTFLAGS=""
+          make -C "$RUNNER_TEMP/pgvector-0.8.7" PG_CONFIG="$PG_CONFIG" install
+
+      - name: Clippy and Rust tests
+        run: |
+          make PROFILE=dev clippy
+          cargo test --locked --workspace --exclude vchord --no-fail-fast
+
+      - name: Build, install, and stage a package
+        run: |
+          make build
+          make install
+          make DESTDIR="$RUNNER_TEMP/package" install
+          test -f "$RUNNER_TEMP/package$($PG_CONFIG --sharedir)/extension/vchord.control"
+          cp sql/install/vchord--1.1.*.sql sql/upgrade/vchord--1.1.0--1.1.1.sql "$($PG_CONFIG --sharedir)/extension/"
+
+      - name: Start PostgreSQL
+        run: |
+          initdb -D "$RUNNER_TEMP/pgdata" --no-locale -A trust
+          pg_ctl -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/postgres.log" \
+            -o "-k $RUNNER_TEMP -p $PGPORT -c listen_addresses=127.0.0.1 -c shared_preload_libraries=vchord -c max_worker_processes=64" start
+          createdb "$PGDATABASE"
+          psql -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION vchord CASCADE;'
+
+      - name: Check versioned installation and upgrade
+        run: |
+          createdb vchord_pg19_install
+          psql -v ON_ERROR_STOP=1 -d vchord_pg19_install -c "CREATE EXTENSION vchord VERSION '1.1.1' CASCADE;"
+          psql -At -d vchord_pg19_install -c "SELECT extversion FROM pg_extension WHERE extname = 'vchord'" | grep -Fx '1.1.1'
+          createdb vchord_pg19_upgrade
+          psql -v ON_ERROR_STOP=1 -d vchord_pg19_upgrade \
+            -c "CREATE EXTENSION vchord VERSION '1.1.0' CASCADE;" \
+            -c "ALTER EXTENSION vchord UPDATE TO '1.1.1';" \
+            -c "SELECT dequantize_to_vector(quantize_to_rabitq8('[1,2,3]'::vector));"
+          psql -At -d vchord_pg19_upgrade -c "SELECT extversion FROM pg_extension WHERE extname = 'vchord'" | grep -Fx '1.1.1'
+
+      - name: SQLLogicTest
+        run: |
+          sqllogictest --host "$PGHOST" --port "$PGPORT" --db "$PGDATABASE" --user "$PGUSER" --label pg19 \
+            './tests/general/*.slt' './tests/vchordg/*.slt' './tests/vchordrq/*.slt' './tests/vchordrq/pg17/*.slt'
+
+      - name: Stop PostgreSQL and show server log
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/pgdata/postmaster.pid" ]; then
+            "$RUNNER_TEMP/pg19/bin/pg_ctl" -D "$RUNNER_TEMP/pgdata" -m fast stop
+          fi
+          if [ -f "$RUNNER_TEMP/postgres.log" ]; then cat "$RUNNER_TEMP/postgres.log"; fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgresql-19rc1-vchord-${{ runner.os }}-${{ runner.arch }}
+          path: ./build
+          retention-days: 14

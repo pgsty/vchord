@@ -74,7 +74,7 @@ impl<O: Opaque> RelationWrite for BufferedPostgresRelation<O> {
     fn extend(&self, opaque: O, tracking_freespace: bool) -> Self::WriteGuard<'_> {
         self.postgres.extend(opaque, tracking_freespace)
     }
-    #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18", feature = "pg19"))]
     fn extend(&self, opaque: O, tracking_freespace: bool) -> Self::WriteGuard<'_> {
         unsafe {
             use pgrx::pg_sys::{

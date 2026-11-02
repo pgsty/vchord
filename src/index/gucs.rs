@@ -16,7 +16,7 @@ pub enum PostgresIo {
     ReadBuffer,
     #[name = c"prefetch_buffer"]
     PrefetchBuffer,
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     #[name = c"read_stream"]
     ReadStream,
 }
@@ -40,14 +40,14 @@ static VCHORDG_MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
 static VCHORDG_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
     PostgresIo::PrefetchBuffer,
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     PostgresIo::ReadStream,
 );
 
 static VCHORDG_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
     PostgresIo::PrefetchBuffer,
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     PostgresIo::ReadStream,
 );
 
@@ -77,14 +77,14 @@ static VCHORDRQ_PREFILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
 static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
     PostgresIo::PrefetchBuffer,
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     PostgresIo::ReadStream,
 );
 
 static VCHORDRQ_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
     PostgresIo::PrefetchBuffer,
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     PostgresIo::ReadStream,
 );
 
@@ -200,7 +200,13 @@ pub fn init() {
     unsafe {
         #[cfg(feature = "pg14")]
         pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchordrq".as_ptr());
-        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
+        #[cfg(any(
+            feature = "pg15",
+            feature = "pg16",
+            feature = "pg17",
+            feature = "pg18",
+            feature = "pg19"
+        ))]
         pgrx::pg_sys::MarkGUCPrefixReserved(c"vchordrq".as_ptr());
     }
     GucRegistry::define_bool_guc(
@@ -260,7 +266,13 @@ pub fn init() {
     unsafe {
         #[cfg(feature = "pg14")]
         pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchordg".as_ptr());
-        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17", feature = "pg18"))]
+        #[cfg(any(
+            feature = "pg15",
+            feature = "pg16",
+            feature = "pg17",
+            feature = "pg18",
+            feature = "pg19"
+        ))]
         pgrx::pg_sys::MarkGUCPrefixReserved(c"vchordg".as_ptr());
     }
     assert!(crate::is_main());
@@ -298,7 +310,7 @@ pub fn init() {
             assert!(check(*ptr, name), "failed to find GUC {name:?}");
         }
     }
-    #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18", feature = "pg19"))]
     unsafe {
         use pgrx::pg_sys::PGERROR;
         for (name, ptr) in targets {
@@ -357,7 +369,7 @@ pub fn vchordg_io_search() -> Io {
     match VCHORDG_IO_SEARCH.get() {
         PostgresIo::ReadBuffer => Io::Plain,
         PostgresIo::PrefetchBuffer => Io::Simple,
-        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
         PostgresIo::ReadStream => Io::Stream,
     }
 }
@@ -366,7 +378,7 @@ pub fn vchordg_io_rerank() -> Io {
     match VCHORDG_IO_RERANK.get() {
         PostgresIo::ReadBuffer => Io::Plain,
         PostgresIo::PrefetchBuffer => Io::Simple,
-        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
         PostgresIo::ReadStream => Io::Stream,
     }
 }
@@ -486,7 +498,7 @@ pub fn vchordrq_io_search() -> Io {
     match VCHORDRQ_IO_SEARCH.get() {
         PostgresIo::ReadBuffer => Io::Plain,
         PostgresIo::PrefetchBuffer => Io::Simple,
-        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
         PostgresIo::ReadStream => Io::Stream,
     }
 }
@@ -495,7 +507,7 @@ pub fn vchordrq_io_rerank() -> Io {
     match VCHORDRQ_IO_RERANK.get() {
         PostgresIo::ReadBuffer => Io::Plain,
         PostgresIo::PrefetchBuffer => Io::Simple,
-        #[cfg(any(feature = "pg17", feature = "pg18"))]
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
         PostgresIo::ReadStream => Io::Stream,
     }
 }

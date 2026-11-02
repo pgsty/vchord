@@ -363,7 +363,7 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
                 UnlockRelationForExtension(self.raw, ExclusiveLock as _);
                 LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE as _);
             }
-            #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18"))]
+            #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18", feature = "pg19"))]
             {
                 use pgrx::pg_sys::{
                     BufferManagerRelation, ExtendBufferedFlags, ExtendBufferedRel, ForkNumber,
@@ -491,7 +491,7 @@ where
 }
 
 pub struct PostgresReadStream<'b, O: Opaque, I: Iterator> {
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     raw: *mut pgrx::pg_sys::ReadStream,
     // Because of `Box`'s special alias rules, `Box` cannot be used here.
     cache: NonNull<Cache<'b, I>>,
@@ -499,7 +499,7 @@ pub struct PostgresReadStream<'b, O: Opaque, I: Iterator> {
 }
 
 pub struct PostgresReadStreamGuards<O, I, L> {
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     raw: *mut pgrx::pg_sys::ReadStream,
     list: L,
     _phantom: PhantomData<fn(O, I) -> (O, I)>,
@@ -516,7 +516,7 @@ where
         unimplemented!()
     }
 
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     fn next(&mut self) -> Option<Self::Item> {
         let _id = self.list.next()?;
         unsafe {
@@ -544,7 +544,7 @@ impl<O: Opaque, I: Iterator, L> ExactSizeIterator for PostgresReadStreamGuards<O
 {
 }
 
-#[cfg(any(feature = "pg17", feature = "pg18"))]
+#[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
 impl<'b, O: Opaque, I: Iterator> PostgresReadStream<'b, O, I>
 where
     I::Item: Fetch<'b>,
@@ -584,7 +584,7 @@ where
         panic!("read_stream is not supported on PostgreSQL versions earlier than 17.");
     }
 
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     fn next(&mut self) -> Option<(I::Item, Self::Guards)> {
         if let Some(e) = unsafe { self.cache.as_mut().pop_item() } {
             let list = self.read(e.fetch());
@@ -594,7 +594,7 @@ where
         }
     }
 
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     fn next_if<P: FnOnce(&I::Item) -> bool>(
         &mut self,
         predicate: P,
@@ -620,7 +620,7 @@ impl<'b, O: Opaque, I: Iterator> Drop for PostgresReadStream<'b, O, I> {
     fn drop(&mut self) {
         unsafe {
             let _ = std::mem::take(self.cache.as_mut());
-            #[cfg(any(feature = "pg17", feature = "pg18"))]
+            #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
             if !std::thread::panicking() && pgrx::pg_sys::IsTransactionState() {
                 pgrx::pg_sys::read_stream_end(self.raw);
             }
@@ -645,7 +645,7 @@ impl<O: Opaque> RelationReadStream for PostgresRelation<O> {
         panic!("read_stream is not supported on PostgreSQL versions earlier than 17.");
     }
 
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     fn read_stream<'b, I: Iterator>(&'b self, iter: I, hints: Hints) -> Self::ReadStream<'b, I>
     where
         I::Item: Fetch<'b>,
@@ -676,7 +676,7 @@ impl<O: Opaque> RelationReadStream for PostgresRelation<O> {
             if hints.full {
                 flags |= pgrx::pg_sys::READ_STREAM_FULL;
             }
-            #[cfg(feature = "pg18")]
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
             if hints.batch {
                 flags |= pgrx::pg_sys::READ_STREAM_USE_BATCHING;
             }

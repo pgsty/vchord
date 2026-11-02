@@ -16,6 +16,7 @@ pg15 = ["pgrx/pg15"]
 pg16 = ["pgrx/pg16"]
 pg17 = ["pgrx/pg17"]
 pg18 = ["pgrx/pg18"]
+pg19 = ["pgrx/pg19"]
 
 [dependencies]
 always_equal = { path = "./crates/always_equal" }

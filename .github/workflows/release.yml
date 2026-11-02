@@ -38,7 +38,7 @@ jobs:
     needs: ["semver"]
     strategy:
       matrix:
-        version: ["14", "15", "16", "17", "18"]
+        version: ["14", "15", "16", "17", "18", "19"]
         arch: ["x86_64", "aarch64"]
     runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
 
@@ -61,7 +61,11 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
           echo CC=clang-18 >> $GITHUB_ENV
 
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
       - name: Install PostgreSQL
+        if: matrix.version != '19'
         run: |
           sudo apt-get remove -y '^postgres.*' '^libpq.*'
           sudo apt-get purge -y '^postgres.*' '^libpq.*'
@@ -71,9 +75,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends postgresql-server-dev-${{ matrix.version }}
 
           pg_config
+          echo "PG_CONFIG=/usr/lib/postgresql/${{ matrix.version }}/bin/pg_config" >> "$GITHUB_ENV"
 
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install PostgreSQL 19 RC1
+        if: matrix.version == '19'
+        run: |
+          sudo apt-get install -y --no-install-recommends build-essential bison flex zlib1g-dev
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /usr/lib/postgresql/19 /usr/share/postgresql/19
+          bash .github/scripts/install-pg19.sh /usr/lib/postgresql/19 --datarootdir=/usr/share/postgresql/19
+          echo "PG_CONFIG=/usr/lib/postgresql/19/bin/pg_config" >> "$GITHUB_ENV"
 
       - name: Build
         run: |

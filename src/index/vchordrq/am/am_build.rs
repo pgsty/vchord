@@ -942,7 +942,14 @@ unsafe fn parallel_build(
         std::slice::from_raw_parts(vchordrqcached.add(8), bytes as _)
     });
 
-    let scan = unsafe { pgrx::pg_sys::table_beginscan_parallel(heap_relation, tablescandesc) };
+    let scan = unsafe {
+        pgrx::pg_sys::table_beginscan_parallel(
+            heap_relation,
+            tablescandesc,
+            #[cfg(feature = "pg19")]
+            pgrx::pg_sys::ScanOptions::SO_NONE,
+        )
+    };
     let opfamily = unsafe { opfamily(index_relation) };
     let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
 
@@ -1206,7 +1213,7 @@ unsafe fn options(
     let att = unsafe { &mut *(*index_relation).rd_att };
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
     let atts = unsafe { att.attrs.as_slice(att.natts as _) };
-    #[cfg(feature = "pg18")]
+    #[cfg(any(feature = "pg18", feature = "pg19"))]
     let atts = unsafe {
         let ptr = att
             .compact_attrs

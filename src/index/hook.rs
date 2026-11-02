@@ -59,10 +59,12 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
                         (*(*node).ss.ps.state).es_snapshot,
-                        #[cfg(feature = "pg18")]
+                        #[cfg(any(feature = "pg18", feature = "pg19"))]
                         std::ptr::null_mut(),
                         (*node).iss_NumScanKeys,
                         (*node).iss_NumOrderByKeys,
+                        #[cfg(feature = "pg19")]
+                        pgrx::pg_sys::ScanOptions::SO_NONE,
                     );
 
                     let scanner = &mut *((*(*node).iss_ScanDesc).opaque as *mut Scanner);
@@ -85,10 +87,12 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
                         (*(*node).ss.ps.state).es_snapshot,
-                        #[cfg(feature = "pg18")]
+                        #[cfg(any(feature = "pg18", feature = "pg19"))]
                         std::ptr::null_mut(),
                         (*node).iss_NumScanKeys,
                         (*node).iss_NumOrderByKeys,
+                        #[cfg(feature = "pg19")]
+                        pgrx::pg_sys::ScanOptions::SO_NONE,
                     );
 
                     let scanner = &mut *((*(*node).iss_ScanDesc).opaque as *mut Scanner);

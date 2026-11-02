@@ -90,6 +90,7 @@ impl Reloption {
     }
 }
 
+// The isset_offset field exists only in PG18; PG19 removed it.
 const TABLE: &[pgrx::pg_sys::relopt_parse_elt] = &[
     pgrx::pg_sys::relopt_parse_elt {
         optname: c"options".as_ptr(),
@@ -201,7 +202,7 @@ const AM_HANDLER: pgrx::pg_sys::IndexAmRoutine = const {
     am_routine.amsupport = 1;
     am_routine.amcanorderbyop = true;
 
-    #[cfg(any(feature = "pg17", feature = "pg18"))]
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     {
         am_routine.amcanbuildparallel = true;
     }
@@ -453,7 +454,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     let check = || unsafe {
         #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
         pgrx::pg_sys::vacuum_delay_point();
-        #[cfg(feature = "pg18")]
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
         pgrx::pg_sys::vacuum_delay_point(false);
     };
     let callback = callback.expect("null function pointer");

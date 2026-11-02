@@ -76,6 +76,8 @@ impl Sampler for HeapSampler {
                 true,
                 false,
                 true,
+                #[cfg(feature = "pg19")]
+                pgrx::pg_sys::ScanOptions::SO_NONE,
             );
             let index_info = pgrx::pg_sys::BuildIndexInfo(self.index_relation);
             let estate = pgrx::pg_sys::CreateExecutorState();

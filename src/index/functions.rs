@@ -28,7 +28,7 @@ unsafe fn heap_tuple_struct<T>(tuple: pgrx::pg_sys::HeapTuple) -> *const T {
 fn am_oid_by_name(amname: &CStr) -> Option<Oid> {
     let tuple = unsafe {
         pgrx::pg_sys::SearchSysCache1(
-            pgrx::pg_sys::SysCacheIdentifier::AMNAME as i32,
+            pgrx::pg_sys::SysCacheIdentifier::AMNAME as _,
             amname.into_datum()?,
         )
     };
@@ -46,7 +46,7 @@ fn am_oid_by_name(amname: &CStr) -> Option<Oid> {
 fn class_info(reloid: Oid) -> Option<ClassInfo> {
     let tuple = unsafe {
         pgrx::pg_sys::SearchSysCache1(
-            pgrx::pg_sys::SysCacheIdentifier::RELOID as i32,
+            pgrx::pg_sys::SysCacheIdentifier::RELOID as _,
             reloid.into_datum()?,
         )
     };

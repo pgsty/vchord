@@ -7,7 +7,7 @@
 [![Version: v1.1.1](https://img.shields.io/badge/Version-v1.1.1-slategray?style=flat)](https://github.com/pgsty/vchord/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](https://github.com/pgsty/vchord/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/vchord?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/vchord&Date)
-[![PostgreSQL: 14-18](https://img.shields.io/badge/PostgreSQL-14--18-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
+[![PostgreSQL: 14-19rc1](https://img.shields.io/badge/PostgreSQL-14--19rc1-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](#postgresql-19-rc1)
 
 **`vchord`** is a PostgreSQL extension engineered for scalable, high-performance, and disk-friendly vector similarity search, serving as the successor to `pgvecto.rs`.
 
@@ -121,6 +121,30 @@ When tuning `vchordrq`, use one comma-separated `probes` value per level in
 and trailing commas are invalid. An empty string is valid for `lists = []`.
 For `vchordg`, `alpha` must contain 1–8 ascending values starting with `1.0`,
 all below `2.0`.
+
+### PostgreSQL 19 RC1
+
+PostgreSQL 19 RC1 is supported by source builds from `main`. It has been
+validated on Linux x86_64 and macOS arm64 with Rust 1.99.1, pgrx 0.19.3,
+and pgvector 0.8.7, including builds with PostgreSQL assertions enabled and
+the full SQL regression suite. The package instructions above still describe
+the published PostgreSQL 14–18 packages.
+
+Install pgvector for PostgreSQL 19, then build and install `vchord` against
+the RC1 installation's `pg_config`:
+
+```bash
+git clone https://github.com/pgsty/vchord.git
+cd vchord
+PG_CONFIG=/path/to/pg19/bin/pg_config make build
+make PG_CONFIG=/path/to/pg19/bin/pg_config install # use sudo if required
+```
+
+Add `vchord` to that server's `shared_preload_libraries`, restart it, and run
+`CREATE EXTENSION IF NOT EXISTS vchord CASCADE;`. The dedicated
+[PG19 workflow](.github/workflows/pg19.yml) pins the official RC1 source and
+runs on Linux x86_64/aarch64 and macOS arm64; the release workflow also has
+a PostgreSQL 19 package target.
 
 ---
 
