@@ -35,11 +35,13 @@ impl<Opaque> BufferedPostgresRelation<Opaque> {
 impl<Opaque> Drop for BufferedPostgresRelation<Opaque> {
     fn drop(&mut self) {
         let free = self.list.get_mut();
-        #[cfg(debug_assertions)]
-        assert!(free.is_empty());
-        for &mut buf in free {
-            unsafe {
-                pgrx::pg_sys::ReleaseBuffer(buf);
+        // PostgreSQL owns cleanup after an error unwind; do not release buffers
+        // again while Rust is unwinding or after the transaction has ended.
+        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+            for &buf in free.iter() {
+                unsafe {
+                    pgrx::pg_sys::ReleaseBuffer(buf);
+                }
             }
         }
     }
