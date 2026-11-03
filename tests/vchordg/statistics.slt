@@ -1,0 +1,71 @@
+# CREATE INDEX, REINDEX and VACUUM store the statistics reported by the index in
+# pg_class. Zeroed statistics would reset the reltuples of the table and of the
+# index to 0.
+
+statement ok
+CREATE TABLE vchordg_stats (id int, v vector(3));
+
+# 2100 rows, 100 of them NULL, which are not indexed.
+statement ok
+INSERT INTO vchordg_stats
+SELECT i, CASE WHEN i % 21 = 0 THEN NULL ELSE ARRAY[i,i,i]::real[]::vector END
+FROM generate_series(1, 2100) i;
+
+statement ok
+ANALYZE vchordg_stats;
+
+statement ok
+CREATE INDEX vchordg_stats_idx ON vchordg_stats USING vchordg (v vector_l2_ops);
+
+query TI
+SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('vchordg_stats', 'vchordg_stats_idx') ORDER BY relname;
+----
+vchordg_stats 2100
+vchordg_stats_idx 2000
+
+# Ask for a parallel build.
+statement ok
+ALTER TABLE vchordg_stats SET (parallel_workers = 2);
+
+statement ok
+REINDEX INDEX vchordg_stats_idx;
+
+statement ok
+ALTER TABLE vchordg_stats RESET (parallel_workers);
+
+query TI
+SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('vchordg_stats', 'vchordg_stats_idx') ORDER BY relname;
+----
+vchordg_stats 2100
+vchordg_stats_idx 2000
+
+# Removes 500 rows, 23 of them NULL.
+statement ok
+DELETE FROM vchordg_stats WHERE id <= 500;
+
+statement ok
+VACUUM vchordg_stats;
+
+query TI
+SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('vchordg_stats', 'vchordg_stats_idx') ORDER BY relname;
+----
+vchordg_stats 1600
+vchordg_stats_idx 1523
+
+query T
+SELECT relpages = pg_relation_size(oid) / current_setting('block_size')::int FROM pg_class WHERE relname = 'vchordg_stats_idx';
+----
+t
+
+# A VACUUM without dead tuples skips bulk delete but still reports statistics.
+statement ok
+VACUUM vchordg_stats;
+
+query TI
+SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('vchordg_stats', 'vchordg_stats_idx') ORDER BY relname;
+----
+vchordg_stats 1600
+vchordg_stats_idx 1523
+
+statement ok
+DROP TABLE vchordg_stats;

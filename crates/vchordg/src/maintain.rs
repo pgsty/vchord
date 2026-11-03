@@ -17,7 +17,9 @@ use index_accessor::DefaultWithDimension;
 use std::cmp::Reverse;
 use vector::VectorOwned;
 
-pub fn maintain<R: RelationRead + RelationWrite, O: Operator>(index: &R, check: impl Fn())
+/// Repairs edges around deleted vertices, then frees deleted vertices and
+/// unreachable vectors. Returns the number of live (non-deleted) vertices.
+pub fn maintain<R: RelationRead + RelationWrite, O: Operator>(index: &R, check: impl Fn()) -> u64
 where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -31,7 +33,7 @@ where
     let link = meta_guard.get_opaque().link;
     drop(meta_guard);
     let Some(s) = start.into_inner() else {
-        return;
+        return 0;
     };
     // do it's best to remove broken edges
     {
@@ -43,7 +45,10 @@ where
             for i in 1..=vertex_guard.len() {
                 if let Some(vertex_bytes) = vertex_guard.get(i) {
                     let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-                    if vertex_tuple.payload().is_some() {
+                    // The start vertex is never freed, even after it is deleted,
+                    // because every search enters the graph through it. Keep its
+                    // edges pointing at live vertices so the graph stays reachable.
+                    if vertex_tuple.payload().is_some() || (vertex_guard.id(), i) == s {
                         let pointers_u = vertex_tuple.pointers().to_vec();
                         members.push((pointers_u, (vertex_guard.id(), i)));
                     }
@@ -142,6 +147,7 @@ where
             current = next;
         }
     }
+    let mut live = 0_u64;
     // remove vertices and vectors
     {
         let mut current = link;
@@ -156,6 +162,7 @@ where
                     if p.is_none() && (current, i) != s {
                         vertex_guard.free(i);
                     } else {
+                        live += u64::from(p.is_some());
                         let iter = tuple.pointers().iter().map(|pointer| pointer.into_inner());
                         reachable_set.extend(iter);
                     }
@@ -180,4 +187,5 @@ where
             current = vertex_guard.get_opaque().next;
         }
     }
+    live
 }

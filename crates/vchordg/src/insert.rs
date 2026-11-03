@@ -318,6 +318,11 @@ where
                 return write;
             }
             if write.get_opaque().next == u32::MAX {
+                // Initialize and WAL-log the new pages before the predecessor
+                // links to them, so neither an error nor a crash can leave the
+                // chain pointing at an uninitialized page. The new vertex page
+                // does not track free space yet: the free space map must not
+                // hand it out before it is reachable from the chain.
                 let link = index
                     .extend(
                         Opaque {
@@ -332,14 +337,19 @@ where
                         next: u32::MAX,
                         link,
                     },
-                    true,
+                    false,
                 );
-                { write }.get_opaque_mut().next = extend.id();
-                if extend.freespace() as usize >= size {
-                    return extend;
-                } else {
+                if (extend.freespace() as usize) < size {
                     panic!("implementation: a clear page cannot accommodate a single tuple");
                 }
+                let id = extend.id();
+                drop(extend);
+                write.get_opaque_mut().next = id;
+                drop(write);
+                // Take the new page through the ordinary path. Another backend
+                // may have used its space in the meantime.
+                current = id;
+                continue;
             }
             current = write.get_opaque().next;
         } else {
@@ -367,6 +377,8 @@ where
                 return write;
             }
             if write.get_opaque().next == u32::MAX {
+                // Initialize and WAL-log the new page before the predecessor
+                // links to it (see `append_vertex_tuple`).
                 let extend = index.extend(
                     Opaque {
                         next: u32::MAX,
@@ -374,12 +386,15 @@ where
                     },
                     false,
                 );
-                { write }.get_opaque_mut().next = extend.id();
-                if extend.freespace() as usize >= size {
-                    return extend;
-                } else {
+                if (extend.freespace() as usize) < size {
                     panic!("implementation: a clear page cannot accommodate a single tuple");
                 }
+                let id = extend.id();
+                drop(extend);
+                write.get_opaque_mut().next = id;
+                drop(write);
+                current = id;
+                continue;
             }
             current = write.get_opaque().next
         } else {

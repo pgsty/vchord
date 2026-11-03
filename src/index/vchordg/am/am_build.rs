@@ -135,7 +135,7 @@ pub unsafe extern "C-unwind" fn ambuild(
     crate::index::vchordg::dispatch::build(vector_options, vchordg_options.index, &index);
     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
     let cached = vchordg_cached::VchordgCached::_0 {}.serialize();
-    if let Some(leader) = unsafe {
+    let (heap_tuples, index_tuples) = if let Some(leader) = unsafe {
         VchordgLeader::enter(
             c"vchordg_parallel_build_main",
             heap_relation,
@@ -174,10 +174,14 @@ pub unsafe extern "C-unwind" fn ambuild(
             reporter.tuples_done((*leader.vchordgshared).indtuples);
             reporter.tuples_total((*leader.vchordgshared).indtuples);
             pgrx::pg_sys::ConditionVariableCancelSleep();
+            (
+                (*leader.vchordgshared).heap_tuples,
+                (*leader.vchordgshared).index_tuples,
+            )
         }
     } else {
         unsafe {
-            let indtuples = sequential_build(
+            let stats = sequential_build(
                 index_relation,
                 heap_relation,
                 index_info,
@@ -186,10 +190,15 @@ pub unsafe extern "C-unwind" fn ambuild(
                     reporter.tuples_done(indtuples);
                 },
             );
-            reporter.tuples_total(indtuples);
+            reporter.tuples_total(stats.indtuples);
+            (stats.heap_tuples, stats.index_tuples)
         }
-    }
-    unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0().into_pg() }
+    };
+    // PostgreSQL stores these as `reltuples` of the table and of the index.
+    let mut result = unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0() };
+    result.heap_tuples = heap_tuples;
+    result.index_tuples = index_tuples as f64;
+    result.into_pg()
 }
 
 struct VchordgShared {
@@ -205,6 +214,8 @@ struct VchordgShared {
     /* mutable state */
     workers_done: i32,
     indtuples: u64,
+    heap_tuples: f64,
+    index_tuples: u64,
 }
 
 fn is_mvcc_snapshot(snapshot: *mut pgrx::pg_sys::SnapshotData) -> bool {
@@ -317,6 +328,8 @@ impl VchordgLeader {
                 mutex: std::mem::zeroed(),
                 workers_done: 0,
                 indtuples: 0,
+                heap_tuples: 0.0,
+                index_tuples: 0,
             });
             pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordgshared).condvar_workers_done);
             pgrx::pg_sys::SpinLockInit(&raw mut (*vchordgshared).mutex);
@@ -412,15 +425,17 @@ pub unsafe extern "C-unwind" fn vchordg_parallel_build_main(
             .cast::<u8>()
             .cast_const()
     };
-    let heap_lockmode;
-    let index_lockmode;
-    if unsafe { !(*vchordgshared).isconcurrent } {
-        heap_lockmode = pgrx::pg_sys::ShareLock as pgrx::pg_sys::LOCKMODE;
-        index_lockmode = pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE;
+    let (heap_lockmode, index_lockmode) = if unsafe { !(*vchordgshared).isconcurrent } {
+        (
+            pgrx::pg_sys::ShareLock as pgrx::pg_sys::LOCKMODE,
+            pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
+        )
     } else {
-        heap_lockmode = pgrx::pg_sys::ShareUpdateExclusiveLock as pgrx::pg_sys::LOCKMODE;
-        index_lockmode = pgrx::pg_sys::RowExclusiveLock as pgrx::pg_sys::LOCKMODE;
-    }
+        (
+            pgrx::pg_sys::ShareUpdateExclusiveLock as pgrx::pg_sys::LOCKMODE,
+            pgrx::pg_sys::RowExclusiveLock as pgrx::pg_sys::LOCKMODE,
+        )
+    };
     let heap = unsafe { pgrx::pg_sys::table_open((*vchordgshared).heaprelid, heap_lockmode) };
     let index = unsafe { pgrx::pg_sys::index_open((*vchordgshared).indexrelid, index_lockmode) };
     let index_info = unsafe { pgrx::pg_sys::BuildIndexInfo(index) };
@@ -473,7 +488,8 @@ unsafe fn parallel_build(
     };
     let opfamily = unsafe { opfamily(index_relation) };
     let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
-    match cached {
+    let mut index_tuples = 0_u64;
+    let heap_tuples = match cached {
         VchordgCachedReader::_0(_) => {
             traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
                 let ctid = tuple.id();
@@ -486,6 +502,7 @@ unsafe fn parallel_build(
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
                     crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
+                    index_tuples += 1;
                 }
                 unsafe {
                     let indtuples;
@@ -497,15 +514,26 @@ unsafe fn parallel_build(
                     }
                     callback(indtuples);
                 }
-            });
+            })
         }
-    }
+    };
     unsafe {
         pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordgshared).mutex);
+        (*vchordgshared).heap_tuples += heap_tuples;
+        (*vchordgshared).index_tuples += index_tuples;
         (*vchordgshared).workers_done += 1;
         pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordgshared).mutex);
         pgrx::pg_sys::ConditionVariableSignal(&raw mut (*vchordgshared).condvar_workers_done);
     }
+}
+
+struct BuildStats {
+    /// heap tuples passed to the build callback, for progress reporting
+    indtuples: u64,
+    /// heap tuples counted by the table AM
+    heap_tuples: f64,
+    /// vectors inserted into the index
+    index_tuples: u64,
 }
 
 unsafe fn sequential_build(
@@ -514,7 +542,7 @@ unsafe fn sequential_build(
     index_info: *mut pgrx::pg_sys::IndexInfo,
     vchordgcached: &[u8],
     mut callback: impl FnMut(u64),
-) -> u64 {
+) -> BuildStats {
     use vchordg_cached::VchordgCachedReader;
     let cached = VchordgCachedReader::deserialize_ref(vchordgcached);
     let index = unsafe { PostgresRelation::new(index_relation) };
@@ -530,7 +558,8 @@ unsafe fn sequential_build(
     };
 
     let mut indtuples = 0;
-    match cached {
+    let mut index_tuples = 0;
+    let heap_tuples = match cached {
         VchordgCachedReader::_0(_) => {
             traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
                 let ctid = tuple.id();
@@ -543,13 +572,18 @@ unsafe fn sequential_build(
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
                     crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
+                    index_tuples += 1;
                 }
                 indtuples += 1;
                 callback(indtuples);
-            });
+            })
         }
+    };
+    BuildStats {
+        indtuples,
+        heap_tuples,
+        index_tuples,
     }
-    indtuples
 }
 
 #[pgrx::pg_guard]

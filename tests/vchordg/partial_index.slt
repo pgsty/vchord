@@ -1,0 +1,104 @@
+# A partial index is a candidate for every query that implies its predicate,
+# even without a vector clause or ORDER BY. Such a scan is rejected by the
+# index, so the planner must never choose it, in particular as an index-only
+# scan when the query needs no columns.
+
+statement ok
+CREATE TABLE vchordg_partial (id int, cat int, v vector(3));
+
+statement ok
+INSERT INTO vchordg_partial SELECT i, i % 10, ARRAY[i,i,i]::real[]::vector FROM generate_series(1, 5000) i;
+
+statement ok
+CREATE INDEX vchordg_partial_idx ON vchordg_partial USING vchordg (v vector_l2_ops) WHERE cat = 1;
+
+statement ok
+VACUUM ANALYZE vchordg_partial;
+
+query I
+SELECT count(*) FROM vchordg_partial WHERE cat = 1;
+----
+500
+
+query I
+SELECT id FROM vchordg_partial WHERE cat = 1 AND id < 40 ORDER BY id;
+----
+1
+11
+21
+31
+
+statement ok
+DO $$
+DECLARE plan text;
+BEGIN
+  FOR plan IN EXPLAIN SELECT count(*) FROM vchordg_partial WHERE cat = 1 LOOP
+    IF plan LIKE '%vchordg_partial_idx%' THEN
+      RAISE EXCEPTION 'unexpected vchordg scan: %', plan;
+    END IF;
+  END LOOP;
+END $$;
+
+# Since PostgreSQL 18, a seq scan disabled by `enable_seqscan` must still win.
+statement ok
+DO $$
+DECLARE n bigint;
+BEGIN
+  IF current_setting('server_version_num')::int >= 180000 THEN
+    PERFORM set_config('enable_seqscan', 'off', true);
+    SELECT count(*) INTO n FROM vchordg_partial WHERE cat = 1;
+    IF n <> 500 THEN
+      RAISE EXCEPTION 'unexpected count %', n;
+    END IF;
+  END IF;
+END $$;
+
+# A full index offers an index-only path to queries that need no columns.
+statement ok
+CREATE INDEX vchordg_partial_full ON vchordg_partial USING vchordg (v vector_l2_ops);
+
+statement ok
+VACUUM ANALYZE vchordg_partial;
+
+query I
+SELECT count(*) FROM vchordg_partial;
+----
+5000
+
+statement ok
+DO $$
+DECLARE plan text;
+BEGIN
+  FOR plan IN EXPLAIN SELECT count(*) FROM vchordg_partial LOOP
+    IF plan LIKE '%vchordg_partial_full%' THEN
+      RAISE EXCEPTION 'unexpected vchordg scan: %', plan;
+    END IF;
+  END LOOP;
+END $$;
+
+statement ok
+DROP INDEX vchordg_partial_full;
+
+# The index remains usable for vector search.
+statement ok
+SET enable_seqscan = off;
+
+query T
+EXPLAIN (COSTS OFF) SELECT id FROM vchordg_partial WHERE cat = 1 ORDER BY v <-> '[3,3,3]' LIMIT 3;
+----
+Limit
+  ->  Index Scan using vchordg_partial_idx on vchordg_partial
+        Order By: (v <-> '[3,3,3]'::vector)
+
+query I
+SELECT id FROM vchordg_partial WHERE cat = 1 ORDER BY v <-> '[3,3,3]' LIMIT 3;
+----
+1
+11
+21
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE vchordg_partial;
