@@ -12,11 +12,14 @@ use crate::tuples::{MetaTuple, VertexTuple, WithReader, WithWriter};
 use index::relation::{Page, RelationRead, RelationWrite};
 use std::num::NonZero;
 
+/// Clears the payload of every vertex whose heap tuple is dead. Returns the
+/// number of vertices that were cleared.
 pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
     index: &R,
     check: impl Fn(),
     callback: impl Fn(NonZero<u64>) -> bool,
-) where
+) -> u64
+where
     R::Page: Page<Opaque = Opaque>,
 {
     let meta_guard = index.read(0);
@@ -26,8 +29,9 @@ pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
     let link = meta_guard.get_opaque().link;
     drop(meta_guard);
     let Some(_) = start.into_inner() else {
-        return;
+        return 0;
     };
+    let mut removed = 0_u64;
     let mut current = link;
     while current != u32::MAX {
         check();
@@ -53,6 +57,7 @@ pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
                     let p = tuple.payload();
                     if Some(true) == p.map(&callback) {
                         *p = None;
+                        removed += 1;
                     }
                 }
             }
@@ -61,4 +66,5 @@ pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
             current = read.get_opaque().next;
         }
     }
+    removed
 }

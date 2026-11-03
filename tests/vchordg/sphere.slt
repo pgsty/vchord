@@ -1,0 +1,144 @@
+# Sphere predicates take the radius in the output space of the distance
+# operator. The index must not compare it with its internal distance (squared
+# L2, or twice the cosine distance), and the qual must be rechecked.
+
+statement ok
+CREATE TABLE vchordg_sphere (id int, v vector(3), h halfvec(3));
+
+statement ok
+INSERT INTO vchordg_sphere
+SELECT i, ARRAY[i,i,i]::real[]::vector, ARRAY[i,i,i]::real[]::halfvec
+FROM generate_series(1, 1000) i;
+
+# Unit vectors at angles of 0.5, 1.0, ..., 90 degrees.
+statement ok
+CREATE TABLE vchordg_sphere_c (id int, c vector(3));
+
+statement ok
+INSERT INTO vchordg_sphere_c
+SELECT i, ARRAY[cos(radians(i * 0.5)), sin(radians(i * 0.5)), 0]::real[]::vector
+FROM generate_series(1, 180) i;
+
+statement ok
+CREATE INDEX vchordg_sphere_l2 ON vchordg_sphere USING vchordg (v vector_l2_ops);
+
+statement ok
+CREATE INDEX vchordg_sphere_h ON vchordg_sphere USING vchordg (h halfvec_l2_ops);
+
+statement ok
+CREATE INDEX vchordg_sphere_cos ON vchordg_sphere_c USING vchordg (c vector_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query T
+EXPLAIN (COSTS OFF) SELECT count(*) FROM vchordg_sphere WHERE v <<->> sphere('[10.3,10.3,10.3]'::vector, 3);
+----
+Aggregate
+  ->  Index Scan using vchordg_sphere_l2 on vchordg_sphere
+        Index Cond: (v <<->> '("[10.3,10.3,10.3]",3)'::sphere_vector)
+
+# [10,10,10] is 0.52 away: the squared distance 0.27 is below the radius.
+query I
+SELECT count(*) FROM vchordg_sphere WHERE v <<->> sphere('[10.3,10.3,10.3]'::vector, 0.5);
+----
+0
+
+query I
+SELECT count(*) FROM vchordg_sphere WHERE v <<->> sphere('[10.3,10.3,10.3]'::vector, 0.6);
+----
+1
+
+# 9, 10, 11 and 12 are within 3; their squared distances reach 8.67.
+query I
+SELECT id FROM vchordg_sphere WHERE v <<->> sphere('[10.3,10.3,10.3]'::vector, 3) ORDER BY id;
+----
+9
+10
+11
+12
+
+query I
+SELECT id FROM vchordg_sphere WHERE h <<->> sphere('[10.3,10.3,10.3]'::halfvec, 3) ORDER BY id;
+----
+9
+10
+11
+12
+
+query T
+EXPLAIN (COSTS OFF) SELECT count(*) FROM vchordg_sphere_c WHERE c <<=>> sphere('[1,0,0]'::vector, 0.1);
+----
+Aggregate
+  ->  Index Scan using vchordg_sphere_cos on vchordg_sphere_c
+        Index Cond: (c <<=>> '("[1,0,0]",0.1)'::sphere_vector)
+
+# Cosine distance 1 - cos(d) stays below 0.1 up to d = 25.8 degrees (51 rows),
+# while the internal distance 2 - 2 cos(d) does so only up to d = 18.2 degrees.
+query I
+SELECT count(*) FROM vchordg_sphere_c WHERE c <<=>> sphere('[1,0,0]'::vector, 0.1);
+----
+51
+
+# Within 18.2 degrees of 45 degrees: 27.0 to 63.0 degrees.
+query II
+SELECT count(*), min(id) FROM vchordg_sphere_c WHERE c <<=>> sphere(ARRAY[cos(radians(45)), sin(radians(45)), 0]::real[]::vector, 0.05);
+----
+73 54
+
+# A second sphere is answered by the recheck only.
+query I
+SELECT id FROM vchordg_sphere
+WHERE v <<->> sphere('[10.3,10.3,10.3]'::vector, 3) AND v <<->> sphere('[11,11,11]'::vector, 1)
+ORDER BY id;
+----
+11
+
+query I
+SELECT id FROM vchordg_sphere WHERE v <<->> sphere('[10.3,10.3,10.3]'::vector, 3) ORDER BY v <-> '[10.3,10.3,10.3]';
+----
+10
+11
+9
+12
+
+# A null sphere matches nothing, even when an ORDER BY drives the scan.
+statement ok
+SET plan_cache_mode = force_generic_plan;
+
+statement ok
+PREPARE vchordg_sphere_null(sphere_vector) AS
+SELECT array_agg(id) FROM (
+  SELECT id FROM vchordg_sphere WHERE v <<->> $1 ORDER BY v <-> '[1,1,1]' LIMIT 3
+) s;
+
+query T
+EXPLAIN (COSTS OFF) EXECUTE vchordg_sphere_null(NULL);
+----
+Aggregate
+  ->  Limit
+        ->  Index Scan using vchordg_sphere_l2 on vchordg_sphere
+              Index Cond: (v <<->> $1)
+              Order By: (v <-> '[1,1,1]'::vector)
+
+query T
+EXECUTE vchordg_sphere_null(NULL);
+----
+NULL
+
+query T
+EXECUTE vchordg_sphere_null(sphere('[1,1,1]'::vector, 2));
+----
+{1,2}
+
+statement ok
+DEALLOCATE vchordg_sphere_null;
+
+statement ok
+RESET plan_cache_mode;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE vchordg_sphere, vchordg_sphere_c;

@@ -1,0 +1,57 @@
+# ANALYZE calls the index vacuum cleanup with `analyze_only`. It must not modify
+# the index: rewriting every page wrote about as much WAL as the index size
+# (full-page images after a checkpoint).
+
+statement ok
+CREATE TABLE vchordg_analyze (id int, v vector(3)) WITH (autovacuum_enabled = off);
+
+statement ok
+INSERT INTO vchordg_analyze SELECT i, ARRAY[i,i,i]::real[]::vector FROM generate_series(1, 3000) i;
+
+statement ok
+CREATE INDEX vchordg_analyze_idx ON vchordg_analyze USING vchordg (v vector_l2_ops);
+
+statement ok
+DELETE FROM vchordg_analyze WHERE id % 10 = 0;
+
+statement ok
+VACUUM vchordg_analyze;
+
+statement ok
+CHECKPOINT;
+
+statement ok
+DO $$
+DECLARE
+  before pg_lsn := pg_current_wal_insert_lsn();
+  size bigint := pg_relation_size('vchordg_analyze_idx');
+  wal numeric;
+BEGIN
+  ANALYZE vchordg_analyze;
+  wal := pg_wal_lsn_diff(pg_current_wal_insert_lsn(), before);
+  IF wal * 4 > size THEN
+    RAISE EXCEPTION 'ANALYZE wrote % bytes of WAL for a % byte index', wal, size;
+  END IF;
+END $$;
+
+# ANALYZE keeps the statistics written by VACUUM.
+query I
+SELECT reltuples::bigint FROM pg_class WHERE relname = 'vchordg_analyze_idx';
+----
+2700
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT id FROM vchordg_analyze ORDER BY v <-> '[10.2,10.2,10.2]' LIMIT 3;
+----
+11
+9
+12
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE vchordg_analyze;

@@ -183,7 +183,7 @@ pub unsafe extern "C-unwind" fn amoptions(
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn amcostestimate(
     _root: *mut pgrx::pg_sys::PlannerInfo,
-    _path: *mut pgrx::pg_sys::IndexPath,
+    path: *mut pgrx::pg_sys::IndexPath,
     _loop_count: f64,
     index_startup_cost: *mut pgrx::pg_sys::Cost,
     index_total_cost: *mut pgrx::pg_sys::Cost,
@@ -193,7 +193,22 @@ pub unsafe extern "C-unwind" fn amcostestimate(
 ) {
     unsafe {
         use pgrx::pg_sys::disable_cost;
-        if !gucs::vchordg_enable_scan() {
+        // Without ORDER BY or vector clauses, PostgreSQL still builds paths for
+        // a partial index whose predicate the query implies, and index-only
+        // paths when the query needs no columns. `amrescan` rejects the former,
+        // and this index cannot return tuple data for the latter.
+        let unusable = ((*path).indexorderbys.is_null() && (*path).indexclauses.is_null())
+            || (*path).path.pathtype == pgrx::pg_sys::NodeTag::T_IndexOnlyScan;
+        if unusable {
+            // Since PostgreSQL 18, `disable_cost` alone does not lose against
+            // paths disabled by `enable_*` settings, so count the path as
+            // disabled as well.
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
+            {
+                (*path).path.disabled_nodes += 1;
+            }
+        }
+        if unusable || !gucs::vchordg_enable_scan() {
             *index_startup_cost = disable_cost;
             *index_total_cost = disable_cost;
             *index_selectivity = 0.0;
@@ -265,7 +280,11 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
             pg_guard_ffi_boundary(|| callback(&mut ctid, callback_state))
         }
     };
-    crate::index::vchordg::dispatch::bulkdelete(opfamily, &index, check, callback);
+    let removed = crate::index::vchordg::dispatch::bulkdelete(opfamily, &index, check, callback);
+    unsafe {
+        (*stats).num_pages = relation_pages((*info).index);
+        (*stats).tuples_removed += removed as f64;
+    }
     stats
 }
 
@@ -274,6 +293,12 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     info: *mut pgrx::pg_sys::IndexVacuumInfo,
     stats: *mut pgrx::pg_sys::IndexBulkDeleteResult,
 ) -> *mut pgrx::pg_sys::IndexBulkDeleteResult {
+    // ANALYZE calls this without VACUUM. Nothing was deleted, so leave the
+    // index (and its statistics) untouched: `maintain` would rewrite and
+    // WAL-log every page.
+    if unsafe { (*info).analyze_only } {
+        return stats;
+    }
     let mut stats = stats;
     if stats.is_null() {
         stats = unsafe {
@@ -288,8 +313,22 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         pgrx::pg_sys::vacuum_delay_point(false);
     };
-    crate::index::vchordg::dispatch::maintain(opfamily, &index, check);
+    let live = crate::index::vchordg::dispatch::maintain(opfamily, &index, check);
+    unsafe {
+        (*stats).num_pages = relation_pages((*info).index);
+        (*stats).num_index_tuples = live as f64;
+        (*stats).estimated_count = false;
+    }
     stats
+}
+
+unsafe fn relation_pages(index_relation: pgrx::pg_sys::Relation) -> pgrx::pg_sys::BlockNumber {
+    unsafe {
+        pgrx::pg_sys::RelationGetNumberOfBlocksInFork(
+            index_relation,
+            pgrx::pg_sys::ForkNumber::MAIN_FORKNUM,
+        )
+    }
 }
 
 #[pgrx::pg_guard]

@@ -62,17 +62,22 @@ where
         };
         let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
         let pointers_s: &[_] = bump.alloc_slice(vertex_tuple.pointers());
+        // The vertex tuple holds the authoritative payload: `bulkdelete` clears
+        // it, but not the copy in the vector tuple. A deleted vertex (including
+        // the start vertex, which `maintain` never frees) is still traversed,
+        // but it is never emitted.
+        let payload_s = vertex_tuple.payload();
         let score_s = O::process(
             bits,
             dim,
             (vertex_tuple.metadata(), vertex_tuple.elements()),
             &lut,
         );
-        candidates.push((Reverse(score_s), AlwaysEqual(pointers_s)));
+        candidates.push((Reverse(score_s), AlwaysEqual((pointers_s, payload_s))));
     }
     let mut iter = std::iter::from_fn(move || {
-        while let Some(((_, AlwaysEqual(pointers_u)), guards)) = candidates.pop() {
-            let Ok((dis_u, outs_u, payload_u, _)) = crate::vectors::read::<R, O, _, _>(
+        while let Some(((_, AlwaysEqual((pointers_u, payload_u))), guards)) = candidates.pop() {
+            let Ok((dis_u, outs_u, _, _)) = crate::vectors::read::<R, O, _, _>(
                 by_prefetch::<R>(guards, pointers_u.iter().copied()),
                 LAccess::new(
                     O::Vector::unpack(vector),
@@ -103,14 +108,15 @@ where
                     continue;
                 };
                 let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-                let pointers_v = bump.alloc_slice(vertex_tuple.pointers());
+                let pointers_v: &[_] = bump.alloc_slice(vertex_tuple.pointers());
+                let payload_v = vertex_tuple.payload();
                 let score_v = O::process(
                     bits,
                     dim,
                     (vertex_tuple.metadata(), vertex_tuple.elements()),
                     &lut,
                 );
-                candidates.push((Reverse(score_v), AlwaysEqual(pointers_v)));
+                candidates.push((Reverse(score_v), AlwaysEqual((pointers_v, payload_v))));
             }
             return Some((Reverse(dis_u), AlwaysEqual(payload_u)));
         }

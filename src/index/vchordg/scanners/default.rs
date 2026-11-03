@@ -91,7 +91,12 @@ impl SearchBuilder for DefaultBuilder {
     {
         let mut vector = None;
         let mut threshold = None;
-        let mut recheck = false;
+        // Let PostgreSQL recheck every sphere qual against the heap tuple. Only
+        // the first non-null sphere (when there is no ORDER BY vector) bounds
+        // the search, and index distances may differ from the operator's by
+        // rounding (e.g. vectors are normalized for cosine). Other spheres,
+        // including null ones, are filtered entirely by the recheck.
+        let recheck = !self.spheres.is_empty();
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
                 vector = Some(orderby_vector);
@@ -102,8 +107,6 @@ impl SearchBuilder for DefaultBuilder {
         for Sphere { center, radius } in self.spheres.into_iter().flatten() {
             if vector.is_none() {
                 (vector, threshold) = (Some(center), Some(radius));
-            } else {
-                recheck = true;
             }
         }
         let opfamily = self.opfamily;
@@ -903,8 +906,11 @@ impl SearchBuilder for DefaultBuilder {
                     }
                 }
             };
+        // `distance` is in the internal space (squared L2 for `l2_ops`, `2 - 2
+        // cos` for `cosine_ops`), while the sphere radius is in the output
+        // space of the SQL operator.
         let iter = if let Some(threshold) = threshold {
-            Box::new(iter.take_while(move |(distance, _)| distance.to_f32() < threshold))
+            Box::new(iter.take_while(move |(distance, _)| opfamily.output(*distance) < threshold))
         } else {
             iter
         };

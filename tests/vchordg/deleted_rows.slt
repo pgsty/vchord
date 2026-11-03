@@ -1,0 +1,80 @@
+# Bulk delete clears the payload of a vertex but not the copy stored with its
+# vector, and VACUUM never frees the start vertex. A search must not return a
+# deleted row: after VACUUM its heap TID can be reused by an unrelated row.
+
+statement ok
+CREATE TABLE vchordg_deleted (id int, v vector(3)) WITH (autovacuum_enabled = off);
+
+statement ok
+INSERT INTO vchordg_deleted SELECT i, ARRAY[i,i,i]::real[]::vector FROM generate_series(1, 300) i;
+
+statement ok
+CREATE INDEX vchordg_deleted_idx ON vchordg_deleted USING vchordg (v vector_l2_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+# The first rows include the start vertex, which is the first one inserted.
+statement ok
+DELETE FROM vchordg_deleted WHERE id <= 5;
+
+query I
+SELECT id FROM vchordg_deleted ORDER BY v <-> '[1,1,1]' LIMIT 3;
+----
+6
+7
+8
+
+statement ok
+VACUUM vchordg_deleted;
+
+query I
+SELECT id FROM vchordg_deleted ORDER BY v <-> '[1,1,1]' LIMIT 3;
+----
+6
+7
+8
+
+# The new rows reuse the heap slots of the deleted rows.
+statement ok
+INSERT INTO vchordg_deleted SELECT 100000 + i, ARRAY[9000+i,9000+i,9000+i]::real[]::vector FROM generate_series(1, 5) i;
+
+query I
+SELECT id FROM vchordg_deleted ORDER BY v <-> '[1,1,1]' LIMIT 3;
+----
+6
+7
+8
+
+query I
+SELECT id FROM vchordg_deleted ORDER BY v <-> '[9005,9005,9005]' LIMIT 3;
+----
+100005
+100004
+100003
+
+# Delete the neighbourhood of the start vertex as well. It stays in the graph
+# as an entry point and must keep leading the search to live vertices.
+statement ok
+DELETE FROM vchordg_deleted WHERE id <= 100;
+
+statement ok
+VACUUM vchordg_deleted;
+
+query I
+SELECT id FROM vchordg_deleted ORDER BY v <-> '[1,1,1]' LIMIT 3;
+----
+101
+102
+103
+
+query I
+SELECT count(*) FROM (SELECT id FROM vchordg_deleted ORDER BY v <-> '[50,50,50]' LIMIT 20) s WHERE id <= 100;
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE vchordg_deleted;
