@@ -344,6 +344,11 @@ impl VectorBorrowed for Rabitq4Borrowed<'_> {
 
     #[inline(always)]
     fn function_normalize(&self) -> Rabitq4Owned {
+        // See `VectBorrowed::function_normalize`: a zero vector stays zero
+        // instead of pretending to be the unit vector its middle code encodes.
+        if !(self.sum_of_x2 > 0.0 && self.sum_of_x2.is_finite()) {
+            return self.own();
+        }
         Rabitq4Owned {
             dim: self.dim,
             sum_of_x2: 1.0,

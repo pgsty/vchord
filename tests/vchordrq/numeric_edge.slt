@@ -1,0 +1,177 @@
+# Numeric edge cases: large-magnitude halfvec, zero vectors and cosine.
+
+# halfvec with elements in 0..=255: partial sums of the distance kernels exceed
+# the binary16 maximum (65504), so they must be accumulated in f32.
+
+statement ok
+CREATE TABLE numeric_edge_h (id int primary key, val halfvec(784));
+
+statement ok
+INSERT INTO numeric_edge_h
+SELECT i, ARRAY(
+    SELECT ('x' || substring(md5((784 * i + j)::text), 1, 2))::bit(8)::int
+    FROM generate_series(1, 784) j
+)::halfvec(784)
+FROM generate_series(1, 300) i;
+
+statement ok
+CREATE TABLE numeric_edge_h_exact AS
+SELECT
+    (SELECT array_agg(id) FROM (SELECT id FROM numeric_edge_h ORDER BY val <-> q LIMIT 10) s) AS l2,
+    (SELECT array_agg(id) FROM (SELECT id FROM numeric_edge_h ORDER BY val <=> q LIMIT 10) s) AS cos
+FROM (SELECT val AS q FROM numeric_edge_h WHERE id = 42) q;
+
+statement ok
+CREATE INDEX numeric_edge_h_l2 ON numeric_edge_h USING vchordrq (val halfvec_l2_ops)
+WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+SET enable_seqscan TO off;
+
+# The exact duplicate of the query ranks first.
+query I
+SELECT id FROM numeric_edge_h ORDER BY val <-> (SELECT val FROM numeric_edge_h WHERE id = 42) LIMIT 1;
+----
+42
+
+query I
+SELECT array_agg(id) = (SELECT l2 FROM numeric_edge_h_exact)
+FROM (SELECT id FROM numeric_edge_h ORDER BY val <-> (SELECT val FROM numeric_edge_h WHERE id = 42) LIMIT 10) s;
+----
+t
+
+statement ok
+DROP INDEX numeric_edge_h_l2;
+
+statement ok
+CREATE INDEX numeric_edge_h_cos ON numeric_edge_h USING vchordrq (val halfvec_cosine_ops)
+WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+query I
+SELECT id FROM numeric_edge_h ORDER BY val <=> (SELECT val FROM numeric_edge_h WHERE id = 42) LIMIT 1;
+----
+42
+
+query I
+SELECT array_agg(id) = (SELECT cos FROM numeric_edge_h_exact)
+FROM (SELECT id FROM numeric_edge_h ORDER BY val <=> (SELECT val FROM numeric_edge_h WHERE id = 42) LIMIT 10) s;
+----
+t
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE numeric_edge_h, numeric_edge_h_exact;
+
+# A stored zero vector is returned by an L2 index.
+
+statement ok
+CREATE TABLE numeric_edge_z (id int primary key, val vector(3));
+
+statement ok
+INSERT INTO numeric_edge_z VALUES
+    (0, '[0,0,0]'), (1, '[1,0,0]'), (2, '[0,2,0]'), (3, '[0,0,3]'), (4, '[4,4,4]');
+
+statement ok
+CREATE INDEX numeric_edge_z_l2 ON numeric_edge_z USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+SET enable_seqscan TO off;
+
+query IR
+SELECT id, val <-> '[0,0,0]' FROM numeric_edge_z ORDER BY val <-> '[0,0,0]' LIMIT 3;
+----
+0 0
+1 1
+2 2
+
+query I
+SELECT id FROM numeric_edge_z ORDER BY val <-> '[0.1,0,0]' LIMIT 3;
+----
+0
+1
+2
+
+statement ok
+DROP INDEX numeric_edge_z_l2;
+
+# Quick k-means (fewer rows than lists) uses rows as centroids, so every
+# vector equals its centroid.
+
+statement ok
+CREATE INDEX numeric_edge_z_l2 ON numeric_edge_z USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.internal]
+lists = [8]
+$$);
+
+statement ok
+SET vchordrq.probes = '8';
+
+query I
+SELECT id FROM numeric_edge_z ORDER BY val <-> '[0.1,0,0]' LIMIT 3;
+----
+0
+1
+2
+
+query I
+SELECT id FROM numeric_edge_z ORDER BY val <-> '[0,1.9,0]' LIMIT 3;
+----
+2
+0
+1
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+DROP INDEX numeric_edge_z_l2;
+
+# Under cosine, the distance to a zero vector is undefined (`<=>` is NaN and
+# sorts last in a sequential scan). The index treats the zero vector as
+# orthogonal to everything: it must never rank first.
+
+statement ok
+INSERT INTO numeric_edge_z VALUES (5, '[1,0.9,0.8]'), (6, '[1,0.5,0.2]'), (7, '[0,0,-1]');
+
+statement ok
+CREATE INDEX numeric_edge_z_cos ON numeric_edge_z USING vchordrq (val vector_cosine_ops)
+WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+query I
+SELECT id FROM numeric_edge_z ORDER BY val <=> '[1,1,1]' LIMIT 3;
+----
+4
+5
+6
+
+query I
+SELECT id FROM numeric_edge_z ORDER BY val <=> '[1,0,0]' LIMIT 1;
+----
+1
+
+query I
+SELECT id FROM numeric_edge_z ORDER BY val <=> '[-1,-1,-1]' LIMIT 1;
+----
+7
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE numeric_edge_z;

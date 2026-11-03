@@ -149,7 +149,7 @@ impl Opfamily {
             | Self::Rabitq8Cosine
             | Self::Rabitq4Cosine => x.to_f32() * 0.5,
             Self::VectorL2 | Self::HalfvecL2 | Self::Rabitq8L2 | Self::Rabitq4L2 => {
-                x.to_f32().sqrt()
+                x.to_f32().clamp(0.0, f32::INFINITY).sqrt()
             }
             Self::VectorIp | Self::HalfvecIp | Self::Rabitq8Ip | Self::Rabitq4Ip => x.to_f32(),
         }

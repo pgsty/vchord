@@ -93,7 +93,9 @@ pub fn new<'a>(
     let mut centroids = Square::with_capacity(d, c);
 
     for index in rand::seq::index::sample(&mut rng, samples.len(), c.min(samples.len())) {
-        centroids.push_slice(&samples[index]);
+        if crate::is_finite(&samples[index]) {
+            centroids.push_slice(&samples[index]);
+        }
     }
 
     if centroids.is_empty() && c == 1 {
@@ -106,11 +108,7 @@ pub fn new<'a>(
 
     pool.install(|| {
         if is_spherical {
-            use simd::Floating;
-            (&mut centroids).into_par_iter().for_each(|centroid| {
-                let l = f32::reduce_sum_of_x2(centroid).sqrt();
-                f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
-            });
+            (&mut centroids).into_par_iter().for_each(crate::normalize);
         }
     });
 
