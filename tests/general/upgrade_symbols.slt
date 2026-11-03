@@ -1,0 +1,31 @@
+# C symbols referenced by historical install scripts must stay loadable:
+# PostgreSQL resolves them whenever such functions are created, including
+# during ALTER EXTENSION UPDATE, pg_restore and pg_upgrade.
+# devtools/check-symbols.sh checks the full list against the built library.
+statement ok
+CREATE FUNCTION upgrade_symbols_typmod_out(integer) RETURNS cstring
+STRICT LANGUAGE c AS 'vchord', '_vchord_typmod_out_wrapper';
+
+statement ok
+CREATE FUNCTION upgrade_symbols_scalar8_in(cstring, oid, integer) RETURNS void
+STRICT LANGUAGE c AS 'vchord', '_vchord_scalar8_in_wrapper';
+
+statement ok
+CREATE FUNCTION upgrade_symbols_scalar8_out(integer) RETURNS cstring
+STRICT LANGUAGE c AS 'vchord', '_vchord_scalar8_out_wrapper';
+
+statement error the symbol _vchord_typmod_out_wrapper is removed in the extension
+SELECT upgrade_symbols_typmod_out(1);
+
+statement error could not find function "_vchord_typmod_out_wrapper_wrapper"
+CREATE FUNCTION upgrade_symbols_misnamed(integer) RETURNS cstring
+STRICT LANGUAGE c AS 'vchord', '_vchord_typmod_out_wrapper_wrapper';
+
+statement ok
+DROP FUNCTION upgrade_symbols_typmod_out(integer);
+
+statement ok
+DROP FUNCTION upgrade_symbols_scalar8_in(cstring, oid, integer);
+
+statement ok
+DROP FUNCTION upgrade_symbols_scalar8_out(integer);

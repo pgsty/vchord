@@ -365,3 +365,16 @@ impl VectorBorrowed for Rabitq8Borrowed<'_> {
         unimplemented!()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_checked_bounds_dim() {
+        let code = vec![0u8; 65536];
+        assert!(Rabitq8Borrowed::new_checked(65536, 1.0, 1.0, 0.0, 1.0, &code).is_none());
+        assert!(Rabitq8Borrowed::new_checked(65535, 1.0, 1.0, 0.0, 1.0, &code[1..]).is_some());
+        assert!(Rabitq8Borrowed::new_checked(0, 1.0, 1.0, 0.0, 1.0, &[]).is_none());
+    }
+}

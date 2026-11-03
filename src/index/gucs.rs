@@ -414,22 +414,33 @@ pub fn vchordrq_enable_scan() -> bool {
     VCHORDRQ_ENABLE_SCAN.get()
 }
 
+/// Parses a comma-separated list of positive probe counts.
+///
+/// Whitespace may surround each value but ends it, so `"1 0"` is rejected.
+/// For compatibility with dumps from upstream 1.1.1, a single trailing comma
+/// is accepted and ignored (`"10,"` is `[10]`); empty entries elsewhere and
+/// zero values are rejected. The empty string is the empty list.
 pub fn parse_probes(value: &CStr) -> Result<Vec<u32>, String> {
+    const ZERO: &str = "probe value must be greater than zero";
     let mut result = Vec::new();
     let mut current: Option<u32> = None;
-    let mut saw_separator = false;
+    // Whether whitespace has ended `current`.
+    let mut ended = false;
     for &c in value.to_bytes() {
         match c {
-            b' ' => continue,
+            c if c.is_ascii_whitespace() => ended = current.is_some(),
             b',' => {
-                saw_separator = true;
                 match current.take() {
-                    Some(0) => return Err("probe value must be greater than zero".to_owned()),
+                    Some(0) => return Err(ZERO.to_owned()),
                     Some(value) => result.push(value),
                     None => return Err("empty entry in probes".to_owned()),
                 }
+                ended = false;
             }
             b'0'..=b'9' => {
+                if ended {
+                    return Err("missing comma between probe values".to_owned());
+                }
                 let value = current.unwrap_or_default();
                 let Some(value) = value
                     .checked_mul(10)
@@ -439,18 +450,23 @@ pub fn parse_probes(value: &CStr) -> Result<Vec<u32>, String> {
                 };
                 current = Some(value);
             }
-            c => return Err(format!("unknown character in probes: ASCII = {c}")),
+            c => {
+                return Err(format!(
+                    "unknown character in probes: '{}'",
+                    c.escape_ascii()
+                ));
+            }
         }
     }
-    if let Some(current) = current {
-        if current == 0 {
-            return Err("probe value must be greater than zero".to_owned());
+    match current {
+        Some(0) => Err(ZERO.to_owned()),
+        Some(value) => {
+            result.push(value);
+            Ok(result)
         }
-        result.push(current);
-    } else if saw_separator {
-        return Err("empty entry in probes".to_owned());
+        // Either the empty list, or one trailing comma after the last value.
+        None => Ok(result),
     }
-    Ok(result)
 }
 
 pub unsafe fn vchordrq_probes(index: pgrx::pg_sys::Relation) -> Vec<u32> {

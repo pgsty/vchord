@@ -8,9 +8,26 @@ CREATE TABLE probes_validation (v vector(3));
 statement ok
 INSERT INTO probes_validation VALUES ('[1,2,3]'), ('[2,3,4]');
 
+# Upstream 1.1.1 accepted one trailing comma, so dumps may contain it.
+statement ok
+CREATE INDEX probes_validation_trailing_idx ON probes_validation USING vchordrq (v vector_l2_ops)
+WITH (options = 'build.internal.lists = [2, 2]', probes = '2,2,');
+
+query I
+SELECT count(*) FROM (SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 2) s;
+----
+2
+
+statement ok
+DROP INDEX probes_validation_trailing_idx;
+
 statement error empty entry in probes
 CREATE INDEX probes_validation_bad_idx ON probes_validation USING vchordrq (v vector_l2_ops)
-WITH (options = 'build.internal.lists = [2, 2]', probes = '2,');
+WITH (options = 'build.internal.lists = [2, 2]', probes = '2,,');
+
+statement error missing comma between probe values
+CREATE INDEX probes_validation_bad_idx ON probes_validation USING vchordrq (v vector_l2_ops)
+WITH (options = 'build.internal.lists = [2, 2]', probes = '2,1 0');
 
 statement ok
 CREATE INDEX probes_validation_idx ON probes_validation USING vchordrq (v vector_l2_ops)
@@ -29,7 +46,37 @@ statement error empty entry in probes
 SET vchordrq.probes = '1,,2';
 
 statement error empty entry in probes
+SET vchordrq.probes = ',';
+
+statement error empty entry in probes
+SET vchordrq.probes = '10,,';
+
+statement error empty entry in probes
+SET vchordrq.probes = '10, ,';
+
+statement ok
 SET vchordrq.probes = '10, ';
+
+statement ok
+SET vchordrq.probes = '10,';
+
+query T
+SHOW vchordrq.probes;
+----
+10,
+
+statement ok
+SET vchordrq.probes = ' ';
+
+statement ok
+SET vchordrq.probes = '';
+
+# Whitespace ends a value; it does not join digits.
+statement error missing comma between probe values
+SET vchordrq.probes = '1 0';
+
+statement error missing comma between probe values
+SET vchordrq.probes = '1,2 3';
 
 statement error probe value is out of range for u32
 SET vchordrq.probes = '4294967296,2';
@@ -37,8 +84,11 @@ SET vchordrq.probes = '4294967296,2';
 statement error probe value is out of range for u32
 SET vchordrq.probes = '999999999999999999999,2';
 
-statement error unknown character in probes
+statement error unknown character in probes: 'x'
 SET vchordrq.probes = '2,x';
+
+statement error unknown character in probes: '-'
+SET vchordrq.probes = '-1';
 
 # Each component and their sum must be safe at the u32 boundary.
 statement ok
@@ -53,7 +103,10 @@ statement ok
 RESET vchordrq.probes;
 
 statement error empty entry in probes
-ALTER INDEX probes_validation_idx SET (probes = '2,');
+ALTER INDEX probes_validation_idx SET (probes = '2,,');
+
+statement error missing comma between probe values
+ALTER INDEX probes_validation_idx SET (probes = '2 2');
 
 statement error probe value must be greater than zero
 ALTER INDEX probes_validation_idx SET (probes = '2,0');
@@ -62,7 +115,7 @@ statement error probe value is out of range for u32
 ALTER INDEX probes_validation_idx SET (probes = '4294967296,2');
 
 statement ok
-ALTER INDEX probes_validation_idx SET (probes = ' 2 , 2 ');
+ALTER INDEX probes_validation_idx SET (probes = ' 2 , 2 , ');
 
 query I
 SELECT count(*) FROM (SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 2) s;

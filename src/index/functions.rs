@@ -11,12 +11,13 @@ use crate::recorder::dump;
 use pgrx::datum::IntoDatum;
 use pgrx::iter::SetOfIterator;
 use pgrx::pg_sys::Oid;
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, CString, c_char};
 
 struct ClassInfo {
     relname: String,
     relam: Oid,
     relkind: c_char,
+    relowner: Oid,
 }
 
 unsafe fn heap_tuple_struct<T>(tuple: pgrx::pg_sys::HeapTuple) -> *const T {
@@ -61,6 +62,7 @@ fn class_info(reloid: Oid) -> Option<ClassInfo> {
                 .into_owned(),
             relam: (*class).relam,
             relkind: (*class).relkind,
+            relowner: (*class).relowner,
         }
     };
     unsafe { pgrx::pg_sys::ReleaseSysCache(tuple) };
@@ -86,10 +88,72 @@ fn validate_index(indexrelid: Oid, amname: &CStr, am_label: &str) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexAccess {
+    /// Loading index pages, like `pg_prewarm`: requires `SELECT` on the table.
+    Prewarm,
+    /// Reading recorded query vectors: requires `SELECT` on the table or
+    /// membership in `pg_read_all_stats`.
+    SampledValues,
+}
+
+/// Raises the standard "permission denied for table" error unless the current
+/// user owns the table of the index, has `SELECT` on it, or (for sampled
+/// values only) has the privileges of `pg_read_all_stats`.
+///
+/// The check is performed before any lock is taken on the index, so an
+/// unprivileged user cannot queue locks on another user's relations.
+fn check_index_access(indexrelid: Oid, access: IndexAccess) -> Oid {
+    let heaprelid = unsafe { pgrx::pg_sys::IndexGetRelation(indexrelid, true) };
+    if heaprelid == Oid::INVALID {
+        pgrx::error!("the relation does not exist");
+    }
+    let Some(heap) = class_info(heaprelid) else {
+        pgrx::error!("the relation does not exist");
+    };
+    let userid = unsafe { pgrx::pg_sys::GetUserId() };
+    let allowed = unsafe {
+        pgrx::pg_sys::has_privs_of_role(userid, heap.relowner)
+            || pgrx::pg_sys::pg_class_aclcheck(
+                heaprelid,
+                userid,
+                pgrx::pg_sys::ACL_SELECT as pgrx::pg_sys::AclMode,
+            ) == pgrx::pg_sys::AclResult::ACLCHECK_OK
+            || (access == IndexAccess::SampledValues
+                && pgrx::pg_sys::has_privs_of_role(
+                    userid,
+                    Oid::from(pgrx::pg_sys::ROLE_PG_READ_ALL_STATS),
+                ))
+    };
+    if !allowed {
+        let relname = CString::new(heap.relname).unwrap_or_default();
+        unsafe {
+            pgrx::pg_sys::aclcheck_error(
+                pgrx::pg_sys::AclResult::ACLCHECK_NO_PRIV,
+                pgrx::pg_sys::ObjectType::OBJECT_TABLE,
+                relname.as_ptr(),
+            );
+        }
+        unreachable!("aclcheck_error returned");
+    }
+    heaprelid
+}
+
+/// Opens the index after the access check, and verifies that the index was
+/// not dropped and replaced between the check and the lock acquisition.
+fn open_checked(indexrelid: Oid, access: IndexAccess) -> Index {
+    let heaprelid = check_index_access(indexrelid, access);
+    let relation = Index::open(indexrelid, pgrx::pg_sys::AccessShareLock as _);
+    if unsafe { pgrx::pg_sys::IndexGetRelation(indexrelid, true) } != heaprelid {
+        pgrx::error!("the relation does not exist");
+    }
+    relation
+}
+
 #[pgrx::pg_extern(sql = "")]
 fn _vchordg_prewarm(indexrelid: Oid) -> String {
     validate_index(indexrelid, c"vchordg", "vchordg");
-    let relation = Index::open(indexrelid, pgrx::pg_sys::AccessShareLock as _);
+    let relation = open_checked(indexrelid, IndexAccess::Prewarm);
     let opfamily = unsafe { crate::index::vchordg::opclass::opfamily(relation.raw()) };
     let index = unsafe { PostgresRelation::new(relation.raw()) };
     crate::index::vchordg::dispatch::prewarm(opfamily, &index)
@@ -98,7 +162,7 @@ fn _vchordg_prewarm(indexrelid: Oid) -> String {
 #[pgrx::pg_extern(sql = "")]
 fn _vchordrq_prewarm(indexrelid: Oid, height: i32) -> String {
     validate_index(indexrelid, c"vchordrq", "vchordrq");
-    let relation = Index::open(indexrelid, pgrx::pg_sys::AccessShareLock as _);
+    let relation = open_checked(indexrelid, IndexAccess::Prewarm);
     let opfamily = unsafe { crate::index::vchordrq::opclass::opfamily(relation.raw()) };
     let index = unsafe { PostgresRelation::new(relation.raw()) };
     crate::index::vchordrq::dispatch::prewarm(opfamily, &index, height)
@@ -132,8 +196,9 @@ impl Drop for Index {
 #[pgrx::pg_extern(sql = "")]
 fn _vchordrq_sampled_values(indexrelid: Oid) -> SetOfIterator<'static, String> {
     validate_index(indexrelid, c"vchordrq", "vchordrq");
-    // The user must have access to the index, if not, raise an error from Postgres.
-    let _relation = Index::open(indexrelid, pgrx::pg_sys::AccessShareLock as _);
+    // Sampled values are query vectors issued against the table, so they are
+    // only shown to users who may read the table or all statistics.
+    let _relation = open_checked(indexrelid, IndexAccess::SampledValues);
     let queries = dump(indexrelid.to_u32());
     SetOfIterator::new(queries)
 }

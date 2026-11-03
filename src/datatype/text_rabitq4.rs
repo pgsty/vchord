@@ -7,6 +7,7 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::datatype::memory_rabitq4::{Rabitq4Input, Rabitq4Output};
+use crate::datatype::rabitq_io;
 use pgrx::pg_sys::Oid;
 use std::ffi::{CStr, CString};
 use vector::rabitq4::Rabitq4Borrowed;
@@ -14,121 +15,19 @@ use vector::rabitq4::Rabitq4Borrowed;
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
 fn _vchord_rabitq4_in(input: &CStr, oid: Oid, typmod: i32) -> Rabitq4Output {
     let _ = (oid, typmod);
-    let mut input = input.to_bytes().iter();
-    let mut p0 = Vec::<f32>::new();
-    let mut p1 = Vec::<u8>::new();
-    {
-        loop {
-            let Some(c) = input.next().copied() else {
-                pgrx::error!("incorrect vector")
-            };
-            match c {
-                b' ' => (),
-                b'(' => break,
-                _ => pgrx::error!("incorrect vector"),
-            }
-        }
-    }
-    {
-        let mut s = Option::<String>::None;
-        loop {
-            let Some(c) = input.next().copied() else {
-                pgrx::error!("incorrect vector")
-            };
-            s = match (s, c) {
-                (s, b' ') => s,
-                (None, c @ (b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'+' | b'-')) => {
-                    Some(String::from(c as char))
-                }
-                (Some(s), c @ (b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'+' | b'-')) => {
-                    let mut x = s;
-                    x.push(c as char);
-                    Some(x)
-                }
-                (Some(s), b',') => {
-                    p0.push(s.parse().expect("failed to parse number"));
-                    None
-                }
-                (None, b',') => {
-                    pgrx::error!("incorrect vector")
-                }
-                (Some(s), b')') => {
-                    p0.push(s.parse().expect("failed to parse number"));
-                    break;
-                }
-                (None, b')') => break,
-                _ => pgrx::error!("incorrect vector"),
-            };
-        }
-    }
-    {
-        loop {
-            let Some(c) = input.next().copied() else {
-                pgrx::error!("incorrect vector")
-            };
-            match c {
-                b' ' => (),
-                b'[' => break,
-                _ => pgrx::error!("incorrect vector"),
-            }
-        }
-    }
-    {
-        let mut s = Option::<String>::None;
-        loop {
-            let Some(c) = input.next().copied() else {
-                pgrx::error!("incorrect vector")
-            };
-            s = match (s, c) {
-                (s, b' ') => s,
-                (None, c @ (b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'+' | b'-')) => {
-                    Some(String::from(c as char))
-                }
-                (Some(s), c @ (b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' | b'.' | b'+' | b'-')) => {
-                    let mut x = s;
-                    x.push(c as char);
-                    Some(x)
-                }
-                (Some(s), b',') => {
-                    p1.push(s.parse().expect("failed to parse number"));
-                    None
-                }
-                (None, b',') => {
-                    pgrx::error!("incorrect vector")
-                }
-                (Some(s), b']') => {
-                    p1.push(s.parse().expect("failed to parse number"));
-                    break;
-                }
-                (None, b']') => break,
-                _ => pgrx::error!("incorrect vector"),
-            };
-        }
-    }
-    if p0.len() != 4 {
-        pgrx::error!("incorrect vector");
-    }
-    if p1.is_empty() {
-        pgrx::error!("vector must have at least 1 dimension");
-    }
-    let sum_of_x2 = p0[0];
-    let norm_of_lattice = p0[1];
-    let sum_of_code = p0[2];
-    let sum_of_abs_x = p0[3];
-    let unpacked_code = p1;
+    let (metadata, unpacked_code) = rabitq_io::parse_text(input, "rabitq4", 15);
     let packed_code = rabitq::halfbyte::pack_code(&unpacked_code);
-    if let Some(x) = Rabitq4Borrowed::new_checked(
+    let Some(x) = Rabitq4Borrowed::new_checked(
         unpacked_code.len() as _,
-        sum_of_x2,
-        norm_of_lattice,
-        sum_of_code,
-        sum_of_abs_x,
+        metadata.sum_of_x2,
+        metadata.norm_of_lattice,
+        metadata.sum_of_code,
+        metadata.sum_of_abs_x,
         &packed_code,
-    ) {
-        Rabitq4Output::new(x)
-    } else {
-        pgrx::error!("incorrect vector");
-    }
+    ) else {
+        pgrx::error!("invalid input syntax for type rabitq4");
+    };
+    Rabitq4Output::new(x)
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]

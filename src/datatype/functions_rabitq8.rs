@@ -9,10 +9,36 @@
 use crate::datatype::memory_halfvec::{HalfvecInput, HalfvecOutput};
 use crate::datatype::memory_rabitq8::{Rabitq8Input, Rabitq8Output};
 use crate::datatype::memory_vector::{VectorInput, VectorOutput};
+use crate::datatype::rabitq_io;
 use simd::{Floating, f16};
 use vector::VectorBorrowed;
 use vector::rabitq8::Rabitq8Borrowed;
 use vector::vect::VectBorrowed;
+
+fn quantized(
+    dim: u32,
+    metadata: rabitq::byte::CodeMetadata,
+    sum_of_abs_x: f32,
+    elements: &[u8],
+) -> Rabitq8Output {
+    let metadata = rabitq_io::Metadata {
+        sum_of_x2: metadata.dis_u_2,
+        norm_of_lattice: metadata.norm_of_lattice,
+        sum_of_code: metadata.sum_of_code,
+        sum_of_abs_x,
+    };
+    // Non-finite metadata makes every distance NaN. Input functions still
+    // accept it so that values stored by earlier versions can be restored.
+    rabitq_io::check_quantized("rabitq8", metadata);
+    Rabitq8Output::new(Rabitq8Borrowed::new(
+        dim,
+        metadata.sum_of_x2,
+        metadata.norm_of_lattice,
+        metadata.sum_of_code,
+        metadata.sum_of_abs_x,
+        elements,
+    ))
+}
 
 #[pgrx::pg_extern(sql = "")]
 fn _vchord_vector_quantize_to_rabitq8(vector: VectorInput) -> Rabitq8Output {
@@ -22,14 +48,7 @@ fn _vchord_vector_quantize_to_rabitq8(vector: VectorInput) -> Rabitq8Output {
     rabitq::rotate::rotate_inplace(&mut vector);
     let (metadata, elements) = rabitq::byte::ugly_code(&vector);
     let elements = rabitq::byte::pack_code(&elements);
-    Rabitq8Output::new(Rabitq8Borrowed::new(
-        dim,
-        metadata.dis_u_2,
-        metadata.norm_of_lattice,
-        metadata.sum_of_code,
-        f32::reduce_sum_of_abs_x(&vector),
-        &elements,
-    ))
+    quantized(dim, metadata, f32::reduce_sum_of_abs_x(&vector), &elements)
 }
 
 #[pgrx::pg_extern(sql = "")]
@@ -40,14 +59,7 @@ fn _vchord_halfvec_quantize_to_rabitq8(vector: HalfvecInput) -> Rabitq8Output {
     rabitq::rotate::rotate_inplace(&mut vector);
     let (metadata, elements) = rabitq::byte::ugly_code(&vector);
     let elements = rabitq::byte::pack_code(&elements);
-    Rabitq8Output::new(Rabitq8Borrowed::new(
-        dim,
-        metadata.dis_u_2,
-        metadata.norm_of_lattice,
-        metadata.sum_of_code,
-        f32::reduce_sum_of_abs_x(&vector),
-        &elements,
-    ))
+    quantized(dim, metadata, f32::reduce_sum_of_abs_x(&vector), &elements)
 }
 
 #[pgrx::pg_extern(sql = "")]

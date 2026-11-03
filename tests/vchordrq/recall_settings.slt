@@ -1,0 +1,143 @@
+# vchordrq_evaluate_query_recall must not leak its ground-truth settings into
+# the caller's transaction, must probe every level of the index, and must use
+# the index reloptions when vchordrq.probes is not set.
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+CREATE TABLE recall_settings (id integer, val vector(3));
+
+statement ok
+INSERT INTO recall_settings
+SELECT i, ARRAY[sin(i), cos(i), sin(i * 3)]::vector(3) FROM generate_series(1, 2000) i;
+
+# Three levels of lists below the root: three probes.
+statement ok
+CREATE INDEX recall_settings_idx ON recall_settings USING vchordrq (val vector_l2_ops)
+WITH (options = 'build.internal.lists = [4, 16, 64]');
+
+statement ok
+BEGIN;
+
+statement ok
+SET LOCAL vchordrq.probes = '1,1,1';
+
+statement ok
+SET LOCAL vchordrq.epsilon = 0.5;
+
+query I
+SELECT vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM recall_settings ORDER BY val <-> '[0.5,0.5,0.5]' LIMIT 10$$
+) BETWEEN 0 AND 1;
+----
+t
+
+query T
+SELECT concat_ws(' ',
+    current_setting('vchordrq.probes'),
+    current_setting('vchordrq.epsilon'),
+    current_setting('vchordrq.max_scan_tuples'),
+    current_setting('vchordrq.enable_scan'));
+----
+1,1,1 0.5 -1 on
+
+# An exact search needs a plan without the vchordrq index; with seqscan
+# disabled the planner would still pick the (disabled) index scan.
+statement ok
+SET LOCAL enable_seqscan = on;
+
+query I
+SELECT vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM recall_settings ORDER BY val <-> '[0.5,0.5,0.5]' LIMIT 10$$,
+    exact_search => true
+) BETWEEN 0 AND 1;
+----
+t
+
+query T
+SELECT current_setting('vchordrq.enable_scan');
+----
+on
+
+statement ok
+COMMIT;
+
+# The probes reloption applies when vchordrq.probes is not set, both to the
+# rough pass and to the level count of the ground-truth pass; afterwards the
+# parameter is still unset.
+statement ok
+CREATE TABLE recall_settings_reloption (id integer, val vector(3));
+
+statement ok
+INSERT INTO recall_settings_reloption
+SELECT i, ARRAY[sin(i), cos(i), sin(i * 3)]::vector(3) FROM generate_series(1, 2000) i;
+
+statement ok
+CREATE INDEX recall_settings_reloption_idx ON recall_settings_reloption USING vchordrq (val vector_l2_ops)
+WITH (options = 'build.internal.lists = [8, 32]', probes = '1,1');
+
+statement ok
+BEGIN;
+
+query I
+SELECT vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM recall_settings_reloption ORDER BY val <-> '[0.5,0.5,0.5]' LIMIT 10$$
+) BETWEEN 0 AND 1;
+----
+t
+
+query T
+SELECT source FROM pg_settings WHERE name = 'vchordrq.probes';
+----
+default
+
+query I
+SELECT vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM recall_settings_reloption ORDER BY val <-> '[0.5,0.5,0.5]' LIMIT 10$$
+) BETWEEN 0 AND 1;
+----
+t
+
+# One probe per level reaches a single leaf list, far fewer than 200 rows,
+# while the ground truth probes every list.
+query I
+SELECT vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM recall_settings_reloption ORDER BY val <-> '[0.5,0.5,0.5]' LIMIT 200$$
+) < 1;
+----
+t
+
+query T
+SELECT concat_ws(' ', source, current_setting('vchordrq.probes') = '')
+FROM pg_settings WHERE name = 'vchordrq.probes';
+----
+default t
+
+statement ok
+COMMIT;
+
+# An explicit accu_probes is still honoured and restored.
+statement ok
+BEGIN;
+
+query I
+SELECT vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM recall_settings_reloption ORDER BY val <-> '[0.5,0.5,0.5]' LIMIT 10$$,
+    accu_probes => '8,32'
+) BETWEEN 0 AND 1;
+----
+t
+
+query T
+SELECT source FROM pg_settings WHERE name = 'vchordrq.probes';
+----
+default
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE recall_settings, recall_settings_reloption;
+
+statement ok
+RESET enable_seqscan;
