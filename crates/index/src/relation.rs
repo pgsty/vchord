@@ -93,6 +93,10 @@ pub trait RelationPrefetch: Relation {
 #[non_exhaustive]
 pub struct Hints {
     pub full: bool,
+    /// Submit reads in batches (PostgreSQL 18+). The sequence passed to
+    /// `read_stream` is then advanced in a context that must not block, so it
+    /// must not read other buffers, take locks, or evaluate user expressions,
+    /// as a prefilter does.
     pub batch: bool,
 }
 
