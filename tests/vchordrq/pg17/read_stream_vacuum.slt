@@ -1,0 +1,73 @@
+# A read_stream consumer may stop reading an item early, e.g. when a
+# concurrent VACUUM has freed the item's vector tuples. Its unread buffers must
+# not be handed to later items. 1024-dimensional vectors span several tuples.
+statement ok
+SET enable_seqscan = off;
+SET vchordrq.io_search = 'read_stream';
+SET vchordrq.io_rerank = 'read_stream';
+
+statement ok
+CREATE TABLE vchordrq_rs_vacuum (id int, v vector(1024)) WITH (autovacuum_enabled = off);
+INSERT INTO vchordrq_rs_vacuum
+SELECT i, ARRAY(SELECT sin(i * 0.731 + j * 0.017)::real FROM generate_series(1, 1024) j)::vector
+FROM generate_series(1, 3000) i;
+
+statement ok
+CREATE FUNCTION vchordrq_rs_vacuum_q() RETURNS vector(1024) IMMUTABLE LANGUAGE sql AS $$
+  SELECT ARRAY(SELECT cos(j * 0.013)::real FROM generate_series(1, 1024) j)::vector(1024)
+$$;
+CREATE FUNCTION vchordrq_rs_vacuum_move_all(c refcursor) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE n bigint;
+BEGIN
+  MOVE FORWARD ALL IN c;
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$;
+
+statement ok
+CREATE INDEX vchordrq_rs_vacuum_idx ON vchordrq_rs_vacuum USING vchordrq (v vector_l2_ops);
+
+statement ok
+DO $$
+DECLARE plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT id FROM vchordrq_rs_vacuum ORDER BY v <-> vchordrq_rs_vacuum_q()' INTO plan;
+  IF plan->0->'Plan'->>'Index Name' IS DISTINCT FROM 'vchordrq_rs_vacuum_idx' THEN
+    RAISE EXCEPTION 'expected vector index scan: %', plan;
+  END IF;
+END $$;
+
+statement ok
+DELETE FROM vchordrq_rs_vacuum WHERE id % 3 = 0;
+
+# Open the rerank stream, then free the deleted rows' vector tuples.
+statement ok
+BEGIN;
+DECLARE c NO SCROLL CURSOR FOR SELECT id FROM vchordrq_rs_vacuum ORDER BY v <-> vchordrq_rs_vacuum_q();
+FETCH 1 FROM c;
+
+connection vacuum
+statement ok
+VACUUM (INDEX_CLEANUP ON) vchordrq_rs_vacuum;
+
+query I
+SELECT vchordrq_rs_vacuum_move_all('c');
+----
+1999
+
+statement ok
+COMMIT;
+
+# The same scan without a concurrent VACUUM.
+query I
+SELECT count(*) FROM (SELECT id FROM vchordrq_rs_vacuum ORDER BY v <-> vchordrq_rs_vacuum_q()) s;
+----
+2000
+
+statement ok
+DROP TABLE vchordrq_rs_vacuum;
+DROP FUNCTION vchordrq_rs_vacuum_q();
+DROP FUNCTION vchordrq_rs_vacuum_move_all(refcursor);
+RESET vchordrq.io_search;
+RESET vchordrq.io_rerank;
+RESET enable_seqscan;

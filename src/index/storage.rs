@@ -304,13 +304,13 @@ impl<O: Opaque> RelationWriteTypes for PostgresRelation<O> {
     type WriteGuard<'a> = PostgresBufferWriteGuard<O>;
 }
 
-impl<O: Opaque> RelationWrite for PostgresRelation<O> {
-    fn write(&self, id: u32, tracking_freespace: bool) -> PostgresBufferWriteGuard<O> {
+impl<O: Opaque> PostgresRelation<O> {
+    /// Pins block `id` and locks it exclusively.
+    unsafe fn lock_exclusive(&self, id: u32) -> pgrx::pg_sys::Buffer {
         assert!(id != u32::MAX, "no such page");
         unsafe {
             use pgrx::pg_sys::{
-                BUFFER_LOCK_EXCLUSIVE, ForkNumber, GenericXLogRegisterBuffer, GenericXLogStart,
-                LockBuffer, ReadBufferExtended, ReadBufferMode,
+                BUFFER_LOCK_EXCLUSIVE, ForkNumber, LockBuffer, ReadBufferExtended, ReadBufferMode,
             };
             let buf = ReadBufferExtended(
                 self.raw,
@@ -320,6 +320,20 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
                 std::ptr::null_mut(),
             );
             LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE as _);
+            buf
+        }
+    }
+
+    /// Starts a WAL-logged change of `buf`, which must be pinned and locked
+    /// exclusively by `lock_exclusive(id)`.
+    unsafe fn start_write(
+        &self,
+        buf: pgrx::pg_sys::Buffer,
+        id: u32,
+        tracking_freespace: bool,
+    ) -> PostgresBufferWriteGuard<O> {
+        unsafe {
+            use pgrx::pg_sys::{GenericXLogRegisterBuffer, GenericXLogStart};
             let state = GenericXLogStart(self.raw);
             let page = NonNull::new(
                 GenericXLogRegisterBuffer(state, buf, 0).cast::<MaybeUninit<PostgresPage<O>>>(),
@@ -333,6 +347,15 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
                 id,
                 tracking_freespace,
             }
+        }
+    }
+}
+
+impl<O: Opaque> RelationWrite for PostgresRelation<O> {
+    fn write(&self, id: u32, tracking_freespace: bool) -> PostgresBufferWriteGuard<O> {
+        unsafe {
+            let buf = self.lock_exclusive(id);
+            self.start_write(buf, id, tracking_freespace)
         }
     }
     fn extend(
@@ -399,19 +422,26 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
     }
     fn search(&self, freespace: usize) -> Option<PostgresBufferWriteGuard<O>> {
         unsafe {
+            use pgrx::pg_sys::{
+                BufferGetPage, FreeSpaceMapVacuumRange, GetPageWithFreeSpace,
+                RecordPageWithFreeSpace, UnlockReleaseBuffer,
+            };
             loop {
-                let id = pgrx::pg_sys::GetPageWithFreeSpace(self.raw, freespace);
+                let id = GetPageWithFreeSpace(self.raw, freespace);
                 if id == u32::MAX {
                     return None;
                 }
-                let write = self.write(id, true);
-                if write.freespace() < freespace as _ {
-                    // the free space is recorded incorrectly
-                    pgrx::pg_sys::RecordPageWithFreeSpace(self.raw, id, write.freespace() as _);
-                    pgrx::pg_sys::FreeSpaceMapVacuumRange(self.raw, id, id + 1);
+                let buf = self.lock_exclusive(id);
+                let actual = (*BufferGetPage(buf).cast::<PostgresPage<O>>()).freespace();
+                if (actual as usize) < freespace {
+                    // The free space is recorded incorrectly. Correct the FSM
+                    // only: the page is unchanged, so it needs no WAL record.
+                    UnlockReleaseBuffer(buf);
+                    RecordPageWithFreeSpace(self.raw, id, actual as _);
+                    FreeSpaceMapVacuumRange(self.raw, id, id + 1);
                     continue;
                 }
-                return Some(write);
+                return Some(self.start_write(buf, id, true));
             }
         }
     }
@@ -498,11 +528,48 @@ pub struct PostgresReadStream<'b, O: Opaque, I: Iterator> {
     _phantom: PhantomData<fn(O) -> O>,
 }
 
-pub struct PostgresReadStreamGuards<O, I, L> {
+/// The buffers of one item of a `PostgresReadStream`.
+///
+/// `read_stream_next_buffer` returns buffers strictly in callback order, which
+/// is the order of the items and of the blocks within each item. A consumer
+/// may stop early, so `Drop` releases the item's remaining buffers and the
+/// next item starts at its own first buffer.
+///
+/// `raw` is borrowed from the stream without a lifetime, because the guards
+/// type of `ReadStream` cannot borrow the stream. Callers must drop the guards
+/// before the stream, and before taking the next item from it. All current
+/// consumers do so: they pass the guards by value to a reader and drop them
+/// before the next `next`/`next_if`.
+pub struct PostgresReadStreamGuards<O, I, L: Iterator<Item = u32>> {
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     raw: *mut pgrx::pg_sys::ReadStream,
     list: L,
     _phantom: PhantomData<fn(O, I) -> (O, I)>,
+}
+
+/// Returns the next buffer of the stream, which must hold block `expected`.
+#[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+unsafe fn read_stream_next_expected(
+    raw: *mut pgrx::pg_sys::ReadStream,
+    expected: u32,
+) -> pgrx::pg_sys::Buffer {
+    unsafe {
+        use pgrx::pg_sys::{
+            Buffer, BufferGetBlockNumber, InvalidBuffer, ReleaseBuffer, read_stream_next_buffer,
+        };
+        let buf = read_stream_next_buffer(raw, core::ptr::null_mut());
+        if buf == InvalidBuffer as Buffer {
+            panic!("internal error: read stream ended before block {expected}");
+        }
+        let actual = BufferGetBlockNumber(buf);
+        if actual != expected {
+            ReleaseBuffer(buf);
+            panic!(
+                "internal error: read stream returned block {actual}, expected block {expected}"
+            );
+        }
+        buf
+    }
 }
 
 impl<O: Opaque, I: Iterator, L> Iterator for PostgresReadStreamGuards<O, I, L>
@@ -518,24 +585,33 @@ where
 
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     fn next(&mut self) -> Option<Self::Item> {
-        let _id = self.list.next()?;
+        let id = self.list.next()?;
         unsafe {
-            use pgrx::pg_sys::{
-                BUFFER_LOCK_SHARE, BufferGetPage, LockBuffer, read_stream_next_buffer,
-            };
-            let buf = read_stream_next_buffer(self.raw, core::ptr::null_mut());
+            use pgrx::pg_sys::{BUFFER_LOCK_SHARE, BufferGetPage, LockBuffer};
+            let buf = read_stream_next_expected(self.raw, id);
             LockBuffer(buf, BUFFER_LOCK_SHARE as _);
             let page = NonNull::new(BufferGetPage(buf).cast()).expect("failed to get page");
-            Some(PostgresBufferReadGuard {
-                buf,
-                page,
-                id: pgrx::pg_sys::BufferGetBlockNumber(buf),
-            })
+            Some(PostgresBufferReadGuard { buf, page, id })
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         self.list.size_hint()
+    }
+}
+
+#[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+impl<O, I, L: Iterator<Item = u32>> Drop for PostgresReadStreamGuards<O, I, L> {
+    fn drop(&mut self) {
+        // After an error, PostgreSQL releases the pins and the stream.
+        if crate::index::cleanup::pg_cleanup_allowed() {
+            for id in self.list.by_ref() {
+                unsafe {
+                    let buf = read_stream_next_expected(self.raw, id);
+                    pgrx::pg_sys::ReleaseBuffer(buf);
+                }
+            }
+        }
     }
 }
 
@@ -677,6 +753,10 @@ impl<O: Opaque> RelationReadStream for PostgresRelation<O> {
             if hints.full {
                 flags |= pgrx::pg_sys::READ_STREAM_FULL;
             }
+            // In batch mode the callback must not block (see
+            // `pgaio_enter_batchmode`). The callback pulls `iter`, which may
+            // fetch heap tuples and evaluate quals (`vchordrq.prefilter`), so
+            // only pure in-memory sequences may set `batch`.
             #[cfg(any(feature = "pg18", feature = "pg19"))]
             if hints.batch {
                 flags |= pgrx::pg_sys::READ_STREAM_USE_BATCHING;
