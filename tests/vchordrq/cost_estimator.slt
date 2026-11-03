@@ -2,12 +2,13 @@
 #
 # The cost estimator must:
 #   1. Use the baserel's planner-computed row estimate to derive filter
-#      selectivity, then report index selectivity from the candidate count
-#      that the scan is expected to retrieve.
+#      selectivity, then report the full-path candidate count. PostgreSQL's
+#      LimitPath applies the top-level LIMIT fraction after the AM callback.
 #   2. Cap the candidate-processing term (`next_count`) by the IVF candidate
 #      budget (`node_count`), so absurdly small selectivity cannot inflate
 #      the reported cost past the work the index actually does.
-#   3. Degrade safely when planner stats are missing or extreme.
+#   3. Apply the candidate LIMIT only to KNN paths with `indexorderbys`.
+#   4. Degrade safely when planner stats are missing or extreme.
 #
 # ---------------------------------------------------------------------------
 # Setup
@@ -114,6 +115,23 @@ BEGIN
   FOR rec IN EXECUTE 'EXPLAIN ' || query LOOP
     IF rec LIKE pat THEN
       m := regexp_match(rec, '\.\.([0-9]+(?:\.[0-9]+)?) rows=');
+      IF m IS NOT NULL THEN RETURN m[1]::double precision; END IF;
+    END IF;
+  END LOOP;
+  RETURN NULL;
+END $$;
+
+# Helper: returns startup cost for the first plan node matching `pat`.
+statement ok
+CREATE OR REPLACE FUNCTION plan_node_startup_cost(query text, pat text) RETURNS double precision
+  LANGUAGE plpgsql AS $$
+DECLARE
+  rec text;
+  m   text[];
+BEGIN
+  FOR rec IN EXECUTE 'EXPLAIN ' || query LOOP
+    IF rec LIKE pat THEN
+      m := regexp_match(rec, 'cost=([0-9]+(?:\.[0-9]+)?)\.\.');
       IF m IS NOT NULL THEN RETURN m[1]::double precision; END IF;
     END IF;
   END LOOP;
@@ -389,6 +407,110 @@ statement ok
 RESET enable_seqscan;
 
 # ---------------------------------------------------------------------------
+# Case 12: a sphere/range filter without a KNN ORDER BY must scan all of the
+# index candidates. An unrelated LIMIT and ordinary ORDER BY must not reduce
+# the cost of the underlying IndexPath.
+# ---------------------------------------------------------------------------
+
+statement ok
+SET enable_seqscan = off;
+
+query B
+SELECT plan_node_total_cost(
+  'SELECT id FROM cost_test
+     WHERE v <<->> sphere(''[0,0,0]''::vector, 1)
+     ORDER BY category LIMIT 10',
+  '%Index Scan using cost_test_v on cost_test%'
+) = plan_node_total_cost(
+  'SELECT id FROM cost_test
+     WHERE v <<->> sphere(''[0,0,0]''::vector, 1)
+     ORDER BY category',
+  '%Index Scan using cost_test_v on cost_test%'
+);
+----
+t
+
+statement ok
+RESET enable_seqscan;
+
+# ---------------------------------------------------------------------------
+# Case 13: with a larger table, the double LIMIT reduction must not make the
+# KNN path look cheaper than a selective B-tree scan followed by a sort.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE cost_test_large (
+  id       int PRIMARY KEY,
+  category int NOT NULL,
+  v        vector(3) NOT NULL
+);
+
+statement ok
+INSERT INTO cost_test_large
+SELECT i,
+       (i % 100),
+       ARRAY[
+         (i % 97) / 97.0,
+         (i % 89) / 89.0,
+         (i % 83) / 83.0
+       ]::real[]::vector
+FROM generate_series(1, 50000) i;
+
+statement ok
+CREATE INDEX cost_test_large_v ON cost_test_large USING vchordrq (v vector_l2_ops);
+
+statement ok
+CREATE INDEX cost_test_large_cat ON cost_test_large (category);
+
+statement ok
+ANALYZE cost_test_large;
+
+query T
+SELECT plan_top_index(
+  'SELECT id FROM cost_test_large WHERE category = 42
+     ORDER BY v <-> ''[0,0,0]''::vector LIMIT 10'
+);
+----
+cost_test_large_cat
+
+# ---------------------------------------------------------------------------
+# Case 14: MaxSim operator classes must receive the normal nonzero cost path.
+# The old allowlist returned zero AM startup cost for these indexes.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE cost_test_maxsim (id int, val vector(2)[]);
+
+statement ok
+INSERT INTO cost_test_maxsim
+SELECT i,
+       ARRAY[ARRAY[(i % 97) / 97.0, (i % 89) / 89.0]::real[]::vector]
+FROM generate_series(1, 1000) i;
+
+statement ok
+CREATE INDEX cost_test_maxsim_v ON cost_test_maxsim USING vchordrq
+  (val vector_maxsim_ops)
+  WITH (options = $$build.internal.lists = []$$);
+
+statement ok
+ANALYZE cost_test_maxsim;
+
+statement ok
+SET enable_seqscan = off;
+
+query B
+SELECT plan_node_startup_cost(
+  'SELECT id FROM cost_test_maxsim
+     ORDER BY val @# ARRAY[''[0,0]''::vector] LIMIT 10',
+  '%Index Scan using cost_test_maxsim_v on cost_test_maxsim%'
+) > 0.0;
+----
+t
+
+statement ok
+RESET enable_seqscan;
+
+# ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
 
@@ -405,6 +527,12 @@ statement ok
 DROP TABLE cost_test_partial;
 
 statement ok
+DROP TABLE cost_test_large;
+
+statement ok
+DROP TABLE cost_test_maxsim;
+
+statement ok
 DROP FUNCTION slow_true(int);
 
 statement ok
@@ -412,6 +540,9 @@ DROP FUNCTION plan_top_index(text);
 
 statement ok
 DROP FUNCTION plan_node_total_cost(text, text);
+
+statement ok
+DROP FUNCTION plan_node_startup_cost(text, text);
 
 statement ok
 DROP FUNCTION top_total_cost(text);

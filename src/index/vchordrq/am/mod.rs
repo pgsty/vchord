@@ -289,7 +289,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         }
         // Non-vector filters are heap quals. Estimate how many candidates must
         // be retrieved to satisfy LIMIT separately from their survival rate.
-        let (total_rows, filter_selectivity) = {
+        let (total_rows, filtered_rows, filter_selectivity) = {
             let baserel = (*index_opt_info).rel;
             let total_rows = (*baserel).tuples;
             let param_info = (*path).path.param_info;
@@ -303,7 +303,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             } else {
                 1.0
             };
-            (total_rows, filter_selectivity)
+            (total_rows, filtered_rows, filter_selectivity)
         };
         // index exists
         if !(*index_opt_info).hypothetical {
@@ -323,6 +323,10 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                     | Opfamily::Rabitq4Cosine
                     | Opfamily::Rabitq4Ip
                     | Opfamily::Rabitq4L2
+                    | Opfamily::VectorMaxsim
+                    | Opfamily::HalfvecMaxsim
+                    | Opfamily::Rabitq8Maxsim
+                    | Opfamily::Rabitq4Maxsim
             ) {
                 *index_startup_cost = 0.0;
                 *index_total_cost = 0.0;
@@ -365,20 +369,37 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 pages += cost.cells[0] as f64;
                 pages
             };
+            // amcostestimate reports the cost of the complete IndexPath. A
+            // top-level LimitPath applies its own limit fraction later, so
+            // account for LIMIT here only by expanding the partial candidate
+            // count back to the equivalent complete-path count. This keeps
+            // candidate work, selectivity, and cost_index's heap/qual costs
+            // consistent and prevents LIMIT from being applied twice.
+            let limit_tuples = if !(*path).indexorderbys.is_null()
+                && (*path).path.param_info.is_null()
+                && (*root).limit_tuples > 0.0
+            {
+                Some((*root).limit_tuples)
+            } else {
+                None
+            };
+            let limit_fraction = limit_tuples
+                .filter(|_| filtered_rows > 0.0)
+                .map(|limit| (limit / filtered_rows).clamp(1e-9, 1.0))
+                .unwrap_or(1.0);
             // The scan cannot process more candidates than the configured IVF
             // budget, even for very selective filters or an unbounded query.
-            let next_count = if (*root).limit_tuples > 0.0 {
-                ((*root).limit_tuples * f64::min(1000.0, 1.0 / filter_selectivity)).min(node_count)
-            } else {
-                node_count
-            };
+            let next_count = limit_tuples
+                .map(|limit| (limit * f64::min(1000.0, 1.0 / filter_selectivity)).min(node_count))
+                .unwrap_or(node_count);
+            let full_path_count = next_count / limit_fraction;
             let scan_selectivity = if total_rows > 0.0 {
-                (next_count / total_rows).clamp(1e-9, 1.0)
+                (full_path_count / total_rows).clamp(1e-9, 1.0)
             } else {
                 1.0
             };
             *index_startup_cost = 0.001 * node_count;
-            *index_total_cost = 0.001 * node_count + next_count;
+            *index_total_cost = 0.001 * node_count + full_path_count;
             *index_selectivity = scan_selectivity;
             *index_correlation = 0.0;
             *index_pages = page_count;
