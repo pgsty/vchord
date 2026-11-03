@@ -58,12 +58,12 @@ impl Sampler for HeapSampler {
 
     fn sample(&self) -> Self::Sample {
         unsafe {
-            let state = NonNull::new_unchecked(Box::into_raw(Box::new(State {
+            let state = NonNull::from(Box::leak(Box::new(State {
                 blocks: None,
                 tuples: None,
             })));
             let sample_scan_state =
-                NonNull::new_unchecked(Box::into_raw(Box::new(pgrx::pg_sys::SampleScanState {
+                NonNull::from(Box::leak(Box::new(pgrx::pg_sys::SampleScanState {
                     tsmroutine: (&raw const TSM.0).cast_mut().cast(),
                     tsm_state: state.as_ptr().cast(),
                     ..core::mem::zeroed()

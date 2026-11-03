@@ -12,7 +12,8 @@
     "prereqs": {
         "runtime": {
             "requires": {
-                "PostgreSQL": "14.0.0"
+                "PostgreSQL": "14.0.0",
+                "vector": "0.7.0"
             }
         }
     },
