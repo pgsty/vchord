@@ -1,0 +1,329 @@
+# A failed parent portal can outlive the ResourceOwner and MemoryContext of
+# its FETCH. Cleanup after rollback must preserve the original error and must
+# not release stale PostgreSQL resources a second time (issue #12).
+statement ok
+SET enable_seqscan = off;
+CREATE TEMP TABLE scan_abort_backend AS SELECT pg_backend_pid() AS pid;
+CREATE TABLE vchordg_scan_abort (id int, v vector(3));
+INSERT INTO vchordg_scan_abort SELECT i, ARRAY[i,i,i]::real[]::vector
+FROM generate_series(1, 100) i;
+
+# Explicitly cover read_stream on PG17+ and prefetch_buffer on PG14-16.
+# The PG14-16 graph path is a smoke test: without read_stream it did not
+# reproduce #12. On those versions, rq heap rerank/prefilter detect the bug.
+statement ok
+DO $$
+DECLARE mode text := CASE WHEN current_setting('server_version_num')::int >= 170000
+                        THEN 'read_stream' ELSE 'prefetch_buffer' END;
+BEGIN
+  PERFORM set_config('vchordg.io_search', mode, false);
+  PERFORM set_config('vchordg.io_rerank', mode, false);
+END $$;
+
+statement ok
+CREATE FUNCTION vchordg_scan_abort_error(int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  RAISE EXCEPTION 'intentional scan error';
+END $$;
+CREATE FUNCTION vchordg_scan_abort_cancel(int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_cancel_backend(pg_backend_pid());
+  PERFORM pg_sleep(1);
+  RETURN $1;
+END $$;
+
+statement ok
+CREATE INDEX vchordg_scan_abort_idx ON vchordg_scan_abort USING vchordg (v vector_l2_ops);
+
+statement ok
+DO $$
+DECLARE plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT id FROM vchordg_scan_abort ORDER BY v <-> ''[0,0,0]'' LIMIT 10' INTO plan;
+  IF plan->0->'Plan'->'Plans'->0->>'Index Name' IS DISTINCT FROM 'vchordg_scan_abort_idx' THEN
+    RAISE EXCEPTION 'expected vector index scan: %', plan;
+  END IF;
+END $$;
+
+# S1: the parent portal outlives the failed subtransaction, then CLOSE runs.
+statement ok
+BEGIN;
+DECLARE bad NO SCROLL CURSOR FOR SELECT vchordg_scan_abort_error(id) FROM vchordg_scan_abort  ORDER BY v <-> '[0,0,0]' LIMIT 10;
+SAVEPOINT s;
+
+statement error intentional scan error
+FETCH 1 FROM bad;
+
+statement ok
+ROLLBACK TO s;
+
+statement error portal "bad" cannot be run
+FETCH 1 FROM bad;
+
+statement ok
+ROLLBACK TO s;
+CLOSE bad;
+COMMIT;
+
+# S2: transaction cleanup must also handle a failed portal without CLOSE.
+statement ok
+BEGIN;
+DECLARE bad NO SCROLL CURSOR FOR SELECT vchordg_scan_abort_error(id) FROM vchordg_scan_abort  ORDER BY v <-> '[0,0,0]' LIMIT 10;
+SAVEPOINT s;
+
+statement error intentional scan error
+FETCH 1 FROM bad;
+
+statement ok
+ROLLBACK TO s;
+COMMIT;
+
+# S3: OPEN outside the exception block, FETCH inside it, CLOSE afterwards.
+statement ok
+DO $$
+DECLARE c refcursor; x int; caught bool := false;
+BEGIN
+  OPEN c FOR SELECT vchordg_scan_abort_error(id) FROM vchordg_scan_abort  ORDER BY v <-> '[0,0,0]' LIMIT 10;
+  BEGIN
+    FETCH c INTO x;
+  EXCEPTION WHEN SQLSTATE 'P0001' THEN
+    IF SQLERRM <> 'intentional scan error' THEN RAISE; END IF;
+    caught := true;
+  END;
+  IF NOT caught THEN RAISE EXCEPTION 'expected scan error'; END IF;
+  CLOSE c;
+END $$;
+
+query I
+SELECT id FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 1;
+----
+1
+
+# Successful FETCH positions survive rollback; another failed cursor is isolated.
+statement ok
+BEGIN;
+DECLARE good NO SCROLL CURSOR FOR SELECT id FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+DECLARE bad NO SCROLL CURSOR FOR
+  SELECT vchordg_scan_abort_error(id) FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+SAVEPOINT s;
+
+query I
+FETCH 1 FROM good;
+----
+1
+
+statement error intentional scan error
+FETCH 1 FROM bad;
+
+statement ok
+ROLLBACK TO s;
+CLOSE bad;
+
+query I
+FETCH 2 FROM good;
+----
+2
+3
+
+statement ok
+CLOSE good;
+COMMIT;
+
+# A portal created in the subtransaction is removed by rollback.
+statement ok
+BEGIN;
+SAVEPOINT s;
+DECLARE child NO SCROLL CURSOR FOR SELECT id FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+
+query I
+FETCH 1 FROM child;
+----
+1
+
+statement ok
+ROLLBACK TO s;
+
+query I
+SELECT count(*) FROM pg_cursors WHERE name = 'child';
+----
+0
+
+statement ok
+COMMIT;
+
+# Unstarted portals and WITH HOLD exercise normal portal cleanup.
+statement ok
+BEGIN;
+DECLARE unstarted NO SCROLL CURSOR FOR SELECT id FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+CLOSE unstarted;
+DECLARE held NO SCROLL CURSOR WITH HOLD FOR SELECT id FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+
+query I
+FETCH 1 FROM held;
+----
+1
+
+statement ok
+COMMIT;
+
+query I
+FETCH 1 FROM held;
+----
+2
+
+statement ok
+CLOSE held;
+
+# Both direct errors and caught errors must leave the backend usable.
+statement error intentional scan error
+SELECT vchordg_scan_abort_error(id) FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+
+statement ok
+DO $$
+BEGIN
+  PERFORM vchordg_scan_abort_error(id) FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+EXCEPTION WHEN SQLSTATE 'P0001' THEN
+  IF SQLERRM <> 'intentional scan error' THEN RAISE; END IF;
+END $$;
+
+# Cancel while the parent cursor holds scan resources, then close it after rollback.
+statement ok
+BEGIN;
+DECLARE canceled NO SCROLL CURSOR FOR
+  SELECT vchordg_scan_abort_cancel(id) FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+SAVEPOINT s;
+
+statement error canceling statement due to user request
+FETCH 1 FROM canceled;
+
+statement ok
+ROLLBACK TO s;
+CLOSE canceled;
+COMMIT;
+
+# Timeout after the first tuple is produced, then let COMMIT clean the portal.
+statement ok
+CREATE FUNCTION vchordg_scan_abort_sleep(int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM pg_sleep(10);
+  RETURN $1;
+END $$;
+BEGIN;
+DECLARE timed_out NO SCROLL CURSOR FOR
+  SELECT vchordg_scan_abort_sleep(id) FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+SAVEPOINT s;
+SET LOCAL statement_timeout = '100ms';
+
+statement error canceling statement due to statement timeout
+FETCH 1 FROM timed_out;
+
+statement ok
+ROLLBACK TO s;
+COMMIT;
+DROP FUNCTION vchordg_scan_abort_sleep(int);
+
+# A successful subtransaction transfers its resources to the parent.
+statement ok
+BEGIN;
+SAVEPOINT s;
+DECLARE committed NO SCROLL CURSOR FOR
+  SELECT id FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+
+query I
+FETCH 1 FROM committed;
+----
+1
+
+statement ok
+RELEASE s;
+
+query I
+FETCH 1 FROM committed;
+----
+2
+
+statement ok
+CLOSE committed;
+COMMIT;
+
+# The correlated subplan rescans the same IndexScanState for each parameter.
+query I
+SELECT ARRAY(SELECT id FROM vchordg_scan_abort ORDER BY v <-> q LIMIT 1)
+FROM (VALUES ('[1,1,1]'::vector), ('[2,2,2]'::vector), ('[3,3,3]'::vector)) p(q);
+----
+{1}
+{2}
+{3}
+
+# Fail on the second rescan, after the first iterator has been replaced.
+statement error intentional scan error
+SELECT ARRAY(SELECT CASE WHEN n = 2 THEN vchordg_scan_abort_error(id) ELSE id END
+  FROM vchordg_scan_abort ORDER BY v <-> q LIMIT 1)
+FROM (VALUES (1, '[1,1,1]'::vector), (2, '[2,2,2]'::vector)) p(n, q);
+
+# Reuse a generic plan across an error and subsequent successful executions.
+statement ok
+SET plan_cache_mode = force_generic_plan;
+PREPARE scan_again(vector, bool) AS
+  SELECT CASE WHEN $2 THEN vchordg_scan_abort_error(id) ELSE id END FROM vchordg_scan_abort
+  ORDER BY v <-> $1 LIMIT 1;
+
+query I
+EXECUTE scan_again('[1,1,1]', false);
+----
+1
+
+statement error intentional scan error
+EXECUTE scan_again('[1,1,1]', true);
+
+query I
+EXECUTE scan_again('[2,2,2]', false);
+----
+2
+
+query I
+EXECUTE scan_again('[3,3,3]', false);
+----
+3
+
+statement ok
+DEALLOCATE scan_again;
+RESET plan_cache_mode;
+
+# Explicit buffer-only cleanup also runs on PG17+.
+statement ok
+SET vchordg.io_search = 'read_buffer';
+SET vchordg.io_rerank = 'read_buffer';
+
+statement ok
+DO $$
+DECLARE c refcursor; x int;
+BEGIN
+  OPEN c FOR SELECT vchordg_scan_abort_error(id) FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 10;
+  BEGIN
+    FETCH c INTO x;
+  EXCEPTION WHEN SQLSTATE 'P0001' THEN
+    IF SQLERRM <> 'intentional scan error' THEN RAISE; END IF;
+  END;
+  CLOSE c;
+END $$;
+
+query I
+SELECT id FROM vchordg_scan_abort ORDER BY v <-> '[0,0,0]' LIMIT 1;
+----
+1
+
+# All failures above must preserve this backend and its session state.
+query I
+SELECT (pid = pg_backend_pid())::int FROM scan_abort_backend;
+----
+1
+
+statement ok
+DROP TABLE vchordg_scan_abort;
+DROP TABLE scan_abort_backend;
+DROP FUNCTION vchordg_scan_abort_error(int);
+DROP FUNCTION vchordg_scan_abort_cancel(int);
+RESET vchordg.io_search;
+RESET vchordg.io_rerank;
+RESET enable_seqscan;

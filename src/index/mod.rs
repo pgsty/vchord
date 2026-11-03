@@ -6,6 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+mod cleanup;
 mod fetcher;
 mod functions;
 mod gucs;

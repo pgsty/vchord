@@ -82,7 +82,7 @@ impl HeapFetcher {
 
 impl Drop for HeapFetcher {
     fn drop(&mut self) {
-        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+        if crate::index::cleanup::pg_cleanup_allowed() {
             unsafe {
                 pgrx::pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
                 // free common resources
@@ -157,7 +157,7 @@ pub struct HeapTuple<'a> {
 
 impl Drop for HeapTuple<'_> {
     fn drop(&mut self) {
-        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+        if crate::index::cleanup::pg_cleanup_allowed() {
             unsafe {
                 pgrx::pg_sys::ExecClearTuple(self.this.slot);
             }

@@ -201,7 +201,7 @@ impl<Opaque> Deref for PostgresBufferReadGuard<Opaque> {
 
 impl<Opaque> Drop for PostgresBufferReadGuard<Opaque> {
     fn drop(&mut self) {
-        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+        if crate::index::cleanup::pg_cleanup_allowed() {
             unsafe {
                 pgrx::pg_sys::UnlockReleaseBuffer(self.buf);
             }
@@ -494,7 +494,7 @@ pub struct PostgresReadStream<'b, O: Opaque, I: Iterator> {
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     raw: *mut pgrx::pg_sys::ReadStream,
     // Because of `Box`'s special alias rules, `Box` cannot be used here.
-    cache: NonNull<Cache<'b, I>>,
+    cache: RawBox<Cache<'b, I>>,
     _phantom: PhantomData<fn(O) -> O>,
 }
 
@@ -619,12 +619,13 @@ where
 impl<'b, O: Opaque, I: Iterator> Drop for PostgresReadStream<'b, O, I> {
     fn drop(&mut self) {
         unsafe {
+            // Leave valid, empty callback data until read_stream_end finishes.
+            // The RawBox field is freed even if this cleanup raises an error.
             let _ = std::mem::take(self.cache.as_mut());
             #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
-            if !std::thread::panicking() && pgrx::pg_sys::IsTransactionState() {
+            if crate::index::cleanup::pg_cleanup_allowed() {
                 pgrx::pg_sys::read_stream_end(self.raw);
             }
-            let _ = box_from_non_null(self.cache);
         }
     }
 }
@@ -665,12 +666,12 @@ impl<O: Opaque> RelationReadStream for PostgresRelation<O> {
                 (*inner).pop_id().unwrap_or(InvalidBlockNumber)
             }
         }
-        let cache = box_into_non_null(Box::new(Cache {
+        let cache = RawBox::new(Cache {
             window: VecDeque::new(),
             tail: VecDeque::new(),
             iter: Some(iter),
             _phantom: PhantomData,
-        }));
+        });
         let raw = unsafe {
             let mut flags = pgrx::pg_sys::READ_STREAM_DEFAULT;
             if hints.full {
@@ -704,16 +705,36 @@ fn lp_flags(x: pgrx::pg_sys::ItemIdData) -> u32 {
     (x >> 15) & 0b11
 }
 
-// Emulate unstable library feature `box_vec_non_null`.
-// See https://github.com/rust-lang/rust/issues/130364.
+// Own callback data without Box's aliasing requirements when the owner moves.
+// Keeping an owner on the stack also frees it if read_stream_begin_relation fails.
+struct RawBox<T>(NonNull<T>);
 
-#[allow(dead_code)]
-#[must_use]
-fn box_into_non_null<T>(b: Box<T>) -> NonNull<T> {
-    unsafe { NonNull::new_unchecked(Box::into_raw(b)) }
+impl<T> RawBox<T> {
+    #[cfg_attr(
+        any(feature = "pg14", feature = "pg15", feature = "pg16"),
+        expect(dead_code)
+    )]
+    fn new(value: T) -> Self {
+        let ptr = Box::into_raw(Box::new(value));
+        Self(NonNull::new(ptr).expect("Box::into_raw returned a null pointer"))
+    }
+
+    #[cfg_attr(
+        any(feature = "pg14", feature = "pg15", feature = "pg16"),
+        expect(dead_code)
+    )]
+    fn as_ptr(&self) -> *mut T {
+        self.0.as_ptr()
+    }
+
+    // The caller must exclude access through the PostgreSQL callback pointer.
+    unsafe fn as_mut(&mut self) -> &mut T {
+        unsafe { self.0.as_mut() }
+    }
 }
 
-#[must_use]
-unsafe fn box_from_non_null<T>(ptr: NonNull<T>) -> Box<T> {
-    unsafe { Box::from_raw(ptr.as_ptr()) }
+impl<T> Drop for RawBox<T> {
+    fn drop(&mut self) {
+        unsafe { drop(Box::from_raw(self.0.as_ptr())) }
+    }
 }

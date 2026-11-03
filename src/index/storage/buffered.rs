@@ -35,9 +35,8 @@ impl<Opaque> BufferedPostgresRelation<Opaque> {
 impl<Opaque> Drop for BufferedPostgresRelation<Opaque> {
     fn drop(&mut self) {
         let free = self.list.get_mut();
-        // PostgreSQL owns cleanup after an error unwind; do not release buffers
-        // again while Rust is unwinding or after the transaction has ended.
-        if !std::thread::panicking() && unsafe { pgrx::pg_sys::IsTransactionState() } {
+        // PostgreSQL owns the unused preallocated buffers after a build error.
+        if crate::index::cleanup::pg_cleanup_allowed() {
             for &buf in free.iter() {
                 unsafe {
                     pgrx::pg_sys::ReleaseBuffer(buf);

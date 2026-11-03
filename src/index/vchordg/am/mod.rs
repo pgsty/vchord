@@ -303,7 +303,7 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     let scan = unsafe { pgrx::pg_sys::RelationGetIndexScan(index_relation, n_keys, n_orderbys) };
     let scanner: Scanner = Scanner {
         hack: None,
-        scanning: LazyCell::new(Box::new(|| Box::new(std::iter::empty()))),
+        scanning: None,
         bump: Box::new(bumpalo::Bump::new()),
     };
     unsafe {
@@ -334,7 +334,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             );
         }
         let scanner = &mut *(*scan).opaque.cast::<Scanner>();
-        scanner.scanning = LazyCell::new(Box::new(|| Box::new(std::iter::empty())));
+        drop(scanner.scanning.take());
         scanner.bump.reset();
         let opfamily = opfamily((*scan).indexRelation);
         let index = PostgresRelation::new((*scan).indexRelation);
@@ -370,7 +370,7 @@ pub unsafe extern "C-unwind" fn amrescan(
         };
         // PAY ATTENTATION: `scanning` references `bump`, so `scanning` must be dropped before `bump`.
         let bump = scanner.bump.as_ref();
-        scanner.scanning = match opfamily {
+        scanner.scanning = Some(match opfamily {
             Opfamily::VectorL2
             | Opfamily::VectorCosine
             | Opfamily::VectorIp
@@ -402,7 +402,7 @@ pub unsafe extern "C-unwind" fn amrescan(
                     builder.build(index, options, fetcher, bump, recorder)
                 }))
             }
-        };
+        });
     }
 }
 
@@ -423,7 +423,10 @@ pub unsafe extern "C-unwind" fn amgettuple(
         pgrx::error!("scanning with a non-MVCC-compliant snapshot is not supported");
     }
     let scanner = unsafe { (*scan).opaque.cast::<Scanner>().as_mut().unwrap_unchecked() };
-    if let Some((_, key, recheck)) = scanner.scanning.deref_mut().next() {
+    let Some(scanning) = scanner.scanning.as_mut() else {
+        return false;
+    };
+    if let Some((_, key, recheck)) = scanning.deref_mut().next() {
         unsafe {
             (*scan).xs_heaptid = key_to_ctid(key);
             (*scan).xs_recheck = recheck;
@@ -438,7 +441,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn amendscan(scan: pgrx::pg_sys::IndexScanDesc) {
     let scanner = unsafe { &mut *(*scan).opaque.cast::<Scanner>() };
-    scanner.scanning = LazyCell::new(Box::new(|| Box::new(std::iter::empty())));
+    drop(scanner.scanning.take());
     scanner.bump.reset();
 }
 
@@ -446,6 +449,16 @@ type Iter = Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
 
 pub struct Scanner {
     pub hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>,
-    scanning: LazyCell<Iter, Box<dyn FnOnce() -> Iter>>,
+    scanning: Option<LazyCell<Iter, Box<dyn FnOnce() -> Iter>>>,
     bump: Box<bumpalo::Bump>,
+}
+
+impl Drop for Scanner {
+    fn drop(&mut self) {
+        // The MemoryContext callback is the sole owner of this Scanner. Normal
+        // amendscan already emptied it; after an error PostgreSQL may have
+        // released its resources before this callback (even after ROLLBACK TO).
+        // Drop the iterator before the bump it borrows, freeing Rust memory only.
+        crate::index::cleanup::abandon(self.scanning.take());
+    }
 }
