@@ -13,6 +13,9 @@ concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   semver:
     runs-on: "ubuntu-latest"
@@ -21,9 +24,11 @@ jobs:
       - name: Semver
         id: semver
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TAG: ${{ github.event.inputs.tag || github.event.release.tag_name }}
         with:
           script: |
-            const tag = "${{ github.event.inputs.tag }}" || "${{ github.event.release.tag_name }}";
+            const tag = process.env.TAG;
             console.log(`Tag: ${tag}`);
             const r = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$/;
             if (!r.test(tag)) {
@@ -42,9 +47,13 @@ jobs:
         arch: ["x86_64", "aarch64"]
     runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
 
+    permissions:
+      contents: write
+
+    # Warnings are enforced by the Check workflow; a new rustc lint on release
+    # day must not fail an already-validated tag.
     env:
       RUSTUP_AUTO_INSTALL: "0"
-      RUSTFLAGS: "-Dwarnings"
       CARGO_TERM_COLOR: "always"
       RUST_BACKTRACE: "1"
 
@@ -74,10 +83,15 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/${{ needs.semver.outputs.SEMVER }}
 
       - name: Build
+        env:
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
         run: |
-          grep -q "default_version = '${{ needs.semver.outputs.SEMVER }}'" vchord.control || exit 1
+          grep -q "default_version = '${SEMVER}'" vchord.control || exit 1
+          test -f "sql/install/vchord--${SEMVER}.sql" || exit 1
           make build
 
       - name: Package (binary package)
@@ -87,8 +101,11 @@ jobs:
           VERSION: ${{ matrix.version }}
         run: |
           ARCH=$(uname -m)
-          (cd ./build && zip -r ~/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip .)
-          gh release upload --clobber $SEMVER ~/postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip
+          ASSET=postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip
+          (cd ./build && zip -r ~/${ASSET} .)
+          (cd ~ && sha256sum ${ASSET} > ${ASSET}.sha256)
+          # No --clobber: published assets must never be replaced silently.
+          gh release upload $SEMVER ~/${ASSET} ~/${ASSET}.sha256
 
       - name: Package (debian package)
         env:
@@ -116,7 +133,7 @@ jobs:
           mkdir -p ~/debian/DEBIAN
           echo "Package: postgresql-${VERSION}-vchord
           Version: ${SEMVER}-1
-          Depends: postgresql-${VERSION}, libgcc-s1, libc6 (>= 2.35)
+          Depends: postgresql-${VERSION}, postgresql-${VERSION}-pgvector, libgcc-s1, libc6 (>= 2.35)
           Section: database
           Priority: optional
           Architecture: ${PLATFORM}
@@ -128,8 +145,10 @@ jobs:
           Homepage: https://vchord.pgsty.com/" \
           > ~/debian/DEBIAN/control
           (cd ~/debian && find usr -type f -print0 | xargs -0 md5sum) > ~/debian/DEBIAN/md5sums
-          dpkg-deb --root-owner-group -Zxz --build ~/debian ~/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
-          gh release upload --clobber $SEMVER ~/postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
+          DEB=postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
+          dpkg-deb --root-owner-group -Zxz --build ~/debian ~/${DEB}
+          (cd ~ && sha256sum ${DEB} > ${DEB}.sha256)
+          gh release upload $SEMVER ~/${DEB} ~/${DEB}.sha256
 
   pgxn:
     runs-on: "ubuntu-latest"
@@ -142,6 +161,8 @@ jobs:
       - name: Checkout
         if: env.PGXN_PASSWORD != ''
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/${{ env.SEMVER }}
 
       - name: Upload
         if: env.PGXN_PASSWORD != ''
