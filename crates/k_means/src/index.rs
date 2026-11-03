@@ -89,6 +89,11 @@ pub fn update(
                 for i in (ctx.index()..samples.len()).step_by(ctx.num_threads()) {
                     let target = targets[i];
                     let sample = &samples[i];
+                    // A non-finite sample is "assigned" to the first centroid
+                    // (no distance compares less than NaN) and would poison it.
+                    if !crate::is_finite(sample) {
+                        continue;
+                    }
                     f32::vector_add_inplace(&mut sum[target], sample);
                     count[target] += 1.0;
                 }
@@ -106,13 +111,28 @@ pub fn update(
 
         sum.par_iter_mut()
             .zip(count.par_iter())
+            .filter(|(_, count)| **count != 0.0)
             .for_each(|(sum, count)| f32::vector_mul_scalar_inplace(sum, 1.0 / count));
+
+        // An empty cluster keeps its previous centroid (rather than `0 / 0`)
+        // until it is reseeded below.
+        for i in 0..c {
+            if count[i] == 0.0f32 {
+                sum[i].copy_from_slice(&centroids[i]);
+            }
+        }
 
         *centroids = sum;
 
         for i in 0..c {
             if count[i] != 0.0f32 {
                 continue;
+            }
+            // Reseeding splits a cluster with more than one sample. One always
+            // exists when every sample is finite (`n > c`); if non-finite
+            // samples were skipped, the loop below might never end without one.
+            if !count.iter().any(|&count| count > 1.0) {
+                break;
             }
             let mut o = 0;
             loop {
@@ -131,10 +151,7 @@ pub fn update(
         }
 
         if this.is_spherical {
-            centroids.into_par_iter().for_each(|centroid| {
-                let l = f32::reduce_sum_of_x2(centroid).sqrt();
-                f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
-            });
+            centroids.into_par_iter().for_each(crate::normalize);
         }
     });
 }

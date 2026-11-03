@@ -19,7 +19,10 @@ fn _vchord_rabitq4_operator_l2(lhs: Rabitq4Input<'_>, rhs: Rabitq4Input<'_>) -> 
     if lhs.dim() != rhs.dim() {
         pgrx::error!("dimension is not matched");
     }
-    Rabitq4Borrowed::operator_l2s(lhs, rhs).to_f32().sqrt()
+    Rabitq4Borrowed::operator_l2s(lhs, rhs)
+        .to_f32()
+        .clamp(0.0, f32::INFINITY)
+        .sqrt()
 }
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
@@ -62,7 +65,10 @@ fn _vchord_rabitq4_sphere_l2_in(
     if lhs.dim() != center.dim() {
         pgrx::error!("dimension is not matched");
     }
-    let d = Rabitq4Borrowed::operator_l2s(lhs, center).to_f32().sqrt();
+    let d = Rabitq4Borrowed::operator_l2s(lhs, center)
+        .to_f32()
+        .clamp(0.0, f32::INFINITY)
+        .sqrt();
     d < radius
 }
 

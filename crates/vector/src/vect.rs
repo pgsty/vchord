@@ -146,11 +146,19 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
         unimplemented!()
     }
 
+    /// Scales the vector to unit length.
+    ///
+    /// A vector whose norm is zero (or not finite) has no direction, and
+    /// scaling it by `1 / l` would fill it with NaN, so it is returned
+    /// unchanged. A zero vector therefore stays zero: its dot product with any
+    /// unit vector is 0, i.e. it is treated as orthogonal to everything.
     #[inline(always)]
     fn function_normalize(&self) -> VectOwned<S> {
         let mut data = self.0.to_vec();
         let l = S::reduce_sum_of_x2(&data).sqrt();
-        S::vector_mul_scalar_inplace(&mut data, 1.0 / l);
+        if l > 0.0 && l.is_finite() {
+            S::vector_mul_scalar_inplace(&mut data, 1.0 / l);
+        }
         VectOwned(data)
     }
 
@@ -208,5 +216,132 @@ impl<S: Floating> PartialOrd for VectBorrowed<'_, S> {
             }
         }
         Some(Ordering::Equal)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use simd::{F16, f16};
+
+    fn lcg(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    fn f16s(x: &[f32]) -> Vec<f16> {
+        x.iter().copied().map(f16::_from_f32).collect()
+    }
+
+    fn norm<S: Floating>(x: &[S]) -> f64 {
+        S::vector_to_f32(x)
+            .iter()
+            .map(|&x| x as f64 * x as f64)
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    #[test]
+    fn normalize_zero_vector() {
+        for n in [1, 2, 3, 64, 784] {
+            let zero = vec![0.0f32; n];
+            let r = VectBorrowed::new(&zero).function_normalize();
+            assert_eq!(r.slice(), &zero[..]);
+            let zero = f16s(&zero);
+            let r = VectBorrowed::new(&zero).function_normalize();
+            assert!(r.slice().iter().all(|x| x._to_f32() == 0.0));
+        }
+    }
+
+    #[test]
+    fn normalize_non_finite_norm() {
+        // `1e30^2` overflows f32, so the norm is infinite and `1 / l` is zero.
+        let x = vec![1e30f32, -1e30, 3.0];
+        let r = VectBorrowed::new(&x).function_normalize();
+        assert_eq!(r.slice(), &x[..]);
+    }
+
+    #[test]
+    fn normalize_unit_length() {
+        let mut rng = lcg(5);
+        for n in [1, 2, 3, 7, 64, 783, 784, 785] {
+            for scale in [1e-3f32, 1.0, 255.0, 60000.0] {
+                let x = (0..n).map(|_| rng() * scale).collect::<Vec<_>>();
+                let r = VectBorrowed::new(&x).function_normalize();
+                assert!((norm(r.slice()) - 1.0).abs() < 1e-5, "f32: n = {n}");
+                // Elements in `0..=255` (pixels) and up to the f16 maximum: the
+                // squared norm overflows binary16, and `1 / norm` underflows it.
+                let x = f16s(&x);
+                let r = VectBorrowed::new(&x).function_normalize();
+                let l = norm(r.slice());
+                assert!(
+                    (l - 1.0).abs() < 2e-3,
+                    "f16: n = {n}, scale = {scale}, l = {l}"
+                );
+            }
+            let x = (0..n)
+                .map(|_| (rng().abs() * 255.0).round())
+                .collect::<Vec<_>>();
+            if x.iter().any(|&x| x != 0.0) {
+                let r = VectBorrowed::new(&f16s(&x)).function_normalize();
+                let l = norm(r.slice());
+                assert!((l - 1.0).abs() < 2e-3, "f16 pixels: n = {n}, l = {l}");
+            }
+        }
+    }
+
+    #[test]
+    fn cosine_against_zero_vector() {
+        let x = vec![0.6f32, 0.8, 0.0];
+        let zero = vec![0.0f32; 3];
+        let (x, zero) = (VectBorrowed::new(&x), VectBorrowed::new(&zero));
+        // The exact cosine distance is undefined; it is NaN, which orders last.
+        let d = x.operator_cos(zero);
+        assert_eq!(d, Distance::NAN);
+        assert!(d > x.operator_cos(VectBorrowed::new(&[-0.6, -0.8, 0.0])));
+        // After normalization (as the cosine opclasses do), it is finite.
+        let (xn, zn) = (x.function_normalize(), zero.function_normalize());
+        let d = xn.as_borrowed().operator_dot(zn.as_borrowed()).to_f32();
+        assert_eq!(d, 0.0);
+        let d = xn.as_borrowed().operator_l2s(zn.as_borrowed()).to_f32();
+        assert!((d - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f16_large_magnitude_distances() {
+        let mut rng = lcg(9);
+        for n in [1, 3, 784, 785] {
+            let x = (0..n)
+                .map(|_| (rng().abs() * 255.0).round())
+                .collect::<Vec<_>>();
+            let y = (0..n)
+                .map(|_| (rng().abs() * 255.0).round())
+                .collect::<Vec<_>>();
+            let exact_l2s = std::iter::zip(&x, &y)
+                .map(|(&x, &y)| (x as f64 - y as f64).powi(2))
+                .sum::<f64>();
+            let exact_dot = std::iter::zip(&x, &y)
+                .map(|(&x, &y)| x as f64 * y as f64)
+                .sum::<f64>();
+            let (xh, yh) = (f16s(&x), f16s(&y));
+            let (xh, yh) = (VectBorrowed::new(&xh), VectBorrowed::new(&yh));
+            let l2s = xh.operator_l2s(yh).to_f32() as f64;
+            let dot = -xh.operator_dot(yh).to_f32() as f64;
+            assert!(
+                (l2s - exact_l2s).abs() <= 1e-5 * exact_l2s + 1e-3,
+                "n = {n}"
+            );
+            assert!(
+                (dot - exact_dot).abs() <= 1e-5 * exact_dot + 1e-3,
+                "n = {n}"
+            );
+            assert_eq!(xh.operator_l2s(xh), Distance::ZERO);
+            assert!((xh.norm() as f64 - norm(xh.slice())).abs() <= 1e-5 * norm(xh.slice()));
+        }
     }
 }

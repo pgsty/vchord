@@ -508,7 +508,11 @@ impl Operator for Op<VectOwned<f32>, L2S> {
         if let Some(centroid) = centroid {
             let residual = VectOwned::new(f32::vector_sub(vector.slice(), centroid.slice()));
             let code = Self::Vector::code(residual.as_borrowed());
-            let delta = {
+            let delta = if code.0.dis_u_2 == 0.0 {
+                // The vector equals its centroid: the residual is zero, so it has
+                // no direction and contributes nothing (the formula below is 0/0).
+                0.0
+            } else {
                 use std::iter::zip;
                 let dim = vector.dim();
                 let t = zip(&code.1, centroid.slice())
@@ -585,7 +589,11 @@ impl Operator for Op<VectOwned<f32>, Dot> {
         if let Some(centroid) = centroid {
             let residual = VectOwned::new(f32::vector_sub(vector.slice(), centroid.slice()));
             let code = Self::Vector::code(residual.as_borrowed());
-            let delta = {
+            let delta = if code.0.dis_u_2 == 0.0 {
+                // The vector equals its centroid: the residual is zero, so it has
+                // no direction and contributes nothing (the formula below is 0/0).
+                0.0
+            } else {
                 use std::iter::zip;
                 let dim = vector.dim();
                 let t = zip(&code.1, centroid.slice())
@@ -660,7 +668,11 @@ impl Operator for Op<VectOwned<f16>, L2S> {
         if let Some(centroid) = centroid {
             let residual = VectOwned::new(f16::vector_sub(vector.slice(), centroid.slice()));
             let code = Self::Vector::code(residual.as_borrowed());
-            let delta = {
+            let delta = if code.0.dis_u_2 == 0.0 {
+                // The vector equals its centroid: the residual is zero, so it has
+                // no direction and contributes nothing (the formula below is 0/0).
+                0.0
+            } else {
                 use std::iter::zip;
                 let dim = vector.dim();
                 let t = zip(&code.1, centroid.slice())
@@ -738,7 +750,11 @@ impl Operator for Op<VectOwned<f16>, Dot> {
         if let Some(centroid) = centroid {
             let residual = VectOwned::new(f16::vector_sub(vector.slice(), centroid.slice()));
             let code = Self::Vector::code(residual.as_borrowed());
-            let delta = {
+            let delta = if code.0.dis_u_2 == 0.0 {
+                // The vector equals its centroid: the residual is zero, so it has
+                // no direction and contributes nothing (the formula below is 0/0).
+                0.0
+            } else {
                 use std::iter::zip;
                 let dim = vector.dim();
                 let t = zip(&code.1, centroid.slice())

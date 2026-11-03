@@ -59,24 +59,53 @@ impl CodeMetadata {
 
 pub type Code = (CodeMetadata, Vec<bool>);
 
+/// Computes the RaBitQ factors of a vector.
+///
+/// For a non-degenerate vector this is the usual formula. Two inputs used to
+/// produce NaN, whose sign differs between CPUs:
+///
+/// * a zero vector (`0 / 0`): it has no direction, so both factors are zero
+///   and the estimates reduce to the exact distances (`|q|^2` and `0`);
+/// * `n == 1`, where `1 / x_0^2 - 1` is zero or a rounding error of either
+///   sign: the 1-bit code of a 1-dimensional vector is exact, so the error
+///   factor is zero.
+///
+/// Rounding can also make `1 / x_0^2 - 1` slightly negative for vectors whose
+/// elements all have the same magnitude; it is clamped to zero.
+fn metadata(n: usize, sum_of_abs_x: f32, sum_of_x_2: f32, factor_cnt: f32) -> CodeMetadata {
+    if sum_of_abs_x == 0.0 {
+        return CodeMetadata {
+            dis_u_2: sum_of_x_2,
+            factor_cnt,
+            factor_ip: 0.0,
+            factor_err: 0.0,
+        };
+    }
+    CodeMetadata {
+        dis_u_2: sum_of_x_2,
+        factor_cnt,
+        factor_ip: sum_of_x_2 / sum_of_abs_x,
+        factor_err: if n > 1 {
+            let dis_u = sum_of_x_2.sqrt();
+            let x_0 = sum_of_abs_x / dis_u / (n as f32).sqrt();
+            dis_u * (1.0 / (x_0 * x_0) - 1.0).max(0.0).sqrt() / (n as f32 - 1.0).sqrt()
+        } else {
+            0.0
+        },
+    }
+}
+
+fn factor_cnt(vector: &[f32]) -> f32 {
+    let cnt_pos = vector.iter().filter(|x| x.is_sign_positive()).count();
+    let cnt_neg = vector.iter().filter(|x| x.is_sign_negative()).count();
+    cnt_pos as f32 - cnt_neg as f32
+}
+
 pub fn code_metadata(vector: &[f32]) -> CodeMetadata {
     let n = vector.len();
     let sum_of_abs_x = f32::reduce_sum_of_abs_x(vector);
     let sum_of_x_2 = f32::reduce_sum_of_x2(vector);
-    CodeMetadata {
-        dis_u_2: sum_of_x_2,
-        factor_cnt: {
-            let cnt_pos = vector.iter().filter(|x| x.is_sign_positive()).count();
-            let cnt_neg = vector.iter().filter(|x| x.is_sign_negative()).count();
-            cnt_pos as f32 - cnt_neg as f32
-        },
-        factor_ip: sum_of_x_2 / sum_of_abs_x,
-        factor_err: {
-            let dis_u = sum_of_x_2.sqrt();
-            let x_0 = sum_of_abs_x / dis_u / (n as f32).sqrt();
-            dis_u * (1.0 / (x_0 * x_0) - 1.0).sqrt() / (n as f32 - 1.0).sqrt()
-        },
-    }
+    metadata(n, sum_of_abs_x, sum_of_x_2, factor_cnt(vector))
 }
 
 pub fn code_elements(vector: &[f32]) -> Vec<bool> {
@@ -89,32 +118,7 @@ pub fn code_elements(vector: &[f32]) -> Vec<bool> {
 }
 
 pub fn code(vector: &[f32]) -> Code {
-    let n = vector.len();
-    let sum_of_abs_x = f32::reduce_sum_of_abs_x(vector);
-    let sum_of_x_2 = f32::reduce_sum_of_x2(vector);
-    (
-        CodeMetadata {
-            dis_u_2: sum_of_x_2,
-            factor_cnt: {
-                let cnt_pos = vector.iter().filter(|x| x.is_sign_positive()).count();
-                let cnt_neg = vector.iter().filter(|x| x.is_sign_negative()).count();
-                cnt_pos as f32 - cnt_neg as f32
-            },
-            factor_ip: sum_of_x_2 / sum_of_abs_x,
-            factor_err: {
-                let dis_u = sum_of_x_2.sqrt();
-                let x_0 = sum_of_abs_x / dis_u / (n as f32).sqrt();
-                dis_u * (1.0 / (x_0 * x_0) - 1.0).sqrt() / (n as f32 - 1.0).sqrt()
-            },
-        },
-        {
-            let mut signs = Vec::new();
-            for i in 0..n {
-                signs.push(vector[i].is_sign_positive());
-            }
-            signs
-        },
-    )
+    (code_metadata(vector), code_elements(vector))
 }
 
 pub fn preprocess(vector: &[f32]) -> (BlockLut, BinaryLut) {
@@ -494,5 +498,164 @@ pub mod block {
             None
         };
         arrays.iter().chain(tailing).map(f).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    fn assert_finite(m: CodeMetadata) {
+        for x in m.into_array() {
+            assert!(x.is_finite(), "{m:?}");
+        }
+    }
+
+    /// The formula before zero vectors and `n == 1` were special-cased.
+    fn reference(vector: &[f32]) -> CodeMetadata {
+        let n = vector.len();
+        let sum_of_abs_x = f32::reduce_sum_of_abs_x(vector);
+        let sum_of_x_2 = f32::reduce_sum_of_x2(vector);
+        CodeMetadata {
+            dis_u_2: sum_of_x_2,
+            factor_cnt: factor_cnt(vector),
+            factor_ip: sum_of_x_2 / sum_of_abs_x,
+            factor_err: {
+                let dis_u = sum_of_x_2.sqrt();
+                let x_0 = sum_of_abs_x / dis_u / (n as f32).sqrt();
+                dis_u * (1.0 / (x_0 * x_0) - 1.0).sqrt() / (n as f32 - 1.0).sqrt()
+            },
+        }
+    }
+
+    fn estimate(vector: &[f32], query: &[f32], dot: bool) -> [(f32, f32); 2] {
+        let (metadata, elements) = code(vector);
+        let binary = {
+            let lut = binary::preprocess(query);
+            let sum = binary::accumulate(&binary::pack_code(&elements), &lut.1);
+            if dot {
+                binary::half_process_dot(sum, metadata, lut.0)
+            } else {
+                binary::half_process_l2s(sum, metadata, lut.0)
+            }
+        };
+        let block = {
+            let lut = block::preprocess(query);
+            let packed = crate::packing::padding_pack([crate::packing::pack_to_u4(&elements)]);
+            let sum = block::accumulate(&packed, &lut.1);
+            if dot {
+                block::half_process_dot(sum[0], metadata, lut.0)
+            } else {
+                block::half_process_l2s(sum[0], metadata, lut.0)
+            }
+        };
+        [binary, block]
+    }
+
+    #[test]
+    fn zero_vector() {
+        let mut rng = lcg(1);
+        for n in [1, 2, 3, 7, 64, 65, 784] {
+            for zero in [vec![0.0f32; n], vec![-0.0f32; n]] {
+                let m = code_metadata(&zero);
+                assert_finite(m);
+                assert_eq!((m.dis_u_2, m.factor_ip, m.factor_err), (0.0, 0.0, 0.0));
+                let query = (0..n).map(|_| rng() * 255.0).collect::<Vec<_>>();
+                let q2 = f32::reduce_sum_of_x2(&query);
+                // The estimates are exact for a zero vector.
+                for (rough, err) in estimate(&zero, &query, false) {
+                    assert_eq!((rough, err), (q2, 0.0), "n = {n}");
+                }
+                for (rough, err) in estimate(&zero, &query, true) {
+                    assert_eq!((rough, err), (0.0, 0.0), "n = {n}");
+                }
+                // A zero query against a zero vector.
+                for (rough, err) in estimate(&zero, &vec![0.0; n], false) {
+                    assert_eq!((rough, err), (0.0, 0.0), "n = {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_dimension() {
+        for x in [1.0f32, -1.0, 0.3, -255.0, 1e-20, 3.0e18] {
+            let m = code_metadata(&[x]);
+            assert_finite(m);
+            assert_eq!(m.factor_err, 0.0);
+            // `x * x / |x|`; `1e-20 * 1e-20` is subnormal.
+            assert!((m.factor_ip - x.abs()).abs() <= 1e-4 * x.abs(), "{m:?}");
+        }
+        for x in [1.0f32, -1.0, 0.3, -255.0] {
+            for q in [2.0f32, -2.0, 0.0, 255.0] {
+                for (rough, err) in estimate(&[x], &[q], false) {
+                    assert!(rough.is_finite() && err == 0.0, "x = {x}, q = {q}");
+                    let exact = (x - q) * (x - q);
+                    assert!(
+                        (rough - exact).abs() <= 1e-3 * (x * x + q * q),
+                        "x = {x}, q = {q}, rough = {rough}, exact = {exact}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn equal_magnitudes() {
+        // `x_0` is 1 up to rounding, so `1 / x_0^2 - 1` may round below zero.
+        for n in 1..300 {
+            for scale in [1.0f32, 0.1, 3.0, 255.0, 1e-3] {
+                let v = (0..n)
+                    .map(|i| if i % 3 == 0 { -scale } else { scale })
+                    .collect::<Vec<_>>();
+                let m = code_metadata(&v);
+                assert_finite(m);
+                // Mathematically zero; only rounding noise remains.
+                assert!(m.factor_err >= 0.0 && m.factor_err <= 1e-2 * scale, "{m:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_degenerate_metadata_is_unchanged() {
+        let mut rng = lcg(2);
+        for n in [2, 3, 7, 64, 100, 768, 784, 1536] {
+            for _ in 0..50 {
+                let v = (0..n).map(|_| rng() * 10.0).collect::<Vec<_>>();
+                let expected = reference(&v).into_array().map(f32::to_bits);
+                assert_eq!(code_metadata(&v).into_array().map(f32::to_bits), expected);
+                let (got, signs) = code(&v);
+                assert_eq!(got.into_array().map(f32::to_bits), expected);
+                assert_eq!(signs, code_elements(&v));
+            }
+        }
+    }
+
+    #[test]
+    fn residual_equal_to_centroid() {
+        // A centroid that is equal to a sample (quick k-means) leaves a zero residual.
+        let mut rng = lcg(3);
+        for n in [3, 64, 785] {
+            let sample = (0..n).map(|_| rng()).collect::<Vec<_>>();
+            let residual = f32::vector_sub(&sample, &sample);
+            assert_finite(code_metadata(&residual));
+            let query = (0..n).map(|_| rng()).collect::<Vec<_>>();
+            let dis_f = f32::reduce_sum_of_d2(&query, &sample);
+            let (metadata, elements) = code(&residual);
+            let lut = binary::preprocess(&query);
+            let sum = binary::accumulate(&binary::pack_code(&elements), &lut.1);
+            let (rough, err) = binary::half_process_l2s_residual(sum, metadata, lut.0, dis_f, 0.0);
+            assert_eq!((rough, err), (dis_f, 0.0));
+        }
     }
 }

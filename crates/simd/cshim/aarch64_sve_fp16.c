@@ -28,80 +28,81 @@
 typedef __fp16 f16;
 typedef float f32;
 
+// Both reductions accumulate in f32. Each half is loaded into the bottom of a
+// 32-bit container (`ld1h` with zero extension) and widened with `fcvt`, so
+// neither products nor differences nor partial sums are rounded to f16, which
+// would overflow at 65504.
+
+__attribute__((target("+sve"))) static inline svfloat32_t
+fp16_load_widen(svbool_t mask, const f16 *p) {
+  svuint32_t bits = svld1uh_u32(mask, (const uint16_t *)p);
+  return svcvt_f32_f16_x(mask, svreinterpret_f16_u32(bits));
+}
+
 __attribute__((target("+sve"))) float
 fp16_reduce_sum_of_xy_a3_512(size_t n, f16 *restrict a, f16 *restrict b) {
-  const size_t vl = svcnth();
-  svfloat16_t _0 = svdup_f16(0.0);
-  svfloat16_t _1 = svdup_f16(0.0);
+  const size_t vl = svcntw();
+  svfloat32_t _0 = svdup_f32(0.0f);
+  svfloat32_t _1 = svdup_f32(0.0f);
   while (n >= vl * 2) {
-    svbool_t mask = svptrue_b16();
-    svfloat16_t x_0 = svld1_f16(mask, a + 0 * vl);
-    svfloat16_t y_0 = svld1_f16(mask, b + 0 * vl);
-    svfloat16_t x_1 = svld1_f16(mask, a + 1 * vl);
-    svfloat16_t y_1 = svld1_f16(mask, b + 1 * vl);
-    _0 = svmla_f16_x(mask, _0, x_0, y_0);
-    _1 = svmla_f16_x(mask, _1, x_1, y_1);
+    svbool_t mask = svptrue_b32();
+    svfloat32_t x_0 = fp16_load_widen(mask, a + 0 * vl);
+    svfloat32_t y_0 = fp16_load_widen(mask, b + 0 * vl);
+    svfloat32_t x_1 = fp16_load_widen(mask, a + 1 * vl);
+    svfloat32_t y_1 = fp16_load_widen(mask, b + 1 * vl);
+    _0 = svmla_f32_x(mask, _0, x_0, y_0);
+    _1 = svmla_f32_x(mask, _1, x_1, y_1);
     n -= vl * 2, a += vl * 2, b += vl * 2;
   }
   if (n >= vl) {
-    svbool_t mask = svptrue_b16();
-    svfloat16_t x_0 = svld1_f16(mask, a + 0 * vl);
-    svfloat16_t y_0 = svld1_f16(mask, b + 0 * vl);
-    _0 = svmla_f16_x(mask, _0, x_0, y_0);
-    n -= vl * 1, a += vl * 1, b += vl * 1;
+    svbool_t mask = svptrue_b32();
+    svfloat32_t x_0 = fp16_load_widen(mask, a);
+    svfloat32_t y_0 = fp16_load_widen(mask, b);
+    _0 = svmla_f32_x(mask, _0, x_0, y_0);
+    n -= vl, a += vl, b += vl;
   }
   if (n > 0) {
-    svbool_t mask = svwhilelt_b16((int64_t)0, (int64_t)n);
-    svfloat16_t x_0 = svld1_f16(mask, a);
-    svfloat16_t y_0 = svld1_f16(mask, b);
-    _0 = svmla_f16_m(mask, _0, x_0, y_0);
+    svbool_t mask = svwhilelt_b32((int64_t)0, (int64_t)n);
+    svfloat32_t x_1 = fp16_load_widen(mask, a);
+    svfloat32_t y_1 = fp16_load_widen(mask, b);
+    _1 = svmla_f32_m(mask, _1, x_1, y_1);
   }
   svbool_t mask = svptrue_b32();
-  svfloat32_t s_0 = svcvt_f32_f16_x(mask, _0);
-  svfloat32_t s_1 = svcvt_f32_f16_x(mask, svext_f16(_0, _0, 1));
-  svfloat32_t s_2 = svcvt_f32_f16_x(mask, _1);
-  svfloat32_t s_3 = svcvt_f32_f16_x(mask, svext_f16(_1, _1, 1));
-  return svaddv_f32(mask, svadd_f32_x(mask, svadd_f32_x(mask, s_0, s_2),
-                                      svadd_f32_x(mask, s_1, s_3)));
+  return svaddv_f32(mask, svadd_f32_x(mask, _0, _1));
 }
 
 __attribute__((target("+sve"))) float
 fp16_reduce_sum_of_d2_a3_512(size_t n, f16 *restrict a, f16 *restrict b) {
-  const size_t vl = svcnth();
-  svfloat16_t _0 = svdup_f16(0.0);
-  svfloat16_t _1 = svdup_f16(0.0);
+  const size_t vl = svcntw();
+  svfloat32_t _0 = svdup_f32(0.0f);
+  svfloat32_t _1 = svdup_f32(0.0f);
   while (n >= vl * 2) {
-    svbool_t mask = svptrue_b16();
-    svfloat16_t x_0 = svld1_f16(mask, a + 0 * vl);
-    svfloat16_t y_0 = svld1_f16(mask, b + 0 * vl);
-    svfloat16_t x_1 = svld1_f16(mask, a + 1 * vl);
-    svfloat16_t y_1 = svld1_f16(mask, b + 1 * vl);
-    svfloat16_t d_0 = svsub_f16_z(mask, x_0, y_0);
-    svfloat16_t d_1 = svsub_f16_z(mask, x_1, y_1);
-    _0 = svmla_f16_x(mask, _0, d_0, d_0);
-    _1 = svmla_f16_x(mask, _1, d_1, d_1);
+    svbool_t mask = svptrue_b32();
+    svfloat32_t x_0 = fp16_load_widen(mask, a + 0 * vl);
+    svfloat32_t y_0 = fp16_load_widen(mask, b + 0 * vl);
+    svfloat32_t x_1 = fp16_load_widen(mask, a + 1 * vl);
+    svfloat32_t y_1 = fp16_load_widen(mask, b + 1 * vl);
+    svfloat32_t d_0 = svsub_f32_x(mask, x_0, y_0);
+    svfloat32_t d_1 = svsub_f32_x(mask, x_1, y_1);
+    _0 = svmla_f32_x(mask, _0, d_0, d_0);
+    _1 = svmla_f32_x(mask, _1, d_1, d_1);
     n -= vl * 2, a += vl * 2, b += vl * 2;
   }
   if (n >= vl) {
-    svbool_t mask = svptrue_b16();
-    svfloat16_t x_0 = svld1_f16(mask, a + 0 * vl);
-    svfloat16_t y_0 = svld1_f16(mask, b + 0 * vl);
-    svfloat16_t d_0 = svsub_f16_z(mask, x_0, y_0);
-    _0 = svmla_f16_x(mask, _0, d_0, d_0);
-    n -= vl * 1, a += vl * 1, b += vl * 1;
+    svbool_t mask = svptrue_b32();
+    svfloat32_t x_0 = fp16_load_widen(mask, a);
+    svfloat32_t y_0 = fp16_load_widen(mask, b);
+    svfloat32_t d_0 = svsub_f32_x(mask, x_0, y_0);
+    _0 = svmla_f32_x(mask, _0, d_0, d_0);
+    n -= vl, a += vl, b += vl;
   }
   if (n > 0) {
-    svbool_t mask = svwhilelt_b16((int64_t)0, (int64_t)n);
-    svfloat16_t x_0 = svld1_f16(mask, a);
-    svfloat16_t y_0 = svld1_f16(mask, b);
-    svfloat16_t d_0 = svsub_f16_z(mask, x_0, y_0);
-    _0 = svmla_f16_m(mask, _0, d_0, d_0);
+    svbool_t mask = svwhilelt_b32((int64_t)0, (int64_t)n);
+    svfloat32_t x_1 = fp16_load_widen(mask, a);
+    svfloat32_t y_1 = fp16_load_widen(mask, b);
+    svfloat32_t d_1 = svsub_f32_z(mask, x_1, y_1);
+    _1 = svmla_f32_m(mask, _1, d_1, d_1);
   }
   svbool_t mask = svptrue_b32();
-  svfloat32_t s_0 = svcvt_f32_f16_x(mask, _0);
-  svfloat32_t s_1 = svcvt_f32_f16_x(mask, svext_f16(_0, _0, 1));
-  svfloat32_t s_2 = svcvt_f32_f16_x(mask, _1);
-  svfloat32_t s_3 = svcvt_f32_f16_x(mask, svext_f16(_1, _1, 1));
-  return svaddv_f32(mask, svadd_f32_x(mask, svadd_f32_x(mask, s_0, s_2),
-                                      svadd_f32_x(mask, s_1, s_3)));
+  return svaddv_f32(mask, svadd_f32_x(mask, _0, _1));
 }

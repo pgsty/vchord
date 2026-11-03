@@ -1,0 +1,56 @@
+# The RaBitQ estimate of `|v - v|^2` cancels catastrophically and could come
+# out slightly negative, so `v <-> v` (its square root) was NaN.
+
+statement ok
+CREATE TABLE numeric_edge_r (id int, v vector(64));
+
+statement ok
+INSERT INTO numeric_edge_r
+SELECT i, ARRAY(SELECT sin(i * 64 + j) FROM generate_series(1, 64) j)::vector(64)
+FROM generate_series(1, 1000) i;
+
+# PostgreSQL orders NaN above every number, so test for it explicitly.
+query I
+SELECT count(*) FROM (SELECT quantize_to_rabitq8(v) <-> quantize_to_rabitq8(v) AS d FROM numeric_edge_r) s
+WHERE d = 'NaN'::real OR d < 0;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT quantize_to_rabitq4(v) <-> quantize_to_rabitq4(v) AS d FROM numeric_edge_r) s
+WHERE d = 'NaN'::real OR d < 0;
+----
+0
+
+query I
+SELECT max(quantize_to_rabitq8(v) <-> quantize_to_rabitq8(v)) < 0.01 FROM numeric_edge_r;
+----
+t
+
+# A vector is inside a sphere centered on itself.
+query I
+SELECT count(*) FROM numeric_edge_r
+WHERE NOT (quantize_to_rabitq8(v) <<->> ROW(quantize_to_rabitq8(v), 0.01)::sphere_rabitq8);
+----
+0
+
+query I
+SELECT count(*) FROM numeric_edge_r
+WHERE NOT (quantize_to_rabitq4(v) <<->> ROW(quantize_to_rabitq4(v), 0.1)::sphere_rabitq4);
+----
+0
+
+statement ok
+DROP TABLE numeric_edge_r;
+
+# The L2 distance to a quantized zero vector is exact.
+
+query I
+SELECT quantize_to_rabitq8('[0,0,0]'::vector) <-> quantize_to_rabitq8('[3,4,0]'::vector);
+----
+5
+
+query I
+SELECT quantize_to_rabitq4('[0,0,0]'::vector) <-> quantize_to_rabitq4('[0,0,0]'::vector);
+----
+0

@@ -1634,7 +1634,11 @@ fn make_internal_build(
                     if is_spherical {
                         (&mut centroids).into_par_iter().for_each(|centroid| {
                             let l = f32::reduce_sum_of_x2(centroid).sqrt();
-                            f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
+                            // A zero (or non-finite) norm has no direction; scaling
+                            // by 1 / l would fill the centroid with NaN.
+                            if l > 0.0 && l.is_finite() {
+                                f32::vector_mul_scalar_inplace(centroid, 1.0 / l);
+                            }
                         });
                     }
 

@@ -165,15 +165,24 @@ pub fn new<'a>(
     let mut partitions = vec![];
     let mut offsets = vec![];
     let mut offset = 0;
-    for (samples, c) in std::iter::zip(partition(samples, &groups), seats) {
-        partitions.push(crate::lloyd_k_means(
-            pool,
-            d,
-            samples,
-            c,
-            seed,
-            is_spherical,
-        ));
+    for (i, (samples, c)) in std::iter::zip(partition(samples, &groups), seats).enumerate() {
+        if samples.is_empty() && c == 1 {
+            // No sample is assigned to this coarse centroid, but it still
+            // represents its region. Otherwise the seat would get a zero
+            // vector (and, for spherical k-means, used to get NaN).
+            let mut centroids = Square::with_capacity(d, 1);
+            centroids.push_slice(&coarse_centroids[i]);
+            partitions.push(crate::quick::from_centroids(centroids));
+        } else {
+            partitions.push(crate::lloyd_k_means(
+                pool,
+                d,
+                samples,
+                c,
+                seed,
+                is_spherical,
+            ));
+        }
         offsets.push(offset);
         offset += c;
     }

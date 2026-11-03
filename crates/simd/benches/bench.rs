@@ -111,14 +111,6 @@ fn floating_f16_reduce_sum_of_xy(c: &mut Criterion) {
         .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
         .collect::<Vec<_>>();
     #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") && simd::is_feature_detected!("avx512fp16") {
-        c.bench_function("floating_f16::reduce_sum_of_xy::v4_avx512fp16", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_v4_avx512fp16(&x, &y)
-            })
-        });
-    }
-    #[cfg(target_arch = "x86_64")]
     if simd::is_cpu_detected!("v4") {
         c.bench_function("floating_f16::reduce_sum_of_xy::v4", |b| {
             b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_v4(&x, &y) })
@@ -139,11 +131,17 @@ fn floating_f16_reduce_sum_of_xy(c: &mut Criterion) {
         });
     }
     #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") && simd::is_feature_detected!("fp16") {
-        c.bench_function("floating_f16::reduce_sum_of_xy::a2_fp16", |b| {
+    if simd::is_cpu_detected!("a2") && simd::is_feature_detected!("fhm") {
+        c.bench_function("floating_f16::reduce_sum_of_xy::a2_fhm", |b| {
             b.iter(|| unsafe {
-                simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_a2_fp16(&x, &y)
+                simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_a2_fhm(&x, &y)
             })
+        });
+    }
+    #[cfg(target_arch = "aarch64")]
+    if simd::is_cpu_detected!("a2") {
+        c.bench_function("floating_f16::reduce_sum_of_xy::a2", |b| {
+            b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_xy::reduce_sum_of_xy_a2(&x, &y) })
         });
     }
 }
@@ -158,14 +156,6 @@ fn floating_f16_reduce_sum_of_d2(c: &mut Criterion) {
     let y = (0..4095)
         .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
         .collect::<Vec<_>>();
-    #[cfg(target_arch = "x86_64")]
-    if simd::is_cpu_detected!("v4") && simd::is_feature_detected!("avx512fp16") {
-        c.bench_function("floating_f16::reduce_sum_of_d2::v4_avx512fp16", |b| {
-            b.iter(|| unsafe {
-                simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_v4_avx512fp16(&x, &y)
-            })
-        });
-    }
     #[cfg(target_arch = "x86_64")]
     if simd::is_cpu_detected!("v4") {
         c.bench_function("floating_f16::reduce_sum_of_d2::v4", |b| {
@@ -187,12 +177,55 @@ fn floating_f16_reduce_sum_of_d2(c: &mut Criterion) {
         });
     }
     #[cfg(target_arch = "aarch64")]
-    if simd::is_cpu_detected!("a2") && simd::is_feature_detected!("fp16") {
-        c.bench_function("floating_f16::reduce_sum_of_d2::a2_fp16", |b| {
+    if simd::is_cpu_detected!("a2") && simd::is_feature_detected!("fhm") {
+        c.bench_function("floating_f16::reduce_sum_of_d2::a2_fhm", |b| {
             b.iter(|| unsafe {
-                simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_a2_fp16(&x, &y)
+                simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_a2_fhm(&x, &y)
             })
         });
+    }
+    #[cfg(target_arch = "aarch64")]
+    if simd::is_cpu_detected!("a2") {
+        c.bench_function("floating_f16::reduce_sum_of_d2::a2", |b| {
+            b.iter(|| unsafe { simd::floating_f16::reduce_sum_of_d2::reduce_sum_of_d2_a2(&x, &y) })
+        });
+    }
+}
+
+// Benchmarks the runtime-dispatched f16 reductions, i.e. the code paths that
+// halfvec distance computations actually execute on the current machine.
+fn floating_f16_dispatch(c: &mut Criterion) {
+    use rand::RngExt;
+    use simd::{F16, Floating, f16};
+    use std::hint::black_box;
+    let mut rng = rand::rng();
+    for n in [784_usize, 4095] {
+        let x = (0..n)
+            .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+            .collect::<Vec<_>>();
+        let y = (0..n)
+            .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
+            .collect::<Vec<_>>();
+        c.bench_function(
+            &format!("floating_f16::dispatch::reduce_sum_of_x::{n}"),
+            |b| b.iter(|| f16::reduce_sum_of_x(black_box(&x))),
+        );
+        c.bench_function(
+            &format!("floating_f16::dispatch::reduce_sum_of_abs_x::{n}"),
+            |b| b.iter(|| f16::reduce_sum_of_abs_x(black_box(&x))),
+        );
+        c.bench_function(
+            &format!("floating_f16::dispatch::reduce_sum_of_x2::{n}"),
+            |b| b.iter(|| f16::reduce_sum_of_x2(black_box(&x))),
+        );
+        c.bench_function(
+            &format!("floating_f16::dispatch::reduce_sum_of_xy::{n}"),
+            |b| b.iter(|| f16::reduce_sum_of_xy(black_box(&x), black_box(&y))),
+        );
+        c.bench_function(
+            &format!("floating_f16::dispatch::reduce_sum_of_d2::{n}"),
+            |b| b.iter(|| f16::reduce_sum_of_d2(black_box(&x), black_box(&y))),
+        );
     }
 }
 
@@ -324,6 +357,7 @@ criterion_group!(
     floating_f32_reduce_sum_of_d2,
     floating_f16_reduce_sum_of_xy,
     floating_f16_reduce_sum_of_d2,
+    floating_f16_dispatch,
     byte_reduce_sum_of_xy,
     byte_reduce_sum_of_x,
     halfbyte_reduce_sum_of_xy,

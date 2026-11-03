@@ -45,7 +45,9 @@ pub fn code<const BITS: usize>(vector: &[f32]) -> Code {
 
     let n = vector.len();
     let dis_u_2 = f32::reduce_sum_of_x2(vector);
-    let code = {
+    let code = if dis_u_2 == 0.0 {
+        zero_code::<BITS>(n)
+    } else {
         let min = -(1 << (BITS - 1));
         let max = (1 << (BITS - 1)) - 1;
         let normalized_vector = {
@@ -98,7 +100,9 @@ pub fn ugly_code<const BITS: usize>(vector: &[f32]) -> Code {
 
     let n = vector.len();
     let dis_u_2 = f32::reduce_sum_of_x2(vector);
-    let code = {
+    let code = if dis_u_2 == 0.0 {
+        zero_code::<BITS>(n)
+    } else {
         let min = -(1 << (BITS - 1));
         let max = (1 << (BITS - 1)) - 1;
         let normalized_vector = {
@@ -146,6 +150,19 @@ pub fn ugly_code<const BITS: usize>(vector: &[f32]) -> Code {
     )
 }
 
+/// The code of a zero vector: every element is the middle of the lattice.
+///
+/// A zero vector has no direction to quantize. This is also the code the
+/// general path produced for it, but through NaN arithmetic (`0 * (1 / 0)`).
+fn zero_code<const BITS: usize>(n: usize) -> Vec<u8> {
+    vec![(1_u32 << (BITS - 1)) as u8; n]
+}
+
+/// Estimates the squared Euclidean distance.
+///
+/// `|u|^2 + |v|^2 - 2 <u, v>` cancels catastrophically for (nearly) equal
+/// vectors and can come out slightly negative, so the result is clamped to
+/// zero; a NaN stays NaN.
 pub fn half_process_l2s<const X: usize, const Y: usize>(
     dim: u32,
     sum: u32,
@@ -159,11 +176,12 @@ pub fn half_process_l2s<const X: usize, const Y: usize>(
     let c_y = ((1 << Y) - 1) as f32 * 0.5;
 
     let ip = sum as f32 - (c_y * lhs.sum_of_code + c_x * rhs.sum_of_code) + dim as f32 * c_x * c_y;
-    lhs.dis_u_2 + rhs.dis_u_2
+    let l2s = lhs.dis_u_2 + rhs.dis_u_2
         - 2.0
             * ip
             * (lhs.dis_u_2.sqrt() / lhs.norm_of_lattice)
-            * (rhs.dis_u_2.sqrt() / rhs.norm_of_lattice)
+            * (rhs.dis_u_2.sqrt() / rhs.norm_of_lattice);
+    l2s.clamp(0.0, f32::INFINITY)
 }
 
 pub fn half_process_dot<const X: usize, const Y: usize>(
@@ -280,4 +298,93 @@ pub fn accumulate<const X: usize, const Y: usize>(lhs: &[u64], rhs: &[Vec<u64>; 
         }
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lcg(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        }
+    }
+
+    fn check_zero<const BITS: usize>(n: usize, (metadata, code): Code) {
+        assert_eq!(code, vec![1_u8 << (BITS - 1); n]);
+        let half = (1u32 << (BITS - 1)) as f32;
+        assert_eq!(metadata.dis_u_2, 0.0);
+        assert_eq!(metadata.sum_of_code, n as f32 * half);
+        let expected = (n as f32 * 0.25).sqrt();
+        assert!((metadata.norm_of_lattice - expected).abs() <= 1e-6 * expected);
+    }
+
+    #[test]
+    fn zero_vector() {
+        for n in [1, 2, 3, 64, 65, 784] {
+            for zero in [vec![0.0f32; n], vec![-0.0f32; n]] {
+                check_zero::<1>(n, code::<1>(&zero));
+                check_zero::<2>(n, code::<2>(&zero));
+                check_zero::<4>(n, code::<4>(&zero));
+                check_zero::<8>(n, code::<8>(&zero));
+                check_zero::<1>(n, ugly_code::<1>(&zero));
+                check_zero::<2>(n, ugly_code::<2>(&zero));
+                check_zero::<4>(n, ugly_code::<4>(&zero));
+                check_zero::<8>(n, ugly_code::<8>(&zero));
+            }
+        }
+        // Distances to a zero vector are exact.
+        let mut rng = lcg(7);
+        for n in [1, 3, 64] {
+            let v = (0..n).map(|_| rng() * 255.0).collect::<Vec<_>>();
+            let v2 = f32::reduce_sum_of_x2(&v);
+            let (z, zc) = ugly_code::<8>(&vec![0.0; n]);
+            let (m, c) = ugly_code::<8>(&v);
+            let sum = simd::byte::reduce_sum_of_xy(&zc, &c);
+            let l2s = half_process_l2s::<8, 8>(n as u32, sum, z, m);
+            assert!((l2s - v2).abs() <= 1e-6 * v2, "{l2s} {v2}");
+            assert_eq!(half_process_dot::<8, 8>(n as u32, sum, z, m), 0.0);
+            let sum = simd::byte::reduce_sum_of_xy(&zc, &zc);
+            assert_eq!(half_process_l2s::<8, 8>(n as u32, sum, z, z), 0.0);
+        }
+    }
+
+    /// The estimate of `|v - v|^2` must never be negative (its square root, the
+    /// `<->` operator of `rabitq8` and `rabitq4`, would be NaN).
+    #[test]
+    fn l2s_of_identical_vectors_is_not_negative() {
+        let mut rng = lcg(42);
+        for n in [1, 2, 3, 7, 64, 100, 768] {
+            for _ in 0..1000 {
+                let scale = [1e-3, 1.0, 255.0][(rng().abs() * 2.99) as usize];
+                let v = (0..n).map(|_| rng() * scale).collect::<Vec<_>>();
+                let (m8, c8) = ugly_code::<8>(&v);
+                let sum = simd::byte::reduce_sum_of_xy(&c8, &c8);
+                let l2s = half_process_l2s::<8, 8>(n as u32, sum, m8, m8);
+                assert!(
+                    l2s >= 0.0 && l2s <= 1e-3 * m8.dis_u_2,
+                    "n = {n}, l2s = {l2s}"
+                );
+                let (m4, c4) = ugly_code::<4>(&v);
+                let p4 = crate::halfbyte::pack_code(&c4);
+                let sum = simd::halfbyte::reduce_sum_of_xy(&p4, &p4);
+                let l2s = half_process_l2s::<4, 4>(n as u32, sum, m4, m4);
+                assert!(
+                    l2s >= 0.0 && l2s <= 1e-3 * m4.dis_u_2,
+                    "n = {n}, l2s = {l2s}"
+                );
+            }
+        }
+        // NaN is not hidden by the clamp.
+        let m = CodeMetadata {
+            dis_u_2: f32::NAN,
+            norm_of_lattice: 1.0,
+            sum_of_code: 1.0,
+        };
+        assert!(half_process_l2s::<8, 8>(1, 1, m, m).is_nan());
+    }
 }
