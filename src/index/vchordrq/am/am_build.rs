@@ -20,7 +20,7 @@ use index::relation::{
     Page, PageGuard, Relation, RelationRead, RelationReadTypes, RelationWrite, RelationWriteTypes,
 };
 use k_means::k_means_lookup;
-use k_means::square::Square;
+use k_means::square::{Square, SquareMut};
 use simd::Floating;
 use std::ffi::CStr;
 use std::marker::PhantomData;
@@ -237,8 +237,28 @@ pub unsafe extern "C-unwind" fn ambuild(
             let snapshot =
                 unsafe { pgrx::pg_sys::RegisterSnapshot(pgrx::pg_sys::GetTransactionSnapshot()) };
             let sampler = unsafe { HeapSampler::new(index_relation, heap_relation, snapshot) };
-            let result =
-                make_internal_build(vector_options, opfamily, internal_build, sampler, &reporter);
+            // the planner's estimate, which also covers tables never analyzed
+            let estimated_rows = unsafe {
+                let mut pages = 0;
+                let mut tuples = 0.0;
+                let mut allvisfrac = 0.0;
+                pgrx::pg_sys::estimate_rel_size(
+                    heap_relation,
+                    std::ptr::null_mut(),
+                    &mut pages,
+                    &mut tuples,
+                    &mut allvisfrac,
+                );
+                tuples
+            };
+            let result = make_internal_build(
+                vector_options,
+                opfamily,
+                internal_build,
+                sampler,
+                estimated_rows,
+                &reporter,
+            );
             unsafe {
                 pgrx::pg_sys::UnregisterSnapshot(snapshot);
             }
@@ -281,7 +301,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         vchordrq_cached::VchordrqCached::_0 {}
     }
     .serialize();
-    if let Some(leader) = unsafe {
+    let (heap_tuples, index_tuples) = if let Some(leader) = unsafe {
         VchordrqLeader::enter(
             c"vchordrq_parallel_build_main",
             heap_relation,
@@ -406,6 +426,9 @@ pub unsafe extern "C-unwind" fn ambuild(
                     );
                 },
             );
+            // Every participant added its counts before entering barrier 1.
+            let shared = leader.vchordrqshared;
+            ((*shared).heap_tuples, (*shared).index_tuples as f64)
         }
     } else {
         unsafe {
@@ -426,10 +449,13 @@ pub unsafe extern "C-unwind" fn ambuild(
                     reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
                 },
                 || {},
-            );
+            )
         }
-    }
-    unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0().into_pg() }
+    };
+    let mut result = unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0() };
+    result.heap_tuples = heap_tuples;
+    result.index_tuples = index_tuples;
+    result.into_pg()
 }
 
 struct VchordrqShared {
@@ -451,6 +477,9 @@ struct VchordrqShared {
     barrier_enter_0: i32,
     nparticipants: u32,
     indtuples: u64,
+    /* sums of every participant's counts, reported by `ambuild` */
+    heap_tuples: f64,
+    index_tuples: u64,
     barrier_leave_0: bool,
     barrier_enter_1: i32,
     barrier_leave_1: bool,
@@ -620,25 +649,14 @@ impl VchordrqLeader {
             heap_relation: pgrx::pg_sys::Relation,
             index_relation: pgrx::pg_sys::Relation,
         ) -> i32 {
+            // The planner already honours the `parallel_workers` reloption (an
+            // unset one is -1), max_parallel_maintenance_workers, the heap size
+            // and maintenance_work_mem; use its answer as is.
             unsafe {
-                if pgrx::pg_sys::plan_create_index_workers(
+                pgrx::pg_sys::plan_create_index_workers(
                     (*heap_relation).rd_id,
                     (*index_relation).rd_id,
-                ) == 0
-                {
-                    return 0;
-                }
-                if !(*heap_relation).rd_options.is_null() {
-                    let std_options = (*heap_relation)
-                        .rd_options
-                        .cast::<pgrx::pg_sys::StdRdOptions>();
-                    std::cmp::min(
-                        (*std_options).parallel_workers,
-                        pgrx::pg_sys::max_parallel_maintenance_workers,
-                    )
-                } else {
-                    pgrx::pg_sys::max_parallel_maintenance_workers
-                }
+                )
             }
         }
 
@@ -712,6 +730,8 @@ impl VchordrqLeader {
                 barrier_leave_2: false,
                 mutex: std::mem::zeroed(),
                 indtuples: 0,
+                heap_tuples: 0.0,
+                index_tuples: 0,
             });
             pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_enter_0);
             pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_leave_0);
@@ -813,15 +833,17 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
             .cast::<u8>()
             .cast_const()
     };
-    let heap_lockmode;
-    let index_lockmode;
-    if unsafe { !(*vchordrqshared).isconcurrent } {
-        heap_lockmode = pgrx::pg_sys::ShareLock as pgrx::pg_sys::LOCKMODE;
-        index_lockmode = pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE;
+    let (heap_lockmode, index_lockmode) = if unsafe { !(*vchordrqshared).isconcurrent } {
+        (
+            pgrx::pg_sys::ShareLock as pgrx::pg_sys::LOCKMODE,
+            pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
+        )
     } else {
-        heap_lockmode = pgrx::pg_sys::ShareUpdateExclusiveLock as pgrx::pg_sys::LOCKMODE;
-        index_lockmode = pgrx::pg_sys::RowExclusiveLock as pgrx::pg_sys::LOCKMODE;
-    }
+        (
+            pgrx::pg_sys::ShareUpdateExclusiveLock as pgrx::pg_sys::LOCKMODE,
+            pgrx::pg_sys::RowExclusiveLock as pgrx::pg_sys::LOCKMODE,
+        )
+    };
     let heap = unsafe { pgrx::pg_sys::table_open((*vchordrqshared).heaprelid, heap_lockmode) };
     let index = unsafe { pgrx::pg_sys::index_open((*vchordrqshared).indexrelid, index_lockmode) };
     let index_info = unsafe { pgrx::pg_sys::BuildIndexInfo(index) };
@@ -978,7 +1000,8 @@ unsafe fn parallel_build(
 
     let index = unsafe { BufferedPostgresRelation::new(index_relation) };
 
-    match cached {
+    let mut index_tuples = 0_u64;
+    let heap_tuples = match cached {
         VchordrqCachedReader::_0(_) => {
             traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
                 let ctid = tuple.id();
@@ -1002,6 +1025,7 @@ unsafe fn parallel_build(
                         &mut chooser,
                         &bump,
                     );
+                    index_tuples += 1;
                 }
                 unsafe {
                     let indtuples;
@@ -1013,7 +1037,7 @@ unsafe fn parallel_build(
                     }
                     callback(indtuples);
                 }
-            });
+            })
         }
         VchordrqCachedReader::_1(cached) => {
             let index = CachingRelation {
@@ -1042,6 +1066,7 @@ unsafe fn parallel_build(
                         &mut chooser,
                         &bump,
                     );
+                    index_tuples += 1;
                 }
                 unsafe {
                     let indtuples;
@@ -1053,8 +1078,15 @@ unsafe fn parallel_build(
                     }
                     callback(indtuples);
                 }
-            });
+            })
         }
+    };
+
+    unsafe {
+        pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
+        (*vchordrqshared).heap_tuples += heap_tuples;
+        (*vchordrqshared).index_tuples += index_tuples;
+        pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordrqshared).mutex);
     }
 
     while index.release() {
@@ -1085,7 +1117,7 @@ unsafe fn sequential_build(
     sync_0: impl FnOnce(),
     sync_1: impl FnOnce(u64),
     sync_2: impl FnOnce(),
-) {
+) -> (f64, f64) {
     use vchordrq_cached::VchordrqCachedReader;
 
     let cached = VchordrqCachedReader::deserialize_ref(vchordrqcached);
@@ -1123,7 +1155,8 @@ unsafe fn sequential_build(
     let index = unsafe { BufferedPostgresRelation::new(index_relation) };
 
     let mut indtuples = 0;
-    match cached {
+    let mut index_tuples = 0_u64;
+    let heap_tuples = match cached {
         VchordrqCachedReader::_0(_) => {
             traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
                 let ctid = tuple.id();
@@ -1147,10 +1180,11 @@ unsafe fn sequential_build(
                         &mut chooser,
                         &bump,
                     );
+                    index_tuples += 1;
                 }
                 indtuples += 1;
                 callback(indtuples);
-            });
+            })
         }
         VchordrqCachedReader::_1(cached) => {
             let index = CachingRelation {
@@ -1179,12 +1213,13 @@ unsafe fn sequential_build(
                         &mut chooser,
                         &bump,
                     );
+                    index_tuples += 1;
                 }
                 indtuples += 1;
                 callback(indtuples);
-            });
+            })
         }
-    }
+    };
 
     while index.release() {
         vchordrq::consume(&index);
@@ -1200,6 +1235,8 @@ unsafe fn sequential_build(
     crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, check);
 
     sync_2();
+
+    (heap_tuples, index_tuples as f64)
 }
 
 #[pgrx::pg_guard]
@@ -1271,10 +1308,20 @@ fn make_internal_build(
     opfamily: Opfamily,
     internal_build: VchordrqInternalBuildOptions,
     sampler: impl Sampler,
+    estimated_rows: f64,
     reporter: &PostgresReporter,
 ) -> Vec<Structure<Normalized>> {
     use humansize::{BINARY, format_size};
     use std::iter::once;
+    use vchordrq::build_memory::{
+        ClusteringMemory, initial_sample_capacity, max_number_of_samples,
+    };
+    let format = |bytes: u128| {
+        format_size(
+            u64::try_from(bytes).unwrap_or(u64::MAX),
+            BINARY.decimal_places(2).decimal_zeroes(2),
+        )
+    };
     let (reduction, sample_dim) = match internal_build.kmeans_dimension {
         None => (None, vector_options.dim as usize),
         Some(d) if d < vector_options.dim => (Some(d as usize), d as usize),
@@ -1287,29 +1334,47 @@ fn make_internal_build(
             (None, vector_options.dim as usize)
         }
     };
-    {
-        let d = sample_dim as u64;
-        let c = internal_build.lists.last().copied().unwrap_or_default() as u64;
-        let f = internal_build.sampling_factor as u64;
-        let t = internal_build.build_threads as u64;
-        let estimated_memory_usage = 4 * c * d * (1 + t + f);
-        pgrx::info!(
-            "clustering: estimated memory usage is {}",
-            format_size(
-                estimated_memory_usage,
-                BINARY.decimal_places(2).decimal_zeroes(2)
-            )
-        );
-    }
-    let max_number_of_samples = internal_build
-        .lists
-        .last()
-        .map(|x| x.saturating_mul(internal_build.sampling_factor))
-        .unwrap_or_default();
+    let dim = vector_options.dim as usize;
+    let lists = internal_build.lists.last().copied().unwrap_or(1) as usize;
+    let reduction_threads = reduction.map(|sample_dim| {
+        number_of_reduction_threads(internal_build.build_threads, sample_dim, dim)
+    });
+    let clustering_memory = |samples: usize| {
+        ClusteringMemory::new(
+            samples as u64,
+            lists as u64,
+            sample_dim as u64,
+            dim as u64,
+            internal_build.build_threads.into(),
+            reduction_threads.map(|x| x as u64),
+        )
+    };
+    // `lists * sampling_factor` only bounds the number of samples; reserve
+    // memory for the rows that the heap is estimated to have.
+    let max_number_of_samples = max_number_of_samples(
+        internal_build.lists.last().copied(),
+        internal_build.sampling_factor,
+    );
+    let initial_sample_capacity = usize::try_from(initial_sample_capacity(
+        max_number_of_samples,
+        estimated_rows,
+    ))
+    .unwrap_or(usize::MAX);
+    pgrx::info!(
+        "clustering: estimated memory usage is {}",
+        format(clustering_memory(initial_sample_capacity).total_bytes())
+    );
     let mut sample = sampler.sample();
     let samples = 'samples: {
-        let mut samples = Square::with_capacity(sample_dim, max_number_of_samples as _);
-        if samples.len() >= max_number_of_samples as usize {
+        let mut samples = Vec::<f32>::new();
+        try_reserve_floats(
+            &mut samples,
+            initial_sample_capacity.saturating_mul(sample_dim),
+            true,
+            "sampled vectors",
+        );
+        let mut number_of_samples = 0_u64;
+        if number_of_samples >= max_number_of_samples {
             break 'samples samples;
         }
         while let Some(mut tuple) = sample.next() {
@@ -1334,8 +1399,10 @@ fn make_internal_build(
                             rabitq::rotate::rotate_inplace(&mut x);
                             x.truncate(sample_dim);
                         }
-                        samples.push_slice(x.as_slice());
-                        if samples.len() >= max_number_of_samples as usize {
+                        try_reserve_floats(&mut samples, sample_dim, false, "sampled vectors");
+                        samples.extend_from_slice(x.as_slice());
+                        number_of_samples += 1;
+                        if number_of_samples >= max_number_of_samples {
                             break 'samples samples;
                         }
                     }
@@ -1345,6 +1412,30 @@ fn make_internal_build(
         samples
     };
     drop(sample);
+    {
+        let memory = clustering_memory(samples.len() / sample_dim);
+        // maintenance_work_mem is in kilobytes
+        let limit = u128::try_from(unsafe { pgrx::pg_sys::maintenance_work_mem })
+            .unwrap_or_default()
+            * 1024;
+        if let Err(required) = memory.check(limit) {
+            pgrx::ereport!(
+                ERROR,
+                pgrx::PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+                format!(
+                    "clustering {} sampled vectors into {} lists needs {} for centroids, \
+                    which exceeds maintenance_work_mem ({})",
+                    memory.samples,
+                    memory.lists,
+                    format(required),
+                    format(limit),
+                ),
+                "There are more lists than sampled vectors, so most centroids would be random. \
+                Lower `build.internal.lists`, build the index after loading the data, \
+                or raise maintenance_work_mem."
+            );
+        }
+    }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(internal_build.build_threads as usize)
         .build()
@@ -1353,20 +1444,24 @@ fn make_internal_build(
     let mut result = Vec::<Structure<Normalized>>::new();
     let mut samples = Some(samples);
     for w in internal_build.lists.iter().rev().copied().chain(once(1)) {
-        let mut input = if let Some(structure) = result.last() {
-            let mut input =
-                Square::with_capacity(vector_options.dim as _, structure.centroids.len());
+        let (mut input, num_dim) = if let Some(structure) = result.last() {
+            let mut input = Vec::new();
+            try_reserve_floats(
+                &mut input,
+                structure.centroids.len().saturating_mul(dim),
+                true,
+                "centroids",
+            );
             for slice in structure.centroids.iter() {
-                input.push_slice(slice);
+                input.extend_from_slice(slice);
             }
-            input
+            (input, dim)
         } else if let Some(samples) = samples.take() {
-            samples
+            (samples, sample_dim)
         } else {
             unreachable!()
         };
-        let num_points = input.len();
-        let num_dim = input.d();
+        let num_points = input.len() / num_dim;
         let num_lists = w as usize;
         let num_iterations = internal_build.kmeans_iterations as _;
         if result.is_empty() {
@@ -1382,7 +1477,7 @@ fn make_internal_build(
             );
         }
         let mut f = 'f: {
-            let view = input.as_mut_view();
+            let view = SquareMut::new(num_dim, input.as_mut_slice());
             if result.last().is_some() {
                 break 'f k_means::lloyd_k_means(
                     &pool,
@@ -1437,25 +1532,27 @@ fn make_internal_build(
                 let index = f.index();
                 let index = &index;
                 let is_spherical = internal_build.spherical_centroids;
-                let num_threads = {
-                    let config = internal_build.build_threads as f64;
-                    let ratio = sample_dim as f64 / vector_options.dim as f64;
-                    (config * ratio).ceil().max(1.0).min(config) as usize
-                };
+                let num_threads =
+                    number_of_reduction_threads(internal_build.build_threads, sample_dim, dim);
+                assert_ne!(num_threads, 0);
+                // Allocate here: an ERROR must not be raised in another thread.
+                let mut buffers = Vec::with_capacity(num_threads);
+                for _ in 0..num_threads {
+                    let sum = try_zeroed_floats(num_lists.saturating_mul(dim), "centroids");
+                    let count = try_zeroed_floats(num_lists, "centroids");
+                    buffers.push((sum, count));
+                }
                 let (tx, rx) = crossbeam_channel::bounded::<Vec<f32>>(1024);
                 let list = std::thread::scope(move |scope| {
-                    assert_ne!(num_threads, 0);
                     let mut handles = Vec::with_capacity(num_threads);
-                    for _ in 0..num_threads {
+                    for (mut sum, mut count) in buffers {
                         let rx = rx.clone();
-                        let mut sum = Square::from_zeros(vector_options.dim as _, num_lists);
-                        let mut count = vec![0.0f32; num_lists];
                         handles.push(scope.spawn(move || {
                             while let Ok(sample) = rx.recv() {
                                 let mut x = rabitq::rotate::rotate(&sample);
                                 x.truncate(sample_dim);
                                 let (_, id) = index(&x);
-                                f32::vector_add_inplace(&mut sum[id], &sample);
+                                f32::vector_add_inplace(&mut sum[id * dim..][..dim], &sample);
                                 count[id] += 1.0;
                             }
                             (sum, count)
@@ -1464,9 +1561,9 @@ fn make_internal_build(
                     {
                         drop(rx);
                         let tx = tx;
-                        let mut samples = 0_usize;
+                        let mut samples = 0_u64;
                         'samples: {
-                            if samples >= max_number_of_samples as usize {
+                            if samples >= max_number_of_samples {
                                 break 'samples;
                             }
                             while let Some(mut tuple) = sample.next() {
@@ -1495,7 +1592,7 @@ fn make_internal_build(
                                                 break 'samples;
                                             }
                                             samples += 1;
-                                            if samples >= max_number_of_samples as usize {
+                                            if samples >= max_number_of_samples {
                                                 break 'samples;
                                             }
                                         }
@@ -1509,11 +1606,11 @@ fn make_internal_build(
                         .map(|handle| handle.join().expect("failed to spawn threads"))
                         .collect::<Vec<_>>()
                 });
-                let mut sum = Square::from_zeros(vector_options.dim as _, num_lists);
-                let mut count = vec![0.0f32; num_lists];
+                let mut sum = try_zeroed_square(dim, num_lists, "centroids");
+                let mut count = try_zeroed_floats(num_lists, "centroids");
                 for (sum_1, count_1) in list {
                     for i in 0..num_lists {
-                        f32::vector_add_inplace(&mut sum[i], &sum_1[i]);
+                        f32::vector_add_inplace(&mut sum[i], &sum_1[i * dim..][..dim]);
                         count[i] += count_1[i];
                     }
                 }
@@ -1583,6 +1680,71 @@ fn make_internal_build(
     result
 }
 
+/// The number of threads that compute full-dimensional centroids from the
+/// clustering in `kmeans_dimension` dimensions.
+fn number_of_reduction_threads(build_threads: u16, sample_dim: usize, dim: usize) -> usize {
+    let config = build_threads as f64;
+    let ratio = sample_dim as f64 / dim as f64;
+    (config * ratio).ceil().max(1.0).min(config) as usize
+}
+
+/// Reports a failed allocation of the internal build as an ERROR. Allocating
+/// through the global allocator would abort the backend instead.
+fn out_of_memory(what: &str, floats: usize) -> ! {
+    pgrx::ereport!(
+        ERROR,
+        pgrx::PgSqlErrorCode::ERRCODE_OUT_OF_MEMORY,
+        "out of memory",
+        format!(
+            "Failed on request of size {} for {what} of the internal build.",
+            (floats as u128) * size_of::<f32>() as u128
+        )
+    );
+}
+
+fn try_reserve_floats(buffer: &mut Vec<f32>, additional: usize, exact: bool, what: &str) {
+    let result = if exact {
+        buffer.try_reserve_exact(additional)
+    } else {
+        buffer.try_reserve(additional)
+    };
+    if result.is_err() {
+        out_of_memory(what, buffer.len().saturating_add(additional));
+    }
+}
+
+/// Allocates `len` zeroed floats, like `vec![0.0; len]` but fallible.
+fn try_zeroed_floats(len: usize, what: &str) -> Vec<f32> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let Ok(layout) = std::alloc::Layout::array::<f32>(len) else {
+        out_of_memory(what, len);
+    };
+    // SAFETY: `layout` has a non-zero size.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<f32>();
+    if ptr.is_null() {
+        out_of_memory(what, len);
+    }
+    // SAFETY: `ptr` is allocated by the global allocator for exactly `len`
+    // floats, and all-zero bytes are `0.0f32`.
+    unsafe { Vec::from_raw_parts(ptr, len, len) }
+}
+
+/// Like `Square::from_zeros`, but reports a failed allocation as an ERROR.
+/// `Square` has no fallible constructor, so probe the allocation first.
+fn try_zeroed_square(d: usize, n: usize, what: &str) -> Square {
+    let mut probe = Vec::<f32>::new();
+    try_reserve_floats(&mut probe, d.saturating_mul(n), true, what);
+    drop(probe);
+    Square::from_zeros(d, n)
+}
+
+/// Quote an SQL identifier, like `quote_ident` but unconditionally.
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
 #[allow(clippy::collapsible_else_if)]
 fn make_external_build(
     vector_options: VectorOptions,
@@ -1608,6 +1770,18 @@ fn make_external_build(
             .get_by_name("nspname")
             .expect("external build: cannot get schema of pgvector")
             .expect("external build: cannot get schema of pgvector");
+        // `table` passed `validate_table`: an optional schema and a table name,
+        // each an unquoted identifier. Quote them after case folding so the
+        // lookup matches the unquoted spelling and reserved words still parse.
+        let table = match table.split_once('.') {
+            Some((schema, name)) => format!(
+                "{}.{}",
+                quote_identifier(&schema.to_ascii_lowercase()),
+                quote_identifier(&name.to_ascii_lowercase())
+            ),
+            None => quote_identifier(&table.to_ascii_lowercase()),
+        };
+        let pgvector_schema = quote_identifier(&pgvector_schema);
         let dump_query =
             format!("SELECT id, parent, vector::{pgvector_schema}.vector FROM {table};");
         let centroids = client.select(&dump_query, None, &[]).unwrap_or_report();
@@ -1675,20 +1849,32 @@ fn make_external_build(
     let Some(root) = root else {
         pgrx::error!("external build: there are no root");
     };
+    // The tree height minus one must be in `1..=8` (checked below), so no
+    // vertex can be deeper than `MAX_DEPTH` edges below the root. Stop the
+    // recursion there: a long parent chain must not overflow the stack.
+    const MAX_DEPTH: u32 = 8;
     let mut heights = BTreeMap::<_, _>::new();
     fn dfs_for_heights(
         heights: &mut BTreeMap<i32, Option<u32>>,
         children: &BTreeMap<i32, Vec<i32>>,
         u: i32,
+        depth: u32,
     ) {
+        if depth > MAX_DEPTH {
+            pgrx::error!(
+                "external build: unexpected tree height, id = {u} is more than {MAX_DEPTH} levels below the root"
+            );
+        }
         if heights.contains_key(&u) {
             pgrx::error!("external build: detect a cycle, id = {u}");
         }
         heights.insert(u, None);
         let mut height = None;
         for &v in children[&u].iter() {
-            dfs_for_heights(heights, children, v);
-            let new = heights[&v].unwrap() + 1;
+            dfs_for_heights(heights, children, v, depth + 1);
+            let Some(new) = heights[&v].map(|h| h + 1) else {
+                pgrx::error!("external build: detect a cycle, id = {v}");
+            };
             if let Some(height) = height {
                 if height != new {
                     pgrx::error!("external build: two heights, id = {u}");
@@ -1702,7 +1888,14 @@ fn make_external_build(
         }
         heights.insert(u, height);
     }
-    dfs_for_heights(&mut heights, &children, root);
+    dfs_for_heights(&mut heights, &children, root, 0);
+    // Every non-root vertex has a parent, so a vertex that the root cannot
+    // reach lies on (or hangs below) a parent cycle.
+    if let Some(&id) = parents.keys().find(|id| !heights.contains_key(*id)) {
+        pgrx::error!(
+            "external build: detect a cycle that is not reachable from the root, id = {id}, root = {root}"
+        );
+    }
     let heights = heights
         .into_iter()
         .map(|(k, v)| (k, v.expect("not a connected graph")))

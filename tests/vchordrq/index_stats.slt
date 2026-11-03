@@ -1,0 +1,111 @@
+# CREATE INDEX, REINDEX and VACUUM report real tuple and page counts. They used
+# to report zeros, which reset the table's reltuples to 0.
+
+statement ok
+CREATE TABLE t (id integer, val vector(3)) WITH (autovacuum_enabled = false);
+
+statement ok
+INSERT INTO t (id, val)
+SELECT i, ARRAY[random(), random(), random()]::real[] FROM generate_series(1, 5000) s(i);
+
+statement ok
+INSERT INTO t (id, val) SELECT i, NULL FROM generate_series(5001, 5100) s(i);
+
+statement ok
+ANALYZE t;
+
+statement ok
+CREATE INDEX t_idx ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.internal]
+lists = [4]
+$$);
+
+# NULLs are not indexed: the heap has 5100 rows, the index 5000 tuples.
+query TI
+SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('t', 't_idx') ORDER BY relname;
+----
+t 5100
+t_idx 5000
+
+statement ok
+REINDEX INDEX t_idx;
+
+query TI
+SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('t', 't_idx') ORDER BY relname;
+----
+t 5100
+t_idx 5000
+
+# a parallel build sums the counts of all participants
+
+statement ok
+SET max_parallel_maintenance_workers = 2;
+
+statement ok
+ALTER TABLE t SET (parallel_workers = 2);
+
+statement ok
+REINDEX INDEX t_idx;
+
+query TI
+SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('t', 't_idx') ORDER BY relname;
+----
+t 5100
+t_idx 5000
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+ALTER TABLE t RESET (parallel_workers);
+
+# VACUUM reports the remaining index tuples and the number of pages.
+
+statement ok
+DELETE FROM t WHERE id <= 1000;
+
+statement ok
+VACUUM t;
+
+query TIB
+SELECT relname, reltuples::bigint, relpages > 0 FROM pg_class WHERE relname IN ('t', 't_idx') ORDER BY relname;
+----
+t 4100 t
+t_idx 4000 t
+
+query B
+SELECT relpages = pg_relation_size('t_idx') / current_setting('block_size')::int FROM pg_class WHERE relname = 't_idx';
+----
+t
+
+statement ok
+DROP TABLE t;
+
+# A multivector index counts vectors, the heap counts rows.
+
+statement ok
+CREATE TABLE t (val vector(3)[]) WITH (autovacuum_enabled = false);
+
+statement ok
+INSERT INTO t (val)
+SELECT ARRAY[
+    ARRAY[random(), random(), random()]::real[]::vector,
+    ARRAY[random(), random(), random()]::real[]::vector,
+    ARRAY[random(), random(), random()]::real[]::vector
+] FROM generate_series(1, 100);
+
+statement ok
+ANALYZE t;
+
+statement ok
+CREATE INDEX t_idx ON t USING vchordrq (val vector_maxsim_ops);
+
+query TI
+SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('t', 't_idx') ORDER BY relname;
+----
+t 100
+t_idx 300
+
+statement ok
+DROP TABLE t;

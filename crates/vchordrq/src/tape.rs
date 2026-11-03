@@ -14,6 +14,14 @@ use index_accessor::Accessor1;
 use std::marker::PhantomData;
 use std::num::NonZero;
 
+/// Writes a new tape page by page.
+///
+/// When the head page is full, it is linked to a freshly extended page and its
+/// WAL record is written before the new page's record. So the tape must stay
+/// unreachable from readers until the writer is dropped: either the index is
+/// still being built, or (in `maintain`) the tape is published by updating the
+/// jump tuple only after every writer of it has been dropped. Appending to a
+/// reachable tape goes through [`append`] instead.
 pub struct TapeWriter<'a, R, T>
 where
     R: RelationWrite + 'a,
@@ -370,17 +378,24 @@ where
                         )
                     }
                 };
-                write.get_opaque_mut().next = extend.id();
-                drop(write);
+                // Each guard is a separate WAL record, written when it is
+                // dropped. The new page must be initialized, filled and logged
+                // before the tail links to it: otherwise crash recovery (WAL
+                // ending between the two records) or a hot standby (replaying
+                // them one at a time) exposes a `next` pointer to a page that
+                // is uninitialized or still holds recycled contents. We keep
+                // the tail locked meanwhile, so concurrent appenders wait and
+                // readers cannot reach the page before it is linked.
                 let fresh = extend.id();
-                if let Some(i) = extend.alloc(bytes) {
-                    drop(extend);
-                    let mut past = index.write(first, tracking_freespace);
-                    past.get_opaque_mut().skip = fresh.max(past.get_opaque().skip);
-                    return (fresh, i);
-                } else {
+                let Some(i) = extend.alloc(bytes) else {
                     panic!("implementation: a clear page cannot accommodate a single tuple");
-                }
+                };
+                drop(extend);
+                write.get_opaque_mut().next = fresh;
+                drop(write);
+                let mut past = index.write(first, tracking_freespace);
+                past.get_opaque_mut().skip = fresh.max(past.get_opaque().skip);
+                return (fresh, i);
             }
             if current == first && write.get_opaque().skip != first {
                 current = write.get_opaque().skip;

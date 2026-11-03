@@ -1,0 +1,63 @@
+# ANALYZE calls amvacuumcleanup with analyze_only set. It must not compact the
+# index: that used to rewrite every list on each ANALYZE (about 460 kB of WAL
+# for this 3.6 MB index, against about 17 kB for ANALYZE alone).
+
+statement ok
+CREATE TABLE t (id integer, val vector(64)) WITH (autovacuum_enabled = false);
+
+# keep ANALYZE's own WAL small and predictable
+statement ok
+ALTER TABLE t ALTER COLUMN val SET STATISTICS 0;
+
+statement ok
+INSERT INTO t (id, val)
+SELECT i, ARRAY(SELECT random() + i * 0 FROM generate_series(1, 64))::real[]::vector
+FROM generate_series(1, 1000) s(i);
+
+statement ok
+CREATE INDEX t_idx ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.internal]
+lists = [8]
+$$);
+
+# rows inserted after the build wait in the appendable tapes for compaction
+statement ok
+INSERT INTO t (id, val)
+SELECT i, ARRAY(SELECT random() + i * 0 FROM generate_series(1, 64))::real[]::vector
+FROM generate_series(1001, 10000) s(i);
+
+query B
+SELECT pg_relation_size('t_idx') > 2 * 1024 * 1024;
+----
+t
+
+statement ok
+CREATE TEMP TABLE wal (lsn pg_lsn);
+
+statement ok
+INSERT INTO wal SELECT pg_current_wal_insert_lsn();
+
+statement ok
+ANALYZE t;
+
+query B
+SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), lsn) < 128 * 1024 FROM wal;
+----
+t
+
+# VACUUM still compacts the index and reports its tuples.
+
+statement ok
+DELETE FROM t WHERE id <= 2500;
+
+statement ok
+VACUUM t;
+
+query I
+SELECT reltuples::bigint FROM pg_class WHERE relname = 't_idx';
+----
+7500
+
+statement ok
+DROP TABLE t;
