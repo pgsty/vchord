@@ -339,11 +339,15 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             let probes = gucs::vchordrq_probes(relation.raw());
             let cost = vchordrq::cost(&index);
             if cost.cells.len() != 1 + probes.len() {
-                pgrx::error!(
-                    "need {} probes, but {} probes provided",
-                    cost.cells.len() - 1,
-                    probes.len()
-                );
+                // This path cannot run with these probes. Raising an ERROR here
+                // would fail the whole query even when another plan works, so
+                // only discourage the path; `amrescan` reports the mismatch.
+                *index_startup_cost = disable_cost;
+                *index_total_cost = disable_cost;
+                *index_selectivity = 1.0;
+                *index_correlation = 0.0;
+                *index_pages = 1.0;
+                return;
             }
             let node_count = {
                 let tuples = (*index_opt_info).tuples as u32;
@@ -487,7 +491,14 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
             pg_guard_ffi_boundary(|| callback(&mut ctid, callback_state))
         }
     };
-    crate::index::vchordrq::dispatch::bulkdelete(opfamily, &index, check, callback);
+    let removed = crate::index::vchordrq::dispatch::bulkdelete(opfamily, &index, check, callback);
+    unsafe {
+        (*stats).tuples_removed += removed as f64;
+        (*stats).num_pages = pgrx::pg_sys::RelationGetNumberOfBlocksInFork(
+            (*info).index,
+            pgrx::pg_sys::ForkNumber::MAIN_FORKNUM,
+        );
+    }
     stats
 }
 
@@ -537,9 +548,22 @@ pub unsafe extern "C-unwind" fn amrescan(
         scanner.bump.reset();
         let opfamily = opfamily((*scan).indexRelation);
         let index = PostgresRelation::new((*scan).indexRelation);
+        let probes = gucs::vchordrq_probes((*scan).indexRelation);
+        {
+            // `amcostestimate` only disables a path with mismatched probes;
+            // report the mismatch once the scan is really used.
+            let cells = vchordrq::cost(&index).cells.len();
+            if cells != 1 + probes.len() {
+                pgrx::error!(
+                    "need {} probes, but {} probes provided",
+                    cells - 1,
+                    probes.len()
+                );
+            }
+        }
         let options = SearchOptions {
             epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),
-            probes: gucs::vchordrq_probes((*scan).indexRelation),
+            probes,
             max_scan_tuples: gucs::vchordrq_max_scan_tuples(),
             maxsim_refine: gucs::vchordrq_maxsim_refine((*scan).indexRelation),
             maxsim_threshold: gucs::vchordrq_maxsim_threshold((*scan).indexRelation),

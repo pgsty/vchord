@@ -15,6 +15,11 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     info: *mut pgrx::pg_sys::IndexVacuumInfo,
     stats: *mut pgrx::pg_sys::IndexBulkDeleteResult,
 ) -> *mut pgrx::pg_sys::IndexBulkDeleteResult {
+    // ANALYZE calls this without a preceding bulk delete; compacting the whole
+    // index there only writes WAL. Like nbtree, do nothing and report nothing.
+    if unsafe { (*info).analyze_only } {
+        return stats;
+    }
     let mut stats = stats;
     if stats.is_null() {
         stats = unsafe {
@@ -22,8 +27,15 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
         };
     }
     let index_relation = unsafe { (*info).index };
+    let tuples = unsafe { sequential_vacuumcleanup(index_relation, || (), || ()) };
     unsafe {
-        sequential_vacuumcleanup(index_relation, || (), || ());
+        // Every list was compacted, so the count is exact.
+        (*stats).num_index_tuples = tuples as f64;
+        (*stats).estimated_count = false;
+        (*stats).num_pages = pgrx::pg_sys::RelationGetNumberOfBlocksInFork(
+            index_relation,
+            pgrx::pg_sys::ForkNumber::MAIN_FORKNUM,
+        );
     }
     stats
 }
@@ -32,7 +44,7 @@ unsafe fn sequential_vacuumcleanup(
     index_relation: pgrx::pg_sys::Relation,
     sync_0: impl FnOnce(),
     sync_1: impl FnOnce(),
-) {
+) -> u64 {
     struct ChooseAll;
     impl MaintainChooser for ChooseAll {
         fn choose(&mut self, _: usize) -> bool {
@@ -52,7 +64,9 @@ unsafe fn sequential_vacuumcleanup(
     sync_0();
 
     let mut chooser = ChooseAll;
-    crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, check);
+    let tuples = crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, check);
 
     sync_1();
+
+    tuples
 }

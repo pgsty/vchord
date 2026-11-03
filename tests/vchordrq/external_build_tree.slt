@@ -1,0 +1,170 @@
+# External build: malformed centroid trees must raise an ERROR, never crash
+# the backend, and the centroid table must be referenced by a quoted name.
+
+statement ok
+CREATE TABLE t (val vector(3));
+
+statement ok
+INSERT INTO t (val)
+SELECT ARRAY[random(), random(), random()]::real[]::vector FROM generate_series(1, 100);
+
+# A parent chain far deeper than any valid tree. The height check used to run
+# after a recursive traversal, which overflowed the stack (SIGSEGV).
+
+statement ok
+CREATE TABLE deep_chain (id integer, parent integer, vector vector(3));
+
+statement ok
+INSERT INTO deep_chain (id, parent, vector)
+SELECT i, NULLIF(i - 1, -1), '[1, 0, 0]' FROM generate_series(0, 300000) s(i);
+
+statement error external build: unexpected tree height
+CREATE INDEX ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.external]
+table = 'public.deep_chain'
+$$);
+
+statement ok
+SELECT 1;
+
+# The tallest valid tree has height 9 (8 levels below the root) ...
+
+statement ok
+CREATE TABLE chain_9 (id integer, parent integer, vector vector(3));
+
+statement ok
+INSERT INTO chain_9 (id, parent, vector)
+SELECT i, NULLIF(i - 1, -1), '[1, 0, 0]' FROM generate_series(0, 8) s(i);
+
+statement ok
+CREATE INDEX t_chain_9 ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.external]
+table = 'public.chain_9'
+$$);
+
+statement ok
+SET vchordrq.probes = '1,1,1,1,1,1,1,1';
+
+query I
+SELECT count(*) FROM (SELECT val FROM t ORDER BY val <-> '[1, 0, 0]' LIMIT 10) s;
+----
+10
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+DROP INDEX t_chain_9;
+
+# ... and one more level is rejected.
+
+statement ok
+CREATE TABLE chain_10 (id integer, parent integer, vector vector(3));
+
+statement ok
+INSERT INTO chain_10 (id, parent, vector)
+SELECT i, NULLIF(i - 1, -1), '[1, 0, 0]' FROM generate_series(0, 9) s(i);
+
+statement error external build: unexpected tree height
+CREATE INDEX ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.external]
+table = 'public.chain_10'
+$$);
+
+# A parent cycle that the root does not reach used to panic with
+# "no entry found for key".
+
+statement ok
+CREATE TABLE disconnected_cycle (id integer, parent integer, vector vector(3));
+
+statement ok
+INSERT INTO disconnected_cycle (id, parent, vector) VALUES
+    (0, NULL, '[1, 0, 0]'),
+    (1, 0, '[0, 1, 0]'),
+    (2, 0, '[0, 0, 1]'),
+    (3, 4, '[1, 1, 0]'),
+    (4, 3, '[0, 1, 1]');
+
+statement error external build: detect a cycle that is not reachable from the root, id = 3
+CREATE INDEX ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.external]
+table = 'public.disconnected_cycle'
+$$);
+
+# Names are quoted after case folding: a reserved word works as a schema name
+# and an unquoted mixed-case spelling still finds the lower-case table.
+
+statement ok
+CREATE SCHEMA "order";
+
+statement ok
+CREATE TABLE "order".centroids (id integer, parent integer, vector vector(3));
+
+statement ok
+INSERT INTO "order".centroids (id, vector) VALUES
+    (0, '[1, 0, 0]'),
+    (1, '[0, 1, 0]'),
+    (2, '[0, 0, 1]');
+
+statement ok
+CREATE INDEX t_order ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.external]
+table = 'order.centroids'
+$$);
+
+statement ok
+DROP INDEX t_order;
+
+statement ok
+CREATE INDEX t_order ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.external]
+table = 'ORDER.Centroids'
+$$);
+
+statement ok
+DROP INDEX t_order;
+
+# The schema of pgvector is quoted too. Move pgvector into a schema whose name
+# needs quoting, and restore its original schema afterwards.
+
+statement ok
+CREATE TABLE pgvector_schema AS
+SELECT n.nspname::text AS nspname
+FROM pg_catalog.pg_extension e
+JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+WHERE e.extname = 'vector';
+
+statement ok
+CREATE SCHEMA "pgvector Schema";
+
+statement ok
+ALTER EXTENSION vector SET SCHEMA "pgvector Schema";
+
+statement ok
+CREATE INDEX t_order ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.external]
+table = 'order.centroids'
+$$);
+
+statement ok
+DO $$
+BEGIN
+    EXECUTE format('ALTER EXTENSION vector SET SCHEMA %I', (SELECT nspname FROM pgvector_schema));
+END
+$$;
+
+statement ok
+DROP SCHEMA "pgvector Schema";
+
+statement ok
+DROP TABLE t, deep_chain, chain_9, chain_10, disconnected_cycle, pgvector_schema;
+
+statement ok
+DROP SCHEMA "order" CASCADE;

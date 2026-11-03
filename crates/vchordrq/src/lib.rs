@@ -26,6 +26,7 @@ mod tape_writer;
 mod tuples;
 mod vectors;
 
+pub mod build_memory;
 pub mod operator;
 pub mod types;
 

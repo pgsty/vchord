@@ -1,0 +1,65 @@
+# A probes setting that does not match the index must not fail planning: the
+# planner should only avoid the index. Using the index still reports an ERROR.
+
+statement ok
+CREATE TABLE t (id integer, val vector(3));
+
+statement ok
+INSERT INTO t (id, val)
+SELECT i, ARRAY[random(), random(), random()]::real[] FROM generate_series(1, 1000) s(i);
+
+statement ok
+CREATE INDEX t_idx ON t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+[build.internal]
+lists = [4]
+$$);
+
+# the index needs one probe
+statement ok
+SET vchordrq.probes = '1,1';
+
+query I
+SELECT count(*) FROM (SELECT id FROM t ORDER BY val <-> '[0.5, 0.5, 0.5]' LIMIT 5) s;
+----
+5
+
+query I
+SELECT count(*) FROM t WHERE id <= 10;
+----
+10
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET enable_sort = off;
+
+statement error need 1 probes, but 2 probes provided
+SELECT id FROM t ORDER BY val <-> '[0.5, 0.5, 0.5]' LIMIT 5;
+
+statement ok
+SET vchordrq.probes = '';
+
+statement error need 1 probes, but 0 probes provided
+SELECT id FROM t ORDER BY val <-> '[0.5, 0.5, 0.5]' LIMIT 5;
+
+statement ok
+SET vchordrq.probes = '1';
+
+query I
+SELECT count(*) FROM (SELECT id FROM t ORDER BY val <-> '[0.5, 0.5, 0.5]' LIMIT 5) s;
+----
+5
+
+statement ok
+RESET enable_sort;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+DROP TABLE t;

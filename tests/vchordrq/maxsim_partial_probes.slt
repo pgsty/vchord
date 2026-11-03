@@ -1,0 +1,78 @@
+# MaxSim with lists > 1, partial probes and the defaults maxsim_refine = 0 and
+# maxsim_threshold = 0. A document that is not a candidate of some query
+# vector used to get the distance -inf for it and was ranked first.
+#
+# Each query below is identical to one document. Every query vector then finds
+# that document in the list it probes first (a vector is stored in the list
+# of its nearest centroid, and the nearest list is always probed), so the
+# document must rank first whatever lists k-means produced. Its score (about
+# -4 * 64 / 12 for four random 64-dimensional vectors) is far below that of
+# any other document (around -4 * 0.7), well beyond the RaBitQ error.
+# With the bug, a document missing from any candidate set ranked first.
+
+statement ok
+SELECT setseed(0.5);
+
+statement ok
+CREATE TABLE docs (id integer, val vector(64)[]);
+
+statement ok
+INSERT INTO docs (id, val)
+SELECT i, ARRAY(
+    SELECT ARRAY(SELECT random() - 0.5 + i * 0 + j * 0 FROM generate_series(1, 64))::real[]::vector
+    FROM generate_series(1, 4) s(j)
+)
+FROM generate_series(1, 1000) s(i);
+
+statement ok
+CREATE INDEX docs_val ON docs USING vchordrq (val vector_maxsim_ops)
+WITH (options = $$
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '4';
+
+statement ok
+SET vchordrq.maxsim_refine = 0;
+
+statement ok
+SET vchordrq.maxsim_threshold = 0;
+
+query I
+SELECT count(*)
+FROM docs q, LATERAL (SELECT d.id FROM docs d ORDER BY d.val @# q.val LIMIT 1) top
+WHERE q.id <= 20 AND top.id = q.id;
+----
+20
+
+# With a single probe too.
+
+statement ok
+SET vchordrq.probes = '1';
+
+query I
+SELECT count(*)
+FROM docs q, LATERAL (SELECT d.id FROM docs d ORDER BY d.val @# q.val LIMIT 1) top
+WHERE q.id <= 20 AND top.id = q.id;
+----
+20
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET vchordrq.maxsim_refine;
+
+statement ok
+RESET vchordrq.maxsim_threshold;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE docs;

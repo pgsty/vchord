@@ -15,13 +15,17 @@ use index::relation::{Page, RelationRead, RelationWrite};
 use index_accessor::FunctionalAccessor;
 use std::num::NonZero;
 
+/// Removes the index tuples whose payload `callback` selects and returns how
+/// many were removed.
 pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
     index: &R,
     check: impl Fn(),
     callback: impl Fn(NonZero<u64>) -> bool,
-) where
+) -> u64
+where
     R::Page: Page<Opaque = Opaque>,
 {
+    let mut removed = 0_u64;
     let meta_guard = index.read(0);
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
@@ -82,6 +86,7 @@ pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
                             for p in tuple.payload().iter_mut() {
                                 if Some(true) == p.map(&callback) {
                                     *p = None;
+                                    removed += 1;
                                 }
                             }
                         }
@@ -115,6 +120,7 @@ pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
                         let p = tuple.payload();
                         if Some(true) == p.map(&callback) {
                             *p = None;
+                            removed += 1;
                         }
                     }
                     current = write.get_opaque().next;
@@ -124,6 +130,7 @@ pub fn bulkdelete<R: RelationRead + RelationWrite, O: Operator>(
             }
         }
     }
+    removed
 }
 
 pub fn bulkdelete_vectors<R: RelationRead + RelationWrite, O: Operator>(

@@ -694,17 +694,32 @@ impl SearchBuilder for MaxsimBuilder {
             updates.reserve(accu_set.len() + rough_set.len());
             let is_empty = accu_set.is_empty() && rough_set.is_empty();
             let mut estimation_by_scope = Distance::NEG_INFINITY;
+            // the worst distance among all candidates of this query vector
+            let mut estimation_by_candidates = Distance::NEG_INFINITY;
             for (distance, payload) in accu_set {
                 estimation_by_scope = std::cmp::max(estimation_by_scope, distance);
+                estimation_by_candidates = std::cmp::max(estimation_by_candidates, distance);
                 let (key, _) = pointer_to_kv(payload);
                 updates.push((key, query_id, distance));
             }
             for (distance, payload) in rough_set {
+                estimation_by_candidates = std::cmp::max(estimation_by_candidates, distance);
                 let (key, _) = pointer_to_kv(payload);
                 updates.push((key, query_id, distance));
             }
             estimations.push(if !is_empty {
-                std::cmp::max(estimation_by_scope, estimation_by_threshold)
+                // A document that is not a candidate of this query vector gets
+                // this estimate as its distance. Without `maxsim_refine` or
+                // `maxsim_threshold` there is no accurate estimate, and `-inf`
+                // would rank such documents first, so fall back to the worst
+                // candidate distance: a missing document is unlikely to be
+                // closer than every candidate that was found.
+                let estimation = std::cmp::max(estimation_by_scope, estimation_by_threshold);
+                if estimation != Distance::NEG_INFINITY {
+                    estimation
+                } else {
+                    estimation_by_candidates
+                }
             } else {
                 Distance::ZERO
             });

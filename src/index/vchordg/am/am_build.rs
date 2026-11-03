@@ -247,25 +247,14 @@ impl VchordgLeader {
             heap_relation: pgrx::pg_sys::Relation,
             index_relation: pgrx::pg_sys::Relation,
         ) -> i32 {
+            // The planner already honours the `parallel_workers` reloption (an
+            // unset one is -1), max_parallel_maintenance_workers, the heap size
+            // and maintenance_work_mem; use its answer as is.
             unsafe {
-                if pgrx::pg_sys::plan_create_index_workers(
+                pgrx::pg_sys::plan_create_index_workers(
                     (*heap_relation).rd_id,
                     (*index_relation).rd_id,
-                ) == 0
-                {
-                    return 0;
-                }
-                if !(*heap_relation).rd_options.is_null() {
-                    let std_options = (*heap_relation)
-                        .rd_options
-                        .cast::<pgrx::pg_sys::StdRdOptions>();
-                    std::cmp::min(
-                        (*std_options).parallel_workers,
-                        pgrx::pg_sys::max_parallel_maintenance_workers,
-                    )
-                } else {
-                    pgrx::pg_sys::max_parallel_maintenance_workers
-                }
+                )
             }
         }
 

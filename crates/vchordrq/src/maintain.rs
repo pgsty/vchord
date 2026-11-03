@@ -27,6 +27,8 @@ pub struct Maintain {
     pub number_of_formerly_allocated_pages: usize,
     pub number_of_freshly_allocated_pages: usize,
     pub number_of_freed_pages: usize,
+    /// Live index tuples in the lists that were chosen and compacted.
+    pub number_of_tuples: u64,
 }
 
 pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
@@ -77,6 +79,8 @@ where
         number_of_formerly_allocated_pages: 0,
         number_of_freshly_allocated_pages: 0,
     });
+
+    let mut number_of_tuples = 0_u64;
 
     for (idx, first) in state.into_iter().enumerate() {
         if !chooser.choose(idx) {
@@ -229,6 +233,7 @@ where
         *jump_tuple.frozen_first() = frozen_first;
         *jump_tuple.appendable_first() = { appendable_tape }.first();
         *jump_tuple.tuples() = tuples;
+        number_of_tuples += tuples;
 
         drop(jump_guard);
 
@@ -247,6 +252,7 @@ where
         number_of_formerly_allocated_pages: buffers.number_of_formerly_allocated_pages,
         number_of_freshly_allocated_pages: buffers.number_of_freshly_allocated_pages,
         number_of_freed_pages: buffers.pages.len(),
+        number_of_tuples,
     }
 }
 
