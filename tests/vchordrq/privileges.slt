@@ -1,0 +1,220 @@
+# Sampled query vectors and prewarm follow table privileges: a role needs to
+# own the table, have SELECT on it, or (sampled values only) be a member of
+# pg_read_all_stats.
+statement ok
+DROP ROLE IF EXISTS vchord_priv_none;
+
+statement ok
+DROP ROLE IF EXISTS vchord_priv_select;
+
+statement ok
+DROP ROLE IF EXISTS vchord_priv_stats;
+
+statement ok
+DROP ROLE IF EXISTS vchord_priv_owner;
+
+statement ok
+CREATE ROLE vchord_priv_none LOGIN;
+
+statement ok
+CREATE ROLE vchord_priv_select LOGIN;
+
+statement ok
+CREATE ROLE vchord_priv_stats LOGIN;
+
+statement ok
+CREATE ROLE vchord_priv_owner LOGIN;
+
+statement ok
+GRANT pg_read_all_stats TO vchord_priv_stats;
+
+statement ok
+CREATE TABLE vchord_priv_secret (id integer, val vector(3));
+
+statement ok
+INSERT INTO vchord_priv_secret SELECT i, ARRAY[i, i, i]::vector(3) FROM generate_series(1, 100) i;
+
+statement ok
+CREATE INDEX vchord_priv_secret_idx ON vchord_priv_secret USING vchordrq (val vector_l2_ops);
+
+statement ok
+GRANT SELECT ON vchord_priv_secret TO vchord_priv_select;
+
+# The view is not granted to PUBLIC; grant it here to check its row filter.
+statement ok
+GRANT SELECT ON vchordrq_sampled_queries TO vchord_priv_none, vchord_priv_select, vchord_priv_stats;
+
+statement ok
+CREATE TABLE vchord_priv_owned (val vector(3));
+
+statement ok
+INSERT INTO vchord_priv_owned SELECT ARRAY[i, i, i]::vector(3) FROM generate_series(1, 10) i;
+
+statement ok
+CREATE INDEX vchord_priv_owned_idx ON vchord_priv_owned USING vchordrq (val vector_l2_ops);
+
+statement ok
+ALTER TABLE vchord_priv_owned OWNER TO vchord_priv_owner;
+
+statement ok
+ALTER SYSTEM SET vchordrq.query_sampling_max_records = 1;
+
+statement ok
+ALTER SYSTEM SET vchordrq.query_sampling_rate = 1;
+
+statement ok
+ALTER SYSTEM SET vchordrq.query_sampling_enable = on;
+
+statement ok
+SELECT pg_reload_conf();
+
+query I retry 5 backoff 1s
+SHOW vchordrq.query_sampling_enable;
+----
+on
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SELECT id FROM vchord_priv_secret ORDER BY val <-> '[42,4242,424242]' LIMIT 1;
+
+statement ok
+SELECT val FROM vchord_priv_owned ORDER BY val <-> '[7,7,7]' LIMIT 1;
+
+query T
+SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
+----
+[42,4242,424242]
+
+# Created after sampling, so that the planner does not pick it above.
+statement ok
+CREATE INDEX vchord_priv_secret_gidx ON vchord_priv_secret USING vchordg (val vector_l2_ops);
+
+# No privilege on the table: every entry point is denied, and the view hides
+# the index instead of failing.
+statement ok
+SET ROLE vchord_priv_none;
+
+statement error permission denied for table vchord_priv_secret
+SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
+
+statement error permission denied for table vchord_priv_secret
+SELECT * FROM vchordrq_sampled_queries('vchord_priv_secret_idx');
+
+statement error permission denied for table vchord_priv_secret
+SELECT vchordrq_prewarm('vchord_priv_secret_idx');
+
+statement error permission denied for table vchord_priv_secret
+SELECT vchordg_prewarm('vchord_priv_secret_gidx');
+
+query I
+SELECT count(*) FROM vchordrq_sampled_queries WHERE index_name = 'vchord_priv_secret_idx';
+----
+0
+
+statement ok
+RESET ROLE;
+
+# SELECT on the table allows both.
+statement ok
+SET ROLE vchord_priv_select;
+
+query T
+SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
+----
+[42,4242,424242]
+
+query T
+SELECT value FROM vchordrq_sampled_queries WHERE index_name = 'vchord_priv_secret_idx';
+----
+[42,4242,424242]
+
+query I
+SELECT vchordrq_prewarm('vchord_priv_secret_idx') <> '';
+----
+t
+
+query I
+SELECT vchordg_prewarm('vchord_priv_secret_gidx') <> '';
+----
+t
+
+statement ok
+RESET ROLE;
+
+# pg_read_all_stats may read sampled values but may not prewarm.
+statement ok
+SET ROLE vchord_priv_stats;
+
+query T
+SELECT value FROM vchordrq_sampled_queries('vchord_priv_secret_idx');
+----
+[42,4242,424242]
+
+query I
+SELECT count(*) FROM vchordrq_sampled_queries WHERE index_name = 'vchord_priv_secret_idx';
+----
+1
+
+statement error permission denied for table vchord_priv_secret
+SELECT vchordrq_prewarm('vchord_priv_secret_idx');
+
+statement ok
+RESET ROLE;
+
+# The table owner needs no grant, even after revoking its own SELECT.
+statement ok
+REVOKE SELECT ON vchord_priv_owned FROM vchord_priv_owner;
+
+statement ok
+SET ROLE vchord_priv_owner;
+
+query T
+SELECT * FROM vchordrq_sampled_values('vchord_priv_owned_idx');
+----
+[7,7,7]
+
+query I
+SELECT vchordrq_prewarm('vchord_priv_owned_idx') <> '';
+----
+t
+
+statement error permission denied for table vchord_priv_secret
+SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
+
+statement ok
+RESET ROLE;
+
+statement ok
+ALTER SYSTEM RESET vchordrq.query_sampling_enable;
+
+statement ok
+ALTER SYSTEM RESET vchordrq.query_sampling_max_records;
+
+statement ok
+ALTER SYSTEM RESET vchordrq.query_sampling_rate;
+
+statement ok
+SELECT pg_reload_conf();
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE vchord_priv_secret, vchord_priv_owned;
+
+statement ok
+REVOKE SELECT ON vchordrq_sampled_queries FROM vchord_priv_none, vchord_priv_select, vchord_priv_stats;
+
+statement ok
+DROP ROLE vchord_priv_none;
+
+statement ok
+DROP ROLE vchord_priv_select;
+
+statement ok
+DROP ROLE vchord_priv_stats;
+
+statement ok
+DROP ROLE vchord_priv_owner;

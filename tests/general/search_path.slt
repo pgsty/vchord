@@ -1,0 +1,110 @@
+# Functions of the extension must not resolve extension objects through the
+# caller's search_path (pg_restore and maintenance operations run with a
+# restricted one), and must keep working after ALTER EXTENSION SET SCHEMA.
+statement ok
+CREATE TABLE search_path_t (id integer, val vector(3));
+
+statement ok
+INSERT INTO search_path_t SELECT i, ARRAY[i, i, i]::vector(3) FROM generate_series(1, 100) i;
+
+statement ok
+CREATE INDEX search_path_idx ON search_path_t USING vchordrq (val vector_l2_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET search_path = pg_catalog;
+
+query T
+SELECT public.sphere('[1,2,3]'::public.vector, 1.0::real)::text;
+----
+("[1,2,3]",1)
+
+query T
+SELECT public.sphere('[1,2,3]'::public.halfvec, 2.0::real)::text;
+----
+("[1,2,3]",2)
+
+query T
+SELECT public.sphere('(1,1,0,1)[1,2]'::public.rabitq8, 3.0::real)::text;
+----
+("(1, 1, 0, 1)[1, 2]",3)
+
+query T
+SELECT public.sphere('(1,1,0,1)[1,2]'::public.rabitq4, 4.0::real)::text;
+----
+("(1, 1, 0, 1)[1, 2]",4)
+
+query I
+SELECT count(*) FROM public.search_path_t
+WHERE val OPERATOR(public.<<->>) public.sphere('[1,1,1]'::public.vector, 1.8::real);
+----
+2
+
+query I
+SELECT public.vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM public.search_path_t ORDER BY val OPERATOR(public.<->) '[5,5,5]'::public.vector LIMIT 5$$
+);
+----
+1
+
+query I
+SELECT public.vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM public.search_path_t ORDER BY val OPERATOR(public.<->) '[5,5,5]'::public.vector LIMIT 5$$,
+    exact_search => true
+);
+----
+1
+
+statement ok
+RESET search_path;
+
+# Relocate the extension and repeat with a search_path that excludes both
+# schemas.
+statement ok
+CREATE SCHEMA vchord_relocated;
+
+statement ok
+ALTER EXTENSION vchord SET SCHEMA vchord_relocated;
+
+statement ok
+SET search_path = pg_catalog;
+
+query T
+SELECT vchord_relocated.sphere('[1,2,3]'::public.vector, 1.0::real)::text;
+----
+("[1,2,3]",1)
+
+query T
+SELECT vchord_relocated.sphere('(1,1,0,1)[1,2]'::vchord_relocated.rabitq4, 4.0::real)::text;
+----
+("(1, 1, 0, 1)[1, 2]",4)
+
+query I
+SELECT count(*) FROM public.search_path_t
+WHERE val OPERATOR(vchord_relocated.<<->>) vchord_relocated.sphere('[1,1,1]'::public.vector, 1.8::real);
+----
+2
+
+query I
+SELECT vchord_relocated.vchordrq_evaluate_query_recall(
+    $$SELECT ctid FROM public.search_path_t ORDER BY val OPERATOR(public.<->) '[5,5,5]'::public.vector LIMIT 5$$
+);
+----
+1
+
+statement ok
+RESET search_path;
+
+statement ok
+ALTER EXTENSION vchord SET SCHEMA public;
+
+statement ok
+DROP SCHEMA vchord_relocated;
+
+statement ok
+DROP TABLE search_path_t;
+
+statement ok
+RESET enable_seqscan;

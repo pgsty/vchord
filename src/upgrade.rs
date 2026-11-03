@@ -12,13 +12,16 @@
 // * https://www.postgresql.org/message-id/CACX+KaPOzzRHEt4w_=iqKbTpMKjyrUGVng1C749yP3r6dprtcg@mail.gmail.com
 // * https://github.com/tensorchord/pgvecto.rs/issues/397
 
+// Each argument is the exact C symbol named in `AS 'MODULE_PATHNAME', '<symbol>'`
+// by some script in `sql/install` or `sql/upgrade`; `pg_finfo_<symbol>` is
+// emitted alongside it. Run `devtools/check-symbols.sh` after changing this list.
 macro_rules! symbol {
     ($t:ident) => {
         paste::paste! {
             #[unsafe(no_mangle)]
             #[doc(hidden)]
             #[pgrx::pg_guard]
-            extern "C-unwind" fn [<$t _wrapper>](_fcinfo: pgrx::pg_sys::FunctionCallInfo) -> pgrx::pg_sys::Datum {
+            extern "C-unwind" fn $t(_fcinfo: pgrx::pg_sys::FunctionCallInfo) -> pgrx::pg_sys::Datum {
                 pgrx::error!(
                     "the symbol {} is removed in the extension; please run extension update scripts",
                     stringify!($t),
@@ -26,7 +29,7 @@ macro_rules! symbol {
             }
             #[unsafe(no_mangle)]
             #[doc(hidden)]
-            pub extern "C" fn [<pg_finfo_ $t _wrapper>]() -> &'static ::pgrx::pg_sys::Pg_finfo_record {
+            pub extern "C" fn [<pg_finfo_ $t>]() -> &'static ::pgrx::pg_sys::Pg_finfo_record {
                 const V1_API: ::pgrx::pg_sys::Pg_finfo_record = ::pgrx::pg_sys::Pg_finfo_record {
                     api_version: 1,
                 };
@@ -46,5 +49,7 @@ symbol!(_vchord_scalar8_sphere_ip_in_wrapper);
 symbol!(_vchord_scalar8_sphere_l2_in_wrapper);
 symbol!(_vchord_typmod_in_65535_wrapper);
 symbol!(_vchord_typmod_out_wrapper);
+symbol!(_vchord_scalar8_in_wrapper);
+symbol!(_vchord_scalar8_out_wrapper);
 symbol!(_vchord_scalar8_recv_wrapper);
 symbol!(_vchord_scalar8_send_wrapper);

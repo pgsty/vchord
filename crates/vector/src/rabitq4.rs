@@ -154,7 +154,9 @@ impl<'a> Rabitq4Borrowed<'a> {
         sum_of_abs_x: f32,
         packed_code: &'a [u8],
     ) -> Option<Self> {
-        if !(1..=65535).contains(&packed_code.len()) {
+        // The on-disk header stores `dim` as `u16`, so bound the dimension
+        // itself rather than the packed length (which is about half of it).
+        if !(1..=65535).contains(&dim) {
             return None;
         }
         if dim.div_ceil(2) as usize != packed_code.len() {
@@ -374,5 +376,20 @@ impl VectorBorrowed for Rabitq4Borrowed<'_> {
 
     fn operator_xor(&self, _: Self) -> Self::Owned {
         unimplemented!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_checked_bounds_dim() {
+        // 65536 dimensions pack into 32768 bytes, but `dim` must fit in u16.
+        let code = vec![0u8; 32768];
+        assert!(Rabitq4Borrowed::new_checked(65536, 1.0, 1.0, 0.0, 1.0, &code).is_none());
+        assert!(Rabitq4Borrowed::new_checked(65535, 1.0, 1.0, 0.0, 1.0, &code).is_some());
+        assert!(Rabitq4Borrowed::new_checked(0, 1.0, 1.0, 0.0, 1.0, &[]).is_none());
+        assert!(Rabitq4Owned::new_checked(65536, 1.0, 1.0, 0.0, 1.0, code).is_none());
     }
 }

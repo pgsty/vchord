@@ -7,6 +7,7 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::datatype::memory_rabitq8::{Rabitq8Input, Rabitq8Output};
+use crate::datatype::rabitq_io;
 use pgrx::datum::Internal;
 use pgrx::pg_sys::Oid;
 use vector::VectorBorrowed;
@@ -31,60 +32,26 @@ fn _vchord_rabitq8_send(vector: Rabitq8Input<'_>) -> Vec<u8> {
 fn _vchord_rabitq8_recv(mut internal: Internal, oid: Oid, typmod: i32) -> Rabitq8Output {
     let _ = (oid, typmod);
     let buf = unsafe { internal.get_mut::<pgrx::pg_sys::StringInfoData>().unwrap() };
+    let mut reader = rabitq_io::Reader::new(buf);
 
-    let dim = {
-        assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
-        let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
-        buf.cursor += 4;
-        u32::from_be_bytes(raw)
-    };
-    let sum_of_x2 = {
-        assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
-        let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
-        buf.cursor += 4;
-        f32::from_be_bytes(raw)
-    };
-    let norm_of_lattice = {
-        assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
-        let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
-        buf.cursor += 4;
-        f32::from_be_bytes(raw)
-    };
-    let sum_of_code = {
-        assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
-        let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
-        buf.cursor += 4;
-        f32::from_be_bytes(raw)
-    };
-    let sum_of_abs_x = {
-        assert!(buf.cursor < i32::MAX - 4 && buf.cursor + 4 <= buf.len);
-        let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 4]>().read() };
-        buf.cursor += 4;
-        f32::from_be_bytes(raw)
-    };
-    let packed_code = {
-        let mut result = Vec::new();
-        for _ in 0..dim.div_ceil(1) {
-            result.push({
-                assert!(buf.cursor < i32::MAX - 1 && buf.cursor + 1 <= buf.len);
-                let raw = unsafe { buf.data.add(buf.cursor as _).cast::<[u8; 1]>().read() };
-                buf.cursor += 1;
-                u8::from_be_bytes(raw)
-            });
-        }
-        result
-    };
+    let dim = reader.u32();
+    rabitq_io::check_dim("rabitq8", dim);
+    let metadata = reader.metadata();
+    let packed_code = reader.bytes(dim.div_ceil(1) as usize);
 
-    if let Some(x) = Rabitq8Borrowed::new_checked(
+    let Some(x) = Rabitq8Borrowed::new_checked(
         dim,
-        sum_of_x2,
-        norm_of_lattice,
-        sum_of_code,
-        sum_of_abs_x,
-        &packed_code,
-    ) {
-        Rabitq8Output::new(x)
-    } else {
-        pgrx::error!("detect data corruption");
-    }
+        metadata.sum_of_x2,
+        metadata.norm_of_lattice,
+        metadata.sum_of_code,
+        metadata.sum_of_abs_x,
+        packed_code,
+    ) else {
+        pgrx::ereport!(
+            ERROR,
+            pgrx::PgSqlErrorCode::ERRCODE_INVALID_BINARY_REPRESENTATION,
+            "invalid binary data for type rabitq8"
+        );
+    };
+    Rabitq8Output::new(x)
 }

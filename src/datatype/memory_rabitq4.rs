@@ -110,6 +110,14 @@ impl Rabitq4Output {
         Self(q)
     }
     pub fn new(vector: Rabitq4Borrowed<'_>) -> Self {
+        // The header stores `dim` as `u16`; never truncate it silently.
+        let Ok(dim) = u16::try_from(vector.dim()) else {
+            pgrx::ereport!(
+                ERROR,
+                pgrx::PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+                format!("rabitq4 cannot have more than {} dimensions", u16::MAX)
+            );
+        };
         unsafe {
             let packed_code = vector.packed_code();
             let size = Rabitq4Header::size_of_by_len(packed_code.len());
@@ -120,7 +128,7 @@ impl Rabitq4Output {
             (&raw mut (*ptr).varlena).write((size as u32) & 0x3FFFFFFF);
             #[cfg(target_endian = "little")]
             (&raw mut (*ptr).varlena).write((size << 2) as u32);
-            (&raw mut (*ptr).dim).write(vector.dim() as _);
+            (&raw mut (*ptr).dim).write(dim);
             (&raw mut (*ptr).unused).write(0);
             (&raw mut (*ptr).sum_of_x2).write(vector.sum_of_x2());
             (&raw mut (*ptr).norm_of_lattice).write(vector.norm_of_lattice());

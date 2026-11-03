@@ -18,6 +18,7 @@ mod operators_halfvec;
 mod operators_rabitq4;
 mod operators_rabitq8;
 mod operators_vector;
+mod rabitq_io;
 mod text_rabitq4;
 mod text_rabitq8;
 pub mod typmod;

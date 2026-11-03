@@ -1,0 +1,233 @@
+# Text input of rabitq8 / rabitq4 rejects malformed values with PostgreSQL
+# style errors, and still accepts everything the output functions print.
+
+# The dimension is stored as u16: 65536 dimensions must be rejected instead of
+# being truncated into a value that can never be read back.
+statement ok
+CREATE TABLE rabitq_input_dim (v rabitq4);
+
+statement error rabitq4 cannot have more than 65535 dimensions
+INSERT INTO rabitq_input_dim
+SELECT ('(1, 1, 0, 1)[' || array_to_string(array_fill(0, ARRAY[65536]), ',') || ']')::rabitq4;
+
+statement error rabitq8 cannot have more than 65535 dimensions
+SELECT ('(1, 1, 0, 1)[' || array_to_string(array_fill(0, ARRAY[65536]), ',') || ']')::rabitq8;
+
+statement ok
+INSERT INTO rabitq_input_dim
+SELECT ('(1, 1, 0, 1)[' || array_to_string(array_fill(15, ARRAY[65535]), ',') || ']')::rabitq4;
+
+query I
+SELECT length(v::text) FROM rabitq_input_dim;
+----
+262152
+
+statement ok
+DROP TABLE rabitq_input_dim;
+
+# Codes out of range.
+statement error code "16" is out of range for type rabitq4
+SELECT '(1,1,0,1)[16,0]'::rabitq4;
+
+statement error code "256" is out of range for type rabitq8
+SELECT '(1,1,0,1)[256]'::rabitq8;
+
+statement error code "-1" is out of range for type rabitq8
+SELECT '(1,1,0,1)[-1]'::rabitq8;
+
+statement error code "99999999999999999999" is out of range for type rabitq4
+SELECT '(1,1,0,1)[99999999999999999999]'::rabitq4;
+
+# Whitespace ends a number.
+statement error invalid input syntax for type rabitq8: "\(1,1,0,1\)\[1 2, 3\]"
+SELECT '(1,1,0,1)[1 2, 3]'::rabitq8;
+
+statement error invalid input syntax for type rabitq4
+SELECT '(1 2,1,0,1)[1]'::rabitq4;
+
+# Only whitespace may follow the closing bracket.
+statement error invalid input syntax for type rabitq8: "\(1,1,0,1\)\[1\]garbage"
+SELECT '(1,1,0,1)[1]garbage'::rabitq8;
+
+statement error invalid input syntax for type rabitq4
+SELECT '(1,1,0,1)[1],'::rabitq4;
+
+# Other malformed values.
+statement error invalid input syntax for type rabitq8
+SELECT '(1,1,0)[1]'::rabitq8;
+
+statement error invalid input syntax for type rabitq8
+SELECT '(1,1,0,1,1)[1]'::rabitq8;
+
+statement error invalid input syntax for type rabitq8
+SELECT '(1,1,0,1)[1,,2]'::rabitq8;
+
+statement error invalid input syntax for type rabitq8
+SELECT '(1,1,0,1)[1,]'::rabitq8;
+
+statement error invalid input syntax for type rabitq8
+SELECT '(1,1,0,1)[x]'::rabitq8;
+
+statement error invalid input syntax for type rabitq4
+SELECT '(1,1,zero,1)[1]'::rabitq4;
+
+statement error invalid input syntax for type rabitq4
+SELECT '(1,1,0,1)'::rabitq4;
+
+statement error invalid input syntax for type rabitq4
+SELECT '[1]'::rabitq4;
+
+statement error rabitq8 must have at least 1 dimension
+SELECT '(1,1,0,1)[]'::rabitq8;
+
+# Non-finite or negative metadata is still accepted on input: earlier
+# versions could store it (quantizing a vector whose squared norm overflows),
+# and such rows must keep restoring from dumps.
+statement ok
+SELECT '(NaN,1,0,1)[1]'::rabitq8;
+
+statement ok
+SELECT '(1,inf,0,1)[1]'::rabitq4;
+
+statement ok
+SELECT '(1,1,-inf,1)[1]'::rabitq8;
+
+statement ok
+SELECT '(1,1,0,1e39)[1]'::rabitq8;
+
+statement ok
+SELECT '(-1,1,0,1)[1]'::rabitq8;
+
+# Quantization refuses to produce such metadata (the squared norm overflows).
+statement error value out of range: overflow
+SELECT quantize_to_rabitq8('[1e20,1e20,1]'::vector);
+
+statement error value out of range: overflow
+SELECT quantize_to_rabitq4('[3e38,3e38,1]'::vector);
+
+# Accepted forms.
+query T
+SELECT E' \t( 1 ,\n1 , 0 , 1 ) [ 1 , 2 ]\r\n '::rabitq8;
+----
+(1, 1, 0, 1)[1, 2]
+
+query T
+SELECT '(-0,1.5e2,+3,.5)[0,15,7]'::rabitq4;
+----
+(-0, 150, 3, 0.5)[0, 15, 7]
+
+query T
+SELECT '(1,1,0,1)[255,0]'::rabitq8;
+----
+(1, 1, 0, 1)[255, 0]
+
+# Everything the output functions print is accepted again, through text and
+# through binary COPY.
+statement ok
+CREATE TABLE rabitq_input_roundtrip (id integer, v8 rabitq8, v4 rabitq4);
+
+statement ok
+INSERT INTO rabitq_input_roundtrip
+SELECT id, quantize_to_rabitq8(v), quantize_to_rabitq4(v)
+FROM (VALUES
+    (1, '[1,2,3]'::vector),
+    (2, '[0,0,0]'::vector),
+    (3, '[1e-30,0,0]'::vector),
+    (4, '[-12345.678,3,4.5,0.001,-0.5]'::vector),
+    (5, '[1e18,-1e18,3]'::vector)
+) AS t(id, v);
+
+statement ok
+INSERT INTO rabitq_input_roundtrip
+SELECT 100 + i, quantize_to_rabitq8(v), quantize_to_rabitq4(v)
+FROM (
+    SELECT i, array_agg(sin(i * 7 + j) * (10 ^ (i % 9)))::real[]::vector AS v
+    FROM generate_series(1, 20) AS i, generate_series(1, 33) AS j
+    GROUP BY i
+) AS t;
+
+query I
+SELECT count(*) FROM rabitq_input_roundtrip
+WHERE v8::text::rabitq8::text <> v8::text OR v4::text::rabitq4::text <> v4::text;
+----
+0
+
+# Binary COPY passes each field to the receive function unchanged, so it can
+# also feed hand-written payloads to rabitq8_recv / rabitq4_recv.
+statement ok
+CREATE FUNCTION rabitq_input_copy(source text, target text) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    path text := current_setting('data_directory') || '/vchord_rabitq_input.copy';
+BEGIN
+    EXECUTE format('COPY (%s) TO %L WITH (FORMAT binary)', source, path);
+    EXECUTE format('COPY %I FROM %L WITH (FORMAT binary)', target, path);
+END;
+$$;
+
+statement ok
+CREATE TABLE rabitq_input_roundtrip_binary (LIKE rabitq_input_roundtrip);
+
+statement ok
+SELECT rabitq_input_copy('SELECT * FROM rabitq_input_roundtrip', 'rabitq_input_roundtrip_binary');
+
+query I
+SELECT count(*) FROM rabitq_input_roundtrip AS a
+JOIN rabitq_input_roundtrip_binary AS b USING (id)
+WHERE a.v8::text = b.v8::text AND a.v4::text = b.v4::text;
+----
+25
+
+statement ok
+CREATE TABLE rabitq_input_binary8 (v rabitq8);
+
+statement ok
+CREATE TABLE rabitq_input_binary4 (v rabitq4);
+
+# dim = 2, metadata (1, 1, 0, 1), codes [3, 4]
+statement ok
+SELECT rabitq_input_copy($$SELECT '\x000000023f8000003f800000000000003f8000000304'::bytea$$, 'rabitq_input_binary8');
+
+query T
+SELECT v::text FROM rabitq_input_binary8;
+----
+(1, 1, 0, 1)[3, 4]
+
+# dim = 65536 must not be truncated to 0.
+statement error rabitq4 cannot have more than 65535 dimensions
+SELECT rabitq_input_copy(
+    $$SELECT '\x000100003f8000003f800000000000003f800000'::bytea || decode(repeat('00', 32768), 'hex')$$,
+    'rabitq_input_binary4'
+);
+
+statement error rabitq8 must have at least 1 dimension
+SELECT rabitq_input_copy($$SELECT '\x000000003f8000003f800000000000003f800000'::bytea$$, 'rabitq_input_binary8');
+
+# Binary input accepts the same metadata as text input (see above).
+statement ok
+SELECT rabitq_input_copy($$SELECT '\x000000017fc000003f800000000000003f80000001'::bytea$$, 'rabitq_input_binary8');
+
+statement ok
+SELECT rabitq_input_copy($$SELECT '\x00000001bf8000003f800000000000003f80000001'::bytea$$, 'rabitq_input_binary4');
+
+statement error insufficient data left in message
+SELECT rabitq_input_copy($$SELECT '\x000000033f8000003f800000000000003f8000000102'::bytea$$, 'rabitq_input_binary8');
+
+# The unused high nibble of an odd-dimensional rabitq4 must be zero.
+statement error invalid binary data for type rabitq4
+SELECT rabitq_input_copy($$SELECT '\x000000013f8000003f800000000000003f80000010'::bytea$$, 'rabitq_input_binary4');
+
+# Only the accepted negative-sum_of_x2 row above was stored.
+query I
+SELECT count(*) FROM rabitq_input_binary4;
+----
+1
+
+statement ok
+SELECT rabitq_input_copy('SELECT 1 WHERE false', 'rabitq_input_binary4');
+
+statement ok
+DROP FUNCTION rabitq_input_copy(text, text);
+
+statement ok
+DROP TABLE rabitq_input_roundtrip, rabitq_input_roundtrip_binary, rabitq_input_binary8, rabitq_input_binary4;
