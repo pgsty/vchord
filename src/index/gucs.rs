@@ -7,8 +7,8 @@
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
 use crate::index::scanners::Io;
-use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting, PostgresGucEnum};
-use std::ffi::{CStr, CString};
+use pgrx::guc::{GucCheckError, GucContext, GucFlags, GucRegistry, GucSetting, PostgresGucEnum};
+use std::ffi::{CStr, CString, c_char};
 
 #[derive(Debug, Clone, Copy, PostgresGucEnum)]
 pub enum PostgresIo {
@@ -57,6 +57,28 @@ static VCHORDRQ_PROBES: GucSetting<Option<CString>> = GucSetting::<Option<CStrin
 
 static mut VCHORDRQ_PROBES_CONFIG: *mut pgrx::pg_sys::config_generic = core::ptr::null_mut();
 
+#[pgrx::pg_guc_hook(check)]
+fn check_vchordrq_probes(newval: Option<CString>) -> Result<(), GucCheckError> {
+    if let Some(newval) = newval {
+        parse_probes(&newval)
+            .map(|_| ())
+            .map_err(GucCheckError::new)
+    } else {
+        Ok(())
+    }
+}
+
+#[pgrx::pg_guard]
+pub unsafe extern "C-unwind" fn validate_vchordrq_probes(value: *const c_char) {
+    if value.is_null() {
+        pgrx::error!("probes value must not be null");
+    }
+    let value = unsafe { CStr::from_ptr(value) };
+    if let Err(error) = parse_probes(value) {
+        pgrx::error!("{error}");
+    }
+}
+
 static VCHORDRQ_EPSILON: GucSetting<f64> = GucSetting::<f64>::new(1.9);
 
 static mut VCHORDRQ_EPSILON_CONFIG: *mut pgrx::pg_sys::config_generic = core::ptr::null_mut();
@@ -97,14 +119,19 @@ pub fn init() {
         GucContext::Userset,
         GucFlags::default(),
     );
-    GucRegistry::define_string_guc(
-        c"vchordrq.probes",
-        c"`probes` argument of vchordrq.",
-        c"`probes` argument of vchordrq.",
-        &VCHORDRQ_PROBES,
-        GucContext::Userset,
-        GucFlags::default(),
-    );
+    unsafe {
+        GucRegistry::define_string_guc_with_hooks(
+            c"vchordrq.probes",
+            c"`probes` argument of vchordrq.",
+            c"`probes` argument of vchordrq.",
+            &VCHORDRQ_PROBES,
+            GucContext::Userset,
+            GucFlags::default(),
+            Some(check_vchordrq_probes),
+            None,
+            None,
+        );
+    }
     GucRegistry::define_float_guc(
         c"vchordrq.epsilon",
         c"`epsilon` argument of vchordrq.",
@@ -387,50 +414,60 @@ pub fn vchordrq_enable_scan() -> bool {
     VCHORDRQ_ENABLE_SCAN.get()
 }
 
-pub unsafe fn vchordrq_probes(index: pgrx::pg_sys::Relation) -> Vec<u32> {
-    fn parse(value: &CStr) -> Vec<u32> {
-        let mut result = Vec::new();
-        let mut current: Option<u32> = None;
-        let mut saw_separator = false;
-        for &c in value.to_bytes() {
-            match c {
-                b' ' => continue,
-                b',' => {
-                    saw_separator = true;
-                    match current.take() {
-                        Some(value) => result.push(value),
-                        None => pgrx::error!("empty entry in probes"),
-                    }
+pub fn parse_probes(value: &CStr) -> Result<Vec<u32>, String> {
+    let mut result = Vec::new();
+    let mut current: Option<u32> = None;
+    let mut saw_separator = false;
+    for &c in value.to_bytes() {
+        match c {
+            b' ' => continue,
+            b',' => {
+                saw_separator = true;
+                match current.take() {
+                    Some(0) => return Err("probe value must be greater than zero".to_owned()),
+                    Some(value) => result.push(value),
+                    None => return Err("empty entry in probes".to_owned()),
                 }
-                b'0'..=b'9' => {
-                    let value = current.unwrap_or_default();
-                    let Some(value) = value
-                        .checked_mul(10)
-                        .and_then(|value| value.checked_add((c - b'0') as u32))
-                    else {
-                        pgrx::error!("probe value is out of range for u32");
-                    };
-                    current = Some(value);
-                }
-                c => pgrx::error!("unknown character in probes: ASCII = {c}"),
             }
+            b'0'..=b'9' => {
+                let value = current.unwrap_or_default();
+                let Some(value) = value
+                    .checked_mul(10)
+                    .and_then(|value| value.checked_add((c - b'0') as u32))
+                else {
+                    return Err("probe value is out of range for u32".to_owned());
+                };
+                current = Some(value);
+            }
+            c => return Err(format!("unknown character in probes: ASCII = {c}")),
         }
-        if let Some(current) = current {
-            result.push(current);
-        } else if saw_separator {
-            pgrx::error!("empty entry in probes");
-        }
-        result
     }
+    if let Some(current) = current {
+        if current == 0 {
+            return Err("probe value must be greater than zero".to_owned());
+        }
+        result.push(current);
+    } else if saw_separator {
+        return Err("empty entry in probes".to_owned());
+    }
+    Ok(result)
+}
+
+pub unsafe fn vchordrq_probes(index: pgrx::pg_sys::Relation) -> Vec<u32> {
     assert!(crate::is_main());
     const DEFAULT: &CStr = c"";
-    if unsafe { (*VCHORDRQ_PROBES_CONFIG).source } != pgrx::pg_sys::GucSource::PGC_S_DEFAULT {
-        let value = VCHORDRQ_PROBES.get();
-        parse(value.as_deref().unwrap_or(DEFAULT))
-    } else {
-        use crate::index::vchordrq::am::Reloption;
-        let value = unsafe { Reloption::probes((*index).rd_options as _, DEFAULT) };
-        parse(value)
+    let parsed =
+        if unsafe { (*VCHORDRQ_PROBES_CONFIG).source } != pgrx::pg_sys::GucSource::PGC_S_DEFAULT {
+            let value = VCHORDRQ_PROBES.get();
+            parse_probes(value.as_deref().unwrap_or(DEFAULT))
+        } else {
+            use crate::index::vchordrq::am::Reloption;
+            let value = unsafe { Reloption::probes((*index).rd_options as _, DEFAULT) };
+            parse_probes(value)
+        };
+    match parsed {
+        Ok(value) => value,
+        Err(error) => pgrx::error!("{error}"),
     }
 }
 

@@ -117,7 +117,7 @@ SELECT * FROM items ORDER BY embedding <-> '[3, 1, 2]' LIMIT 5;
 ```
 
 When tuning `vchordrq`, use one comma-separated `probes` value per level in
-`build.internal.lists`. Each value must be in `0..=4294967295`; empty entries
+`build.internal.lists`. Each value must be in `1..=4294967295`; empty entries
 and trailing commas are invalid. An empty string is valid for `lists = []`.
 For `vchordg`, `alpha` must contain 1–8 ascending values starting with `1.0`,
 all below `2.0`.

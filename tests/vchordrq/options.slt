@@ -27,7 +27,7 @@ SELECT val FROM t ORDER BY val <-> '[0,0,0]' LIMIT 10;
 ----
 [1,1,1]
 
-statement ok
+statement error probe value must be greater than zero
 ALTER INDEX i SET (probes = '0');
 
 query T
@@ -41,6 +41,8 @@ SET vchordrq.probes TO DEFAULT;
 query T
 SELECT val FROM t ORDER BY val <-> '[0,0,0]' LIMIT 10;
 ----
+[1,1,1]
+[2,2,2]
 
 statement ok
 DROP TABLE t;

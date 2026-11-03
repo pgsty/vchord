@@ -8,45 +8,37 @@ CREATE TABLE probes_validation (v vector(3));
 statement ok
 INSERT INTO probes_validation VALUES ('[1,2,3]'), ('[2,3,4]');
 
+statement error empty entry in probes
+CREATE INDEX probes_validation_bad_idx ON probes_validation USING vchordrq (v vector_l2_ops)
+WITH (options = 'build.internal.lists = [2, 2]', probes = '2,');
+
 statement ok
 CREATE INDEX probes_validation_idx ON probes_validation USING vchordrq (v vector_l2_ops)
 WITH (options = 'build.internal.lists = [2, 2]', probes = '2,2');
 
-statement ok
+statement error probe value must be greater than zero
+SET vchordrq.probes = '0';
+
+statement error probe value must be greater than zero
+SET vchordrq.probes = '1,0';
+
+statement error empty entry in probes
 SET vchordrq.probes = ',5';
 
 statement error empty entry in probes
-SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
-
-statement ok
 SET vchordrq.probes = '1,,2';
 
 statement error empty entry in probes
-SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
-
-statement ok
 SET vchordrq.probes = '10, ';
 
-statement error empty entry in probes
-SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
-
-statement ok
+statement error probe value is out of range for u32
 SET vchordrq.probes = '4294967296,2';
 
 statement error probe value is out of range for u32
-SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
-
-statement ok
 SET vchordrq.probes = '999999999999999999999,2';
 
-statement error probe value is out of range for u32
-SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
-
-statement ok
-SET vchordrq.probes = '2,x';
-
 statement error unknown character in probes
-SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+SET vchordrq.probes = '2,x';
 
 # Each component and their sum must be safe at the u32 boundary.
 statement ok
@@ -60,17 +52,14 @@ SELECT count(*) FROM (SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' L
 statement ok
 RESET vchordrq.probes;
 
-statement ok
+statement error empty entry in probes
 ALTER INDEX probes_validation_idx SET (probes = '2,');
 
-statement error empty entry in probes
-SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
-
-statement ok
-ALTER INDEX probes_validation_idx SET (probes = '4294967296,2');
+statement error probe value must be greater than zero
+ALTER INDEX probes_validation_idx SET (probes = '2,0');
 
 statement error probe value is out of range for u32
-SELECT v FROM probes_validation ORDER BY v <-> '[0,0,0]' LIMIT 1;
+ALTER INDEX probes_validation_idx SET (probes = '4294967296,2');
 
 statement ok
 ALTER INDEX probes_validation_idx SET (probes = ' 2 , 2 ');

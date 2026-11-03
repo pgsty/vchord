@@ -149,7 +149,7 @@ pub fn init() {
                 c"probes".as_ptr(),
                 c"Search parameter `vchordrq.probes`".as_ptr(),
                 c"".as_ptr(),
-                None,
+                Some(gucs::validate_vchordrq_probes),
                 pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
             );
             pgrx::pg_sys::add_real_reloption(
@@ -335,7 +335,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             let probes = gucs::vchordrq_probes(relation.raw());
             let cost = vchordrq::cost(&index);
             if cost.cells.len() != 1 + probes.len() {
-                panic!(
+                pgrx::error!(
                     "need {} probes, but {} probes provided",
                     cost.cells.len() - 1,
                     probes.len()
