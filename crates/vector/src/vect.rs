@@ -247,6 +247,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn normalize_zero_vector() {
         for n in [1, 2, 3, 64, 784] {
             let zero = vec![0.0f32; n];
@@ -259,6 +260,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn normalize_non_finite_norm() {
         // `1e30^2` overflows f32, so the norm is infinite and `1 / l` is zero.
         let x = vec![1e30f32, -1e30, 3.0];
@@ -267,6 +269,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn normalize_unit_length() {
         let mut rng = lcg(5);
         for n in [1, 2, 3, 7, 64, 783, 784, 785] {
@@ -313,6 +316,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn f16_large_magnitude_distances() {
         let mut rng = lcg(9);
         for n in [1, 3, 784, 785] {

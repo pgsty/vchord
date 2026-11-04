@@ -165,6 +165,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn zero_and_nan_samples() {
         // `n <= c` (quick), `c < n <= 2c` (flat) and `n > 2c` (rabitq).
         for (n, c) in [(5, 8), (8, 8), (12, 8), (100, 8), (1000, 16)] {
@@ -185,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn only_nan_samples() {
         for (n, c) in [(3, 8), (12, 8), (100, 8)] {
             for is_spherical in [false, true] {
@@ -196,6 +198,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn hierarchical_empty_partition() {
         // With 2 samples far from the origin, 2 of the 4 coarse centroids are
         // random vectors that no sample is assigned to. Their seats used to
@@ -211,6 +214,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn centroid_equal_to_zero_sample() {
         // Quick k-means uses samples as centroids; a zero sample gives a zero
         // centroid, whose RaBitQ metadata used to be NaN so that the RaBitQ

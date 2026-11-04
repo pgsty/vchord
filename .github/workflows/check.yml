@@ -693,12 +693,8 @@ jobs:
     strategy:
       matrix:
         include:
-          - version: "15"
-            platform: "s390x"
-            clang_triple: "s390x-linux-gnu"
-            rust_triple: "s390x-unknown-linux-gnu"
-            gcc_version: "12"
-            debian_version: "bookworm"
+          # PGDG has no s390x packages, so s390x uses Debian's own PostgreSQL
+          # (trixie ships 17); debuerreotype no longer publishes s390x bookworm.
           - version: "17"
             platform: "s390x"
             clang_triple: "s390x-linux-gnu"

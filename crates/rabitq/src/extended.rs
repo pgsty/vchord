@@ -324,6 +324,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn zero_vector() {
         for n in [1, 2, 3, 64, 65, 784] {
             for zero in [vec![0.0f32; n], vec![-0.0f32; n]] {
@@ -356,6 +357,7 @@ mod tests {
     /// The estimate of `|v - v|^2` must never be negative (its square root, the
     /// `<->` operator of `rabitq8` and `rabitq4`, would be NaN).
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn l2s_of_identical_vectors_is_not_negative() {
         let mut rng = lcg(42);
         for n in [1, 2, 3, 7, 64, 100, 768] {

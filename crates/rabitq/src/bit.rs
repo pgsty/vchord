@@ -563,6 +563,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn zero_vector() {
         let mut rng = lcg(1);
         for n in [1, 2, 3, 7, 64, 65, 784] {
@@ -588,6 +589,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn one_dimension() {
         for x in [1.0f32, -1.0, 0.3, -255.0, 1e-20, 3.0e18] {
             let m = code_metadata(&[x]);
@@ -642,6 +644,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn residual_equal_to_centroid() {
         // A centroid that is equal to a sample (quick k-means) leaves a zero residual.
         let mut rng = lcg(3);

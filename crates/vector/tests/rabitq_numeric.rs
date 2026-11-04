@@ -49,6 +49,7 @@ fn rabitq4(x: &[f32]) -> Rabitq4Owned {
 
 /// `v <-> v` is `sqrt(operator_l2s(v, v))`; a negative estimate made it NaN.
 #[test]
+#[cfg_attr(miri, ignore)]
 fn l2s_of_identical_vectors() {
     let mut rng = lcg(1);
     for n in [1, 2, 3, 64, 65, 768] {
@@ -70,6 +71,7 @@ fn l2s_of_identical_vectors() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore)]
 fn zero_vector() {
     let mut rng = lcg(2);
     for n in [1, 3, 64] {

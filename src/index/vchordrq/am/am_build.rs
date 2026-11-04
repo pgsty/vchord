@@ -978,7 +978,7 @@ unsafe fn parallel_build(
     struct IdChooser(u32);
     impl InsertChooser for IdChooser {
         fn choose(&mut self, n: NonZero<usize>) -> usize {
-            self.0 as usize % n.get()
+            self.0 as usize % n
         }
     }
 
