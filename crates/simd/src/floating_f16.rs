@@ -407,7 +407,7 @@ mod reduce_sum_of_x {
     }
 
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, unused_mut)]
     fn implementations() -> Vec<(&'static str, unsafe fn(&[f16]) -> f32)> {
         let mut r: Vec<(&'static str, unsafe fn(&[f16]) -> f32)> =
             vec![("fallback", fallback), ("dispatch", |x| reduce_sum_of_x(x))];
@@ -646,7 +646,7 @@ mod reduce_sum_of_abs_x {
     }
 
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, unused_mut)]
     fn implementations() -> Vec<(&'static str, unsafe fn(&[f16]) -> f32)> {
         let mut r: Vec<(&'static str, unsafe fn(&[f16]) -> f32)> = vec![
             ("fallback", fallback),
@@ -884,7 +884,7 @@ mod reduce_sum_of_x2 {
     }
 
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, unused_mut)]
     fn implementations() -> Vec<(&'static str, unsafe fn(&[f16]) -> f32)> {
         let mut r: Vec<(&'static str, unsafe fn(&[f16]) -> f32)> = vec![
             ("fallback", fallback),
@@ -1248,7 +1248,7 @@ mod reduce_min_max_of_x {
     #[test]
     #[cfg_attr(miri, ignore)]
     fn reduce_min_max_of_x_out_of_range_test() {
-        #[allow(clippy::type_complexity)]
+        #[allow(clippy::type_complexity, unused_mut)]
         let mut implementations: Vec<(&str, unsafe fn(&[f16]) -> (f32, f32))> = vec![
             ("fallback", fallback),
             ("dispatch", |x| reduce_min_max_of_x(x)),
@@ -1555,7 +1555,7 @@ mod reduce_sum_of_xy {
     }
 
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, unused_mut)]
     fn implementations() -> Vec<(&'static str, unsafe fn(&[f16], &[f16]) -> f32)> {
         let mut r: Vec<(&'static str, unsafe fn(&[f16], &[f16]) -> f32)> = vec![
             ("fallback", fallback),
@@ -1899,7 +1899,7 @@ mod reduce_sum_of_d2 {
     }
 
     #[cfg(test)]
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, unused_mut)]
     fn implementations() -> Vec<(&'static str, unsafe fn(&[f16], &[f16]) -> f32)> {
         let mut r: Vec<(&'static str, unsafe fn(&[f16], &[f16]) -> f32)> = vec![
             ("fallback", fallback),
