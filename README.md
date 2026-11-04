@@ -1,17 +1,16 @@
 # vchord
 
 [![Website: vchord.pgsty.com](https://img.shields.io/badge/Website-vchord.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://vchord.pgsty.com/)
-[![Docs: vchord](https://img.shields.io/badge/Docs-vchord-slategray?style=flat)](https://vchord.pgsty.com/docs/)
-[![PGEXT: vchord](https://img.shields.io/badge/PGEXT-vchord-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
-[![Pigsty: vchord](https://img.shields.io/badge/Pigsty-vchord-slategray?style=flat)](https://pigsty.io/ext/e/vchord)
-[![Version: v1.1.1](https://img.shields.io/badge/Version-v1.1.1-slategray?style=flat)](https://github.com/pgsty/vchord/releases)
+[![Docs: vchord](https://img.shields.io/badge/Docs-vchord-slategray?style=flat)](https://vchord.pgsty.com/docs/vchord/)
+[![Catalog: vchord](https://img.shields.io/badge/Catalog-vchord-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
+[![Version: v1.2.0](https://img.shields.io/badge/Version-v1.2.0-slategray?style=flat)](https://github.com/pgsty/vchord/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](https://github.com/pgsty/vchord/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/vchord?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/vchord&Date)
-[![PostgreSQL: 14-18](https://img.shields.io/badge/PostgreSQL-14--18-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
+[![PostgreSQL: 14-19](https://img.shields.io/badge/PostgreSQL-14--19-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
 
 **`vchord`** is a PostgreSQL extension engineered for scalable, high-performance, and disk-friendly vector similarity search, serving as the successor to `pgvecto.rs`.
 
-[Website](https://vchord.pgsty.com/) | [Documentation](https://vchord.pgsty.com/docs/) | [vchord_bm25](https://github.com/pgsty/vchord_bm25) | [pg_tokenizer](https://github.com/pgsty/pg_tokenizer) | [Blog](https://vchord.pgsty.com/blog/) | [PGEXT](https://pgext.cloud/ext/vchord) | [Pigsty](https://pigsty.io/ext/e/vchord) ([中文](https://pigsty.cc/ext/e/vchord)) | [Releases](https://github.com/pgsty/vchord/releases) | [Issues](https://github.com/pgsty/vchord/issues)
+[Website](https://vchord.pgsty.com/) | [Documentation](https://vchord.pgsty.com/docs/vchord/) | [vchord_bm25](https://github.com/pgsty/vchord_bm25) | [pg_tokenizer](https://github.com/pgsty/pg_tokenizer) | [Blog](https://vchord.pgsty.com/blog/) | [PGEXT](https://pgext.cloud/ext/vchord) | [Releases](https://github.com/pgsty/vchord/releases) | [Issues](https://github.com/pgsty/vchord/issues) | [Upstream](https://github.com/supervc-stack/VectorChord)
 
 ---
 
@@ -27,30 +26,30 @@ To store vectors compactly while preserving recall, `vchord` combines **RaBitQ**
 
 `vchord` is the core extension of the **Vchord** family maintained by [PGSTY](https://pgsty.com):
 
-- **[`vchord`](https://github.com/pgsty/vchord)** ([`pgsty/vchord`](https://github.com/pgsty/vchord) · [PGEXT](https://pgext.cloud/ext/vchord) · [Pigsty](https://pigsty.io/ext/e/vchord)): Scalable, high-performance, and disk-friendly vector similarity search (`vchordrq` & `vchordg`).
-- **[`vchord_bm25`](https://github.com/pgsty/vchord_bm25)** ([`pgsty/vchord_bm25`](https://github.com/pgsty/vchord_bm25) · [PGEXT](https://pgext.cloud/ext/vchord_bm25) · [Pigsty](https://pigsty.io/ext/e/vchord_bm25)): Native BM25 full-text ranking index (`Block-WeakAnd`).
-- **[`pg_tokenizer`](https://github.com/pgsty/pg_tokenizer)** ([`pgsty/pg_tokenizer`](https://github.com/pgsty/pg_tokenizer) · [PGEXT](https://pgext.cloud/ext/pg_tokenizer) · [Pigsty](https://pigsty.io/ext/e/pg_tokenizer)): Standalone multilingual text analyzer and vocabulary tokenizer.
+- **[`vchord`](https://github.com/pgsty/vchord)** ([Docs](https://vchord.pgsty.com/docs/vchord/) / [Meta](https://pgext.cloud/ext/vchord)): Scalable, high-performance, and disk-friendly vector similarity search.
+- **[`vchord_bm25`](https://github.com/pgsty/vchord_bm25)** ([Docs](https://vchord.pgsty.com/docs/bm25/) / [Meta](https://pgext.cloud/ext/vchord_bm25)): Native BM25 full-text ranking index (`Block-WeakAnd`).
+- **[`pg_tokenizer`](https://github.com/pgsty/pg_tokenizer)** ([Docs](https://vchord.pgsty.com/docs/tokenizer/) / [Meta](https://pgext.cloud/ext/pg_tokenizer)): Standalone multilingual text analyzer and vocabulary tokenizer.
 
 ---
 
 ## Features
 
 - **Cost-Effective Storage**: Host 100M × 768-dim vectors on a single AWS `i4i.xlarge` ($247/mo)[^2], or [scale to 1B × 96-dim vectors](https://vchord.pgsty.com/blog/post/scaling-vector-search-to-1-billion-on-postgresql/) on an `i7ie.6xlarge` ($2,246/mo)[^3] by keeping only compact centroids in RAM and streaming quantized lists from NVMe SSD.
-- **Fast Index Construction**: Build a 100M-vector index in ~20 minutes using [hierarchical K-means](https://vchord.pgsty.com/docs/usage/partitioning-tuning/#hierarchical-k-means)[^4] or [external index precomputation](https://vchord.pgsty.com/docs/usage/external-build/).
-- **Bounded Memory Growth**: Control index build memory via [dimensionality reduction and sampling](https://vchord.pgsty.com/docs/usage/partitioning-tuning/#reduce-sampling-factor)[^5], enabling billion-scale index builds on 128 GB RAM nodes.
-- **Drop-In `pgvector` Compatibility**: Directly indexes `pgvector` data types (`vector`, `halfvec`) and supports standard distance operators (`<->`, `<#>`, `<=>`) alongside multi-vector MaxSim (`@#`) retrieval.
-- **Native Low-Bit Quantization Types**: Provides [native 4-bit (`rabitq4`) and 8-bit (`rabitq8`) vector types](https://vchord.pgsty.com/docs/usage/quantization-types/) with <1% recall loss on `rabitq8`.
+- **Fast Index Construction**: Build a 100M-vector index in ~20 minutes using [hierarchical K-means](https://vchord.pgsty.com/docs/vchord/usage/partitioning-tuning/#hierarchical-k-means)[^4] or [external index precomputation](https://vchord.pgsty.com/docs/vchord/usage/external-build/).
+- **Bounded Memory Growth**: Control index build memory via [dimensionality reduction and sampling](https://vchord.pgsty.com/docs/vchord/usage/partitioning-tuning/#reduce-sampling-factor)[^5], enabling billion-scale index builds on 128 GB RAM nodes.
+- **Drop-In `pgvector` Compatibility**: Directly indexes [`pgvector`](https://vchord.pgsty.com/docs/vector/) data types (`vector`, `halfvec`) and supports standard distance operators (`<->`, `<#>`, `<=>`) alongside multi-vector MaxSim (`@#`) retrieval.
+- **Native Low-Bit Quantization Types**: Provides [native 4-bit (`rabitq4`) and 8-bit (`rabitq8`) vector types](https://vchord.pgsty.com/docs/vchord/usage/quantization-types/) with <1% recall loss on `rabitq8`.
 
 [^2]: See [Store 400k Vectors for $1 in PostgreSQL](https://vchord.pgsty.com/blog/post/vectorchord-store-400k-vectors-for-1-in-postgresql/).
 [^3]: See [Scaling Vector Search to 1 Billion on PostgreSQL](https://vchord.pgsty.com/blog/post/scaling-vector-search-to-1-billion-on-postgresql/).
-[^4]: See [How We Made 100M Vector Indexing in 20 Minutes Possible on PostgreSQL](https://vchord.pgsty.com/blog/post/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql/#hierarchical-k-means) and [Partitioning Tuning](https://vchord.pgsty.com/docs/usage/partitioning-tuning/#hierarchical-k-means).
-[^5]: See [Dimensionality Reduction](https://vchord.pgsty.com/blog/post/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql/#dimensionality-reduction) and [Sampling Factor Tuning](https://vchord.pgsty.com/docs/usage/partitioning-tuning/#reduce-sampling-factor).
+[^4]: See [How We Made 100M Vector Indexing in 20 Minutes Possible on PostgreSQL](https://vchord.pgsty.com/blog/post/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql/#hierarchical-k-means) and [Partitioning Tuning](https://vchord.pgsty.com/docs/vchord/usage/partitioning-tuning/#hierarchical-k-means).
+[^5]: See [Dimensionality Reduction](https://vchord.pgsty.com/blog/post/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql/#dimensionality-reduction) and [Sampling Factor Tuning](https://vchord.pgsty.com/docs/vchord/usage/partitioning-tuning/#reduce-sampling-factor).
 
 ---
 
 ## Quick Start
 
-For full setup instructions (Debian/Ubuntu packages, PGXN, Kubernetes, and source builds), see the [Installation Guide](https://vchord.pgsty.com/docs/getting-started/installation/).
+For full setup instructions (Debian/Ubuntu packages, PGXN, Kubernetes, and source builds), see the [Installation Guide](https://vchord.pgsty.com/docs/vchord/getting-started/installation/).
 
 ### 1. Install via Native Linux Packages ([`pig`](https://pig.pgsty.com/))
 
@@ -82,7 +81,7 @@ docker run \
 ```
 
 > [!NOTE]
-> For hybrid vector + full-text search, use the all-in-one [`tensorchord/vchord-suite:pg18-latest`](https://vchord.pgsty.com/docs/getting-started/vectorchord-suite/) image, which bundles [`vchord`](https://github.com/pgsty/vchord), [`vchord_bm25`](https://github.com/pgsty/vchord_bm25), and [`pg_tokenizer`](https://github.com/pgsty/pg_tokenizer).
+> For hybrid vector + full-text search, use the all-in-one [`tensorchord/vchord-suite:pg18-latest`](https://vchord.pgsty.com/docs/vchord/getting-started/vectorchord-suite/) image, which bundles [`vchord`](https://github.com/pgsty/vchord), [`vchord_bm25`](https://github.com/pgsty/vchord_bm25), and [`pg_tokenizer`](https://github.com/pgsty/pg_tokenizer).
 
 Connect to the instance with `psql`:
 
@@ -151,28 +150,30 @@ considered after PostgreSQL 19 GA and a fresh compatibility check.
 
 ## Documentation
 
-Full documentation is available at **[vchord.pgsty.com/docs](https://vchord.pgsty.com/docs/)**:
+Full documentation is available at **[vchord.pgsty.com/docs/vchord](https://vchord.pgsty.com/docs/vchord/)**:
 
 - **Getting Started**
-  - [Overview](https://vchord.pgsty.com/docs/getting-started/overview/)
-  - [Installation](https://vchord.pgsty.com/docs/getting-started/installation/)
-  - [Vchord Suite](https://vchord.pgsty.com/docs/getting-started/vectorchord-suite/)
+  - [Overview](https://vchord.pgsty.com/docs/vchord/getting-started/overview/)
+  - [Installation](https://vchord.pgsty.com/docs/vchord/getting-started/installation/)
+  - [Vchord Suite](https://vchord.pgsty.com/docs/vchord/getting-started/vectorchord-suite/)
 - **Indexing & Querying**
-  - [Indexing (`vchordrq`)](https://vchord.pgsty.com/docs/usage/indexing/)
-  - [Graph Index (`vchordg`)](https://vchord.pgsty.com/docs/usage/graph-index/)
-  - [Quantization Types (`rabitq4` / `rabitq8`)](https://vchord.pgsty.com/docs/usage/quantization-types/)
-  - [Multi-Vector Retrieval (MaxSim)](https://vchord.pgsty.com/docs/usage/multi-vector-retrieval/)
-  - [Similarity Filter (Range Query)](https://vchord.pgsty.com/docs/usage/similarity-filter/)
-  - [Prefilter](https://vchord.pgsty.com/docs/usage/prefilter/) & [Rerank in Table](https://vchord.pgsty.com/docs/usage/rerank-in-table/)
+  - [Indexing (`vchordrq`)](https://vchord.pgsty.com/docs/vchord/usage/indexing/)
+  - [Graph Index (`vchordg`)](https://vchord.pgsty.com/docs/vchord/usage/graph-index/)
+  - [Quantization Types (`rabitq4` / `rabitq8`)](https://vchord.pgsty.com/docs/vchord/usage/quantization-types/)
+  - [Multi-Vector Retrieval (MaxSim)](https://vchord.pgsty.com/docs/vchord/usage/multi-vector-retrieval/)
+  - [Similarity Filter (Range Query)](https://vchord.pgsty.com/docs/vchord/usage/similarity-filter/)
+  - [Prefilter](https://vchord.pgsty.com/docs/vchord/usage/prefilter/) & [Rerank in Table](https://vchord.pgsty.com/docs/vchord/usage/rerank-in-table/)
 - **Tuning & Operations**
-  - [Partitioning Tuning](https://vchord.pgsty.com/docs/usage/partitioning-tuning/)
-  - [External Index Build](https://vchord.pgsty.com/docs/usage/external-build/)
-  - [PostgreSQL Tuning](https://vchord.pgsty.com/docs/usage/postgresql-tuning/)
-  - [Prewarm](https://vchord.pgsty.com/docs/usage/prewarm/) & [Prefetch](https://vchord.pgsty.com/docs/usage/prefetch/)
-  - [Monitoring](https://vchord.pgsty.com/docs/usage/monitoring/), [Measure Recall](https://vchord.pgsty.com/docs/usage/measure-recall/), & [Fallback Parameters](https://vchord.pgsty.com/docs/usage/fallback-parameters/)
+  - [Partitioning Tuning](https://vchord.pgsty.com/docs/vchord/usage/partitioning-tuning/)
+  - [External Index Build](https://vchord.pgsty.com/docs/vchord/usage/external-build/)
+  - [PostgreSQL Tuning](https://vchord.pgsty.com/docs/vchord/usage/postgresql-tuning/)
+  - [Prewarm](https://vchord.pgsty.com/docs/vchord/usage/prewarm/) & [Prefetch](https://vchord.pgsty.com/docs/vchord/usage/prefetch/)
+  - [Monitoring](https://vchord.pgsty.com/docs/vchord/usage/monitoring/), [Measure Recall](https://vchord.pgsty.com/docs/vchord/usage/measure-recall/), & [Fallback Parameters](https://vchord.pgsty.com/docs/vchord/usage/fallback-parameters/)
+  - [Scalability](https://vchord.pgsty.com/docs/vchord/admin/scalability/), [Kubernetes](https://vchord.pgsty.com/docs/vchord/admin/kubernetes/), & [Migration](https://vchord.pgsty.com/docs/vchord/admin/migration/)
 - **Benchmarks & Use Cases**
-  - [Performance](https://vchord.pgsty.com/docs/benchmark/performance/) & [Price Benchmarks](https://vchord.pgsty.com/docs/benchmark/price/)
-  - [Hybrid Search](https://vchord.pgsty.com/docs/use-case/hybrid-search/) & [ColBERT Rerank](https://vchord.pgsty.com/docs/use-case/colbert-rerank/)
+  - [Performance](https://vchord.pgsty.com/docs/vchord/benchmark/performance/) & [Price Benchmarks](https://vchord.pgsty.com/docs/vchord/benchmark/price/)
+  - [Hybrid Search](https://vchord.pgsty.com/docs/vchord/use-case/hybrid-search/) & [ColBERT Rerank](https://vchord.pgsty.com/docs/vchord/use-case/colbert-rerank/)
+  - [Customer Stories (Earth Genome)](https://vchord.pgsty.com/docs/vchord/customer-stories/earthgenome/)
 
 ---
 
