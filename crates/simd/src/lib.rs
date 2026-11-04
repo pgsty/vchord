@@ -8,6 +8,9 @@
 
 #![allow(unsafe_code)]
 #![cfg_attr(feature = "nightly_f16", feature(f16))]
+// Newer toolchains stabilized the s390x target features this crate enables, so
+// the gate is unused there (`unused_features`); older ones still require it.
+#![cfg_attr(target_arch = "s390x", allow(unknown_lints, unused_features))]
 #![cfg_attr(target_arch = "s390x", feature(s390x_target_feature))]
 #![cfg_attr(target_arch = "s390x", feature(stdarch_s390x))]
 #![cfg_attr(target_arch = "powerpc64", feature(stdarch_powerpc_feature_detection))]
