@@ -804,7 +804,9 @@ jobs:
 
           sudo chroot /sysroot apt-get install -y --no-install-recommends postgresql-common
           sudo chroot /sysroot /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          sudo chroot /sysroot apt-get install -y --no-install-recommends postgresql-server-dev-${{ matrix.version }}
+          # The server headers include ICU headers, which Debian's own packages
+          # (s390x and riscv64) do not pull in without recommends.
+          sudo chroot /sysroot apt-get install -y --no-install-recommends postgresql-server-dev-${{ matrix.version }} libicu-dev
           sudo chroot /sysroot apt-get install -y --no-install-recommends postgresql-${{ matrix.version }}
 
           echo "local all all trust" | sudo tee /sysroot/etc/postgresql/${{ matrix.version }}/main/pg_hba.conf
