@@ -202,13 +202,29 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         if unusable {
             // Since PostgreSQL 18, `disable_cost` alone does not lose against
             // paths disabled by `enable_*` settings, so count the path as
-            // disabled as well.
+            // disabled as well. Before PostgreSQL 18, `disable_cost` is
+            // additive: a seq scan disabled by `enable_seqscan = off` costs
+            // more than this path at `disable_cost`, so give it a cost that
+            // dominates realistic plans (#32). It stays finite on purpose:
+            // planner arithmetic such as `inf - inf` yields NaN.
             #[cfg(any(feature = "pg18", feature = "pg19"))]
             {
                 (*path).path.disabled_nodes += 1;
             }
+            *index_startup_cost = crate::index::UNUSABLE_PATH_COST;
+            *index_total_cost = crate::index::UNUSABLE_PATH_COST;
+            *index_selectivity = 0.0;
+            *index_correlation = 0.0;
+            *index_pages = 1.0;
+            return;
         }
-        if unusable || !gucs::vchordg_enable_scan() {
+        if !gucs::vchordg_enable_scan() {
+            // `vchordg.enable_scan = off` discourages the path like the
+            // built-in `enable_*` settings do.
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
+            {
+                (*path).path.disabled_nodes += 1;
+            }
             *index_startup_cost = disable_cost;
             *index_total_cost = disable_cost;
             *index_selectivity = 0.0;

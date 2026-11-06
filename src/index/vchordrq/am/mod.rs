@@ -276,10 +276,30 @@ pub unsafe extern "C-unwind" fn amcostestimate(
     unsafe {
         use pgrx::pg_sys::disable_cost;
         let index_opt_info = (*path).indexinfo;
-        // do not use index, if there are no orderbys or clauses
-        if ((*path).indexorderbys.is_null() && (*path).indexclauses.is_null())
-            || !gucs::vchordrq_enable_scan()
-        {
+        // Without ORDER BY or vector clauses `amrescan` rejects the scan, and
+        // this index cannot return tuple data for index-only scans. Make such
+        // paths lose to any usable plan: count them as disabled (PostgreSQL
+        // 18 compares disabled nodes first) and give them a dominating finite
+        // cost (before PostgreSQL 18, `disable_cost` is additive) (#32).
+        let unusable = ((*path).indexorderbys.is_null() && (*path).indexclauses.is_null())
+            || (*path).path.pathtype == pgrx::pg_sys::NodeTag::T_IndexOnlyScan;
+        if unusable {
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
+            {
+                (*path).path.disabled_nodes += 1;
+            }
+            *index_startup_cost = crate::index::UNUSABLE_PATH_COST;
+            *index_total_cost = crate::index::UNUSABLE_PATH_COST;
+            *index_selectivity = 0.0;
+            *index_correlation = 0.0;
+            *index_pages = 1.0;
+            return;
+        }
+        if !gucs::vchordrq_enable_scan() {
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
+            {
+                (*path).path.disabled_nodes += 1;
+            }
             *index_startup_cost = disable_cost;
             *index_total_cost = disable_cost;
             *index_selectivity = 0.0;

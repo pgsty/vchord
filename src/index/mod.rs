@@ -25,3 +25,9 @@ pub fn init() {
     vchordrq::am::init();
     vchordg::am::init();
 }
+
+/// Cost given to index paths the access methods cannot execute (no ORDER BY
+/// vector and no index clause, or index-only scans). Finite on purpose:
+/// `inf - inf` in planner arithmetic yields NaN. This is a mitigation, not a
+/// structural exclusion (#32).
+pub const UNUSABLE_PATH_COST: f64 = 1.0e30;
