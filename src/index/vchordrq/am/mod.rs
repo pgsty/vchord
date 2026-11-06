@@ -131,6 +131,26 @@ const TABLE: &[pgrx::pg_sys::relopt_parse_elt] = &[
 
 static RELOPT_KIND: OnceLock<pgrx::pg_sys::relopt_kind::Type> = OnceLock::new();
 
+/// Validates the `options` reloption at `CREATE INDEX ... WITH` and
+/// `ALTER INDEX ... SET`, so a malformed value is rejected immediately instead
+/// of failing at the next REINDEX (#35). Checks that need the indexed column
+/// (dimensions, vector type) still happen when the index is built.
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn validate_options(value: *const core::ffi::c_char) {
+    if value.is_null() {
+        return;
+    }
+    let s = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+    match toml::from_str::<crate::index::vchordrq::types::VchordrqIndexingOptions>(&s) {
+        Ok(options) => {
+            if let Err(errors) = validator::Validate::validate(&options) {
+                pgrx::error!("error while validating options: {}", errors);
+            }
+        }
+        Err(e) => pgrx::error!("failed to parse options: {}", e),
+    }
+}
+
 pub fn init() {
     RELOPT_KIND.get_or_init(|| {
         let kind;
@@ -141,7 +161,7 @@ pub fn init() {
                 c"options".as_ptr(),
                 c"Vector index options, represented as a TOML string.".as_ptr(),
                 c"".as_ptr(),
-                None,
+                Some(validate_options),
                 pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
             );
             pgrx::pg_sys::add_string_reloption(

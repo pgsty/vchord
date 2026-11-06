@@ -6,24 +6,6 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-/// Switches `CurrentMemoryContext` and restores it when dropped, including
-/// during unwinding.
-struct MemoryContextSwitch(pgrx::pg_sys::MemoryContext);
-
-impl MemoryContextSwitch {
-    unsafe fn new(context: pgrx::pg_sys::MemoryContext) -> Self {
-        Self(unsafe { pgrx::pg_sys::MemoryContextSwitchTo(context) })
-    }
-}
-
-impl Drop for MemoryContextSwitch {
-    fn drop(&mut self) {
-        unsafe {
-            pgrx::pg_sys::MemoryContextSwitchTo(self.0);
-        }
-    }
-}
-
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn rewrite_plan_state(
     node: *mut pgrx::pg_sys::PlanState,
@@ -78,7 +60,7 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                     // `IndexNext` would; otherwise the Scanner lives as long as
                     // the caller's context (for an SQL function on PG14-17, the
                     // whole outer query) (#25).
-                    let _switch = MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+                    let _switch = crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
                     (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
@@ -112,7 +94,7 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                     // `IndexNext` would; otherwise the Scanner lives as long as
                     // the caller's context (for an SQL function on PG14-17, the
                     // whole outer query) (#25).
-                    let _switch = MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+                    let _switch = crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
                     (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,

@@ -283,7 +283,16 @@ impl RandomProject for VectBorrowed<'_, f16> {
         use rabitq::rotate::rotate;
         use simd::Floating;
         let input = f16::vector_to_f32(self.slice());
-        VectOwned::new(f16::vector_from_f32(&rotate(&input)))
+        let output = f16::vector_from_f32(&rotate(&input));
+        // A rotation keeps the norm, not the largest component: a component
+        // above 65504 becomes infinite in f16 and every distance NaN (#35).
+        // This runs on the build, insert and query paths.
+        if output.iter().any(|x| !x.to_f32().is_finite()) {
+            pgrx::error!(
+                "halfvec value is out of range for vchordg: a rotated component exceeds the halfvec range"
+            );
+        }
+        VectOwned::new(output)
     }
 }
 

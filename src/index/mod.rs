@@ -31,3 +31,21 @@ pub fn init() {
 /// `inf - inf` in planner arithmetic yields NaN. This is a mitigation, not a
 /// structural exclusion (#32).
 pub const UNUSABLE_PATH_COST: f64 = 1.0e30;
+
+/// Switches `CurrentMemoryContext` and restores it when dropped, including
+/// during unwinding.
+pub struct MemoryContextSwitch(pgrx::pg_sys::MemoryContext);
+
+impl MemoryContextSwitch {
+    pub unsafe fn new(context: pgrx::pg_sys::MemoryContext) -> Self {
+        Self(unsafe { pgrx::pg_sys::MemoryContextSwitchTo(context) })
+    }
+}
+
+impl Drop for MemoryContextSwitch {
+    fn drop(&mut self) {
+        unsafe {
+            pgrx::pg_sys::MemoryContextSwitchTo(self.0);
+        }
+    }
+}

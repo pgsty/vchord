@@ -206,7 +206,25 @@ impl<S: Floating> VectorBorrowed for SVectBorrowed<'_, S> {
         let xy = S::reduce_sum_of_xy_sparse(self.indexes, self.values, rhs.indexes, rhs.values);
         let x2 = S::reduce_sum_of_x2(self.values);
         let y2 = S::reduce_sum_of_x2(rhs.values);
-        Distance::from(1.0 - xy / (x2 * y2).sqrt())
+        Distance::from(crate::cosine_distance(xy, x2, y2, || {
+            let x = S::vector_to_f32_borrowed(self.values);
+            let y = S::vector_to_f32_borrowed(rhs.values);
+            let (x, y) = (x.as_ref(), y.as_ref());
+            let (mut i, mut j, mut xy) = (0, 0, 0.0f64);
+            while i < x.len() && j < y.len() {
+                match self.indexes[i].cmp(&rhs.indexes[j]) {
+                    std::cmp::Ordering::Less => i += 1,
+                    std::cmp::Ordering::Greater => j += 1,
+                    std::cmp::Ordering::Equal => {
+                        xy += f64::from(x[i]) * f64::from(y[j]);
+                        (i, j) = (i + 1, j + 1);
+                    }
+                }
+            }
+            let x2 = x.iter().map(|&a| f64::from(a) * f64::from(a)).sum();
+            let y2 = y.iter().map(|&b| f64::from(b) * f64::from(b)).sum();
+            (xy, x2, y2)
+        }))
     }
 
     #[inline(always)]

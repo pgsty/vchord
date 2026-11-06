@@ -1,0 +1,98 @@
+# Hardening items from #35.
+
+statement ok
+CREATE TABLE hardening (id int, v vector(3), h halfvec(64));
+
+statement ok
+INSERT INTO hardening SELECT i, ARRAY[i, i + 1, i + 2]::real[]::vector, array_fill((i % 7)::real, ARRAY[64])::halfvec FROM generate_series(1, 300) i;
+
+# The options reloption is validated by CREATE INDEX and ALTER INDEX.
+statement error failed to parse options
+CREATE INDEX hardening_bad ON hardening USING vchordrq (v vector_l2_ops) WITH (options = 'not toml');
+
+statement error failed to parse options
+CREATE INDEX hardening_bad ON hardening USING vchordg (v vector_l2_ops) WITH (options = 'm = ');
+
+statement error error while validating options
+CREATE INDEX hardening_bad ON hardening USING vchordg (v vector_l2_ops) WITH (options = 'm = 99999');
+
+statement ok
+CREATE INDEX hardening_rq ON hardening USING vchordrq (v vector_l2_ops);
+
+statement ok
+CREATE INDEX hardening_g ON hardening USING vchordg (v vector_l2_ops);
+
+statement error failed to parse options
+ALTER INDEX hardening_rq SET (options = 'not toml');
+
+statement error failed to parse options
+ALTER INDEX hardening_g SET (options = 'this is not toml');
+
+statement error error while validating options
+ALTER INDEX hardening_g SET (options = 'm = 99999');
+
+statement ok
+ALTER INDEX hardening_g SET (options = 'm = 16');
+
+query T
+SELECT reloptions FROM pg_class WHERE relname = 'hardening_rq';
+----
+NULL
+
+statement ok
+ALTER INDEX hardening_g RESET (options);
+
+# Every vchordg.io_search / vchordg.io_rerank combination answers the same.
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+DROP INDEX hardening_rq;
+
+statement ok
+CREATE TABLE hardening_io (io_search text, io_rerank text, ids int[]);
+
+statement ok
+DO $$
+DECLARE
+  s text;
+  r text;
+  result int[];
+BEGIN
+  FOREACH s IN ARRAY ARRAY['read_buffer', 'prefetch_buffer', 'read_stream'] LOOP
+    FOREACH r IN ARRAY ARRAY['read_buffer', 'prefetch_buffer', 'read_stream'] LOOP
+      BEGIN
+        PERFORM set_config('vchordg.io_search', s, true);
+        PERFORM set_config('vchordg.io_rerank', r, true);
+        SELECT array_agg(id) INTO result FROM (SELECT id FROM hardening ORDER BY v <-> '[150,151,152]' LIMIT 5) t;
+        INSERT INTO hardening_io VALUES (s, r, result);
+      EXCEPTION WHEN invalid_parameter_value THEN
+        -- read_stream is unavailable before PostgreSQL 17
+        NULL;
+      END;
+    END LOOP;
+  END LOOP;
+END
+$$;
+
+query T
+SELECT count(*) >= 4 AND count(DISTINCT ids) = 1 FROM hardening_io;
+----
+t
+
+statement ok
+RESET enable_seqscan;
+
+# A rotation keeps the norm, not the largest component: rotated components of
+# this valid halfvec exceed 65504 and would become infinite in vchordg.
+statement ok
+CREATE INDEX hardening_h ON hardening USING vchordg (h halfvec_l2_ops);
+
+statement error out of range for vchordg
+INSERT INTO hardening (id, h) VALUES (1000, array_fill(60000::real, ARRAY[64])::halfvec);
+
+statement error out of range for vchordg
+SELECT id FROM hardening ORDER BY h <-> array_fill(60000::real, ARRAY[64])::halfvec LIMIT 1;
+
+statement ok
+DROP TABLE hardening, hardening_io;

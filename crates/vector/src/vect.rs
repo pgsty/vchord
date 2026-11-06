@@ -133,7 +133,17 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
         let xy = S::reduce_sum_of_xy(self.slice(), rhs.slice());
         let x2 = S::reduce_sum_of_x2(self.0);
         let y2 = S::reduce_sum_of_x2(rhs.0);
-        Distance::from(1.0 - xy / (x2 * y2).sqrt())
+        Distance::from(crate::cosine_distance(xy, x2, y2, || {
+            let x = S::vector_to_f32_borrowed(self.0);
+            let y = S::vector_to_f32_borrowed(rhs.0);
+            let (x, y) = (x.as_ref(), y.as_ref());
+            let mut sums = (0.0f64, 0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(y.iter()) {
+                let (a, b) = (f64::from(a), f64::from(b));
+                sums = (sums.0 + a * b, sums.1 + a * a, sums.2 + b * b);
+            }
+            sums
+        }))
     }
 
     #[inline(always)]
