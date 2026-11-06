@@ -141,16 +141,18 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         };
         let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
         let pointers_s: &[_] = bump.alloc_slice(vertex_tuple.pointers());
+        let payload_s = vertex_tuple.payload();
         let score_s = O::process(
             bits,
             dim,
             (vertex_tuple.metadata(), vertex_tuple.elements()),
             &lut,
         );
-        candidates.push((Reverse(score_s), AlwaysEqual((pointers_s, s))));
+        candidates.push((Reverse(score_s), AlwaysEqual((pointers_s, (s, payload_s)))));
     }
     let mut iter = std::iter::from_fn(|| {
-        while let Some(((_, AlwaysEqual((pointers_u, u))), guards)) = candidates.pop() {
+        while let Some(((_, AlwaysEqual((pointers_u, (u, payload_u)))), guards)) = candidates.pop()
+        {
             let Ok((dis_u, outs_u, _, _)) = crate::vectors::read::<R, O, _, _>(
                 by_prefetch::<R>(guards, pointers_u.iter().copied()),
                 LAccess::new(
@@ -183,15 +185,16 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
                 };
                 let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
                 let pointers_v: &[_] = bump.alloc_slice(vertex_tuple.pointers());
+                let payload_v = vertex_tuple.payload();
                 let score_v = O::process(
                     bits,
                     dim,
                     (vertex_tuple.metadata(), vertex_tuple.elements()),
                     &lut,
                 );
-                candidates.push((Reverse(score_v), AlwaysEqual((pointers_v, v))));
+                candidates.push((Reverse(score_v), AlwaysEqual((pointers_v, (v, payload_v)))));
             }
-            return Some((Reverse(dis_u), AlwaysEqual((pointers_u, u))));
+            return Some((Reverse(dis_u), AlwaysEqual((pointers_u, (u, payload_u)))));
         }
         None
     });
@@ -206,13 +209,19 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             break;
         }
     }
+    // Deleted vertices only guide the search (#26): VACUUM frees them, so
+    // neither an out-edge of the new vertex nor its backlink may rely on
+    // one. The start vertex is never freed and stays eligible, deleted or
+    // not. The search still stops as before, counting deleted vertices, so
+    // its cost does not grow while a VACUUM has many vertices marked.
     let trace = {
         let (left, right) = results.into_inner();
         left.into_iter()
             .map(|(dis_v, v)| (Reverse(dis_v), v))
             .chain(right)
+            .filter(|(_, AlwaysEqual((_, (u, payload_u))))| payload_u.is_some() || *u == s)
             .flat_map(|item| {
-                let (Reverse(dis_u), AlwaysEqual((pointers_u, u))) = item;
+                let (Reverse(dis_u), AlwaysEqual((pointers_u, (u, payload_u)))) = item;
                 let Ok((vector_u, _, _, _)) = crate::vectors::read::<R, O, _, _>(
                     by_read(index, pointers_u.iter().copied()),
                     CloneAccessor::<O::Vector>::default_with_dimension(dim),
@@ -221,26 +230,29 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
                     // the link is broken
                     return None;
                 };
-                Some(((Reverse(dis_u), AlwaysEqual((pointers_u, u))), vector_u))
+                Some((
+                    (Reverse(dis_u), AlwaysEqual((pointers_u, u, payload_u))),
+                    vector_u,
+                ))
             })
             .collect::<Vec<_>>()
     };
     let outs = crate::prune::prune(
         |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
-        (bump.alloc_slice(&pointers_t) as &[_], t),
+        (bump.alloc_slice(&pointers_t) as &[_], t, Some(payload)),
         trace.into_iter(),
         m,
         &alpha,
-        |(_, u)| *u,
+        |(_, u, _)| *u,
         O::DISTANCE == DistanceKind::L2S,
     );
     let _ = update::<R, O>(
         (index, pointers_t.as_slice()),
         (version_t, VecDeque::new()),
         outs.iter()
-            .map(|&(Reverse(dis_u), AlwaysEqual((_, u)))| (u, dis_u)),
+            .map(|&(Reverse(dis_u), AlwaysEqual((_, u, _)))| (u, dis_u)),
     );
-    for (Reverse(dis_t), AlwaysEqual((pointers_u, u))) in outs {
+    for (Reverse(dis_t), AlwaysEqual((pointers_u, u, payload_u))) in outs {
         'occ: loop {
             let Ok((neighbours_u, _, version)) =
                 crate::vectors::read_without_accessor::<R, O, _>((index, pointers_u), copy_all)
@@ -286,13 +298,29 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
                 |(_, u)| *u,
                 O::DISTANCE == DistanceKind::L2S,
             );
-            if update::<R, O>(
+            // Publish the backlink only while `u` is still the vertex that
+            // was selected, in the same state (#26): a VACUUM may have
+            // marked it deleted since, or freed it and reused its slot. Its
+            // vertex page stays share-locked through the update, so it cannot
+            // be marked or freed in between (vertex before vector, as in
+            // insert and maintain); the version check in `update` covers
+            // changes to the list since it was read.
+            let vertex_guard = index.read(u.0);
+            let Some(vertex_bytes) = vertex_guard.get(u.1) else {
+                break 'occ;
+            };
+            let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
+            if vertex_tuple.payload() != payload_u || vertex_tuple.pointers() != pointers_u {
+                break 'occ;
+            }
+            let updated = update::<R, O>(
                 (index, pointers_u),
                 (version, neighbours_u),
                 outs.iter()
                     .map(|&(Reverse(dis_u), AlwaysEqual((_, u)))| (u, dis_u)),
-            ) != Ok(false)
-            {
+            );
+            drop(vertex_guard);
+            if updated != Ok(false) {
                 break 'occ;
             }
         }
