@@ -15,6 +15,7 @@ use crate::types::DistanceKind;
 use crate::vectors::{by_prefetch, by_read, copy_all, copy_nothing, copy_outs, update};
 use crate::visited::Visited;
 use always_equal::AlwaysEqual;
+use distance::Distance;
 use index::bump::Bump;
 use index::prefetcher::{Prefetcher, PrefetcherSequenceFamily};
 use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
@@ -198,8 +199,22 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         }
         None
     });
+    // Deleted vertices only guide the search (#26): VACUUM frees them, so
+    // neither an out-edge of the new vertex nor its backlink may rely on
+    // one. They do not count towards `ef`, so a region of them cannot end
+    // the search before live vertices are found; a separate limit bounds how
+    // many the search may pass. The start vertex is never freed and stays
+    // eligible, deleted or not.
     let mut results = Results::new(ef as _);
-    for element @ (Reverse(dis_c), _) in iter.by_ref() {
+    let mut passed = 0_usize;
+    for element @ (Reverse(dis_c), AlwaysEqual((_, (u, payload_u)))) in iter.by_ref() {
+        if payload_u.is_none() && u != s {
+            passed += 1;
+            if passed > DELETED_TRAVERSAL_LIMIT {
+                break;
+            }
+            continue;
+        }
         results.push(element);
         if results
             .peek_ef_th()
@@ -209,17 +224,11 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             break;
         }
     }
-    // Deleted vertices only guide the search (#26): VACUUM frees them, so
-    // neither an out-edge of the new vertex nor its backlink may rely on
-    // one. The start vertex is never freed and stays eligible, deleted or
-    // not. The search still stops as before, counting deleted vertices, so
-    // its cost does not grow while a VACUUM has many vertices marked.
     let trace = {
         let (left, right) = results.into_inner();
         left.into_iter()
             .map(|(dis_v, v)| (Reverse(dis_v), v))
             .chain(right)
-            .filter(|(_, AlwaysEqual((_, (u, payload_u))))| payload_u.is_some() || *u == s)
             .flat_map(|item| {
                 let (Reverse(dis_u), AlwaysEqual((pointers_u, (u, payload_u)))) = item;
                 let Ok((vector_u, _, _, _)) = crate::vectors::read::<R, O, _, _>(
@@ -237,6 +246,12 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             })
             .collect::<Vec<_>>()
     };
+    // The start vertex is popped first, so it is in the trace unless its
+    // vectors could not be read.
+    let start_distance = trace
+        .iter()
+        .find(|((_, AlwaysEqual((_, u, _))), _)| *u == s)
+        .map(|((Reverse(dis_s), _), _)| *dis_s);
     let outs = crate::prune::prune(
         |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
         (bump.alloc_slice(&pointers_t) as &[_], t, Some(payload)),
@@ -252,77 +267,170 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         outs.iter()
             .map(|&(Reverse(dis_u), AlwaysEqual((_, u, _)))| (u, dis_u)),
     );
-    for (Reverse(dis_t), AlwaysEqual((pointers_u, u, payload_u))) in outs {
-        'occ: loop {
-            let Ok((neighbours_u, _, version)) =
-                crate::vectors::read_without_accessor::<R, O, _>((index, pointers_u), copy_all)
-            else {
-                // the link is broken
-                break 'occ;
-            };
-            let trace = neighbours_u
-                .iter()
-                .copied()
-                .chain(std::iter::once((t, dis_t)))
-                .map(|(v, dis_v)| (Reverse(dis_v), AlwaysEqual(v)))
-                .flat_map(|item| {
-                    let (Reverse(dis_u), AlwaysEqual(u)) = item;
-                    let vertex_guard = index.read(u.0);
-                    let Some(vertex_bytes) = vertex_guard.get(u.1) else {
-                        // the link is broken
-                        return None;
-                    };
-                    let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-                    let pointers_u = vertex_tuple.pointers().to_vec();
-                    Some((Reverse(dis_u), AlwaysEqual((pointers_u, u))))
-                })
-                .flat_map(|item| {
-                    let (Reverse(dis_u), AlwaysEqual((pointers_u, u))) = item;
-                    let Ok((vector_u, _, _, _)) = crate::vectors::read::<R, O, _, _>(
-                        by_read(index, pointers_u.iter().copied()),
-                        CloneAccessor::<O::Vector>::default_with_dimension(dim),
-                        copy_nothing,
-                    ) else {
-                        // the link is broken
-                        return None;
-                    };
-                    Some(((Reverse(dis_u), AlwaysEqual((pointers_u, u))), vector_u))
-                })
-                .collect::<Vec<_>>();
-            let outs = crate::prune::prune(
-                |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
-                (pointers_u.to_vec(), u),
-                trace.into_iter(),
-                m,
-                &alpha,
-                |(_, u)| *u,
-                O::DISTANCE == DistanceKind::L2S,
-            );
-            // Publish the backlink only while `u` is still the vertex that
-            // was selected, in the same state (#26): a VACUUM may have
-            // marked it deleted since, or freed it and reused its slot. Its
-            // vertex page stays share-locked through the update, so it cannot
-            // be marked or freed in between (vertex before vector, as in
-            // insert and maintain); the version check in `update` covers
-            // changes to the list since it was read.
-            let vertex_guard = index.read(u.0);
-            let Some(vertex_bytes) = vertex_guard.get(u.1) else {
-                break 'occ;
-            };
-            let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-            if vertex_tuple.payload() != payload_u || vertex_tuple.pointers() != pointers_u {
-                break 'occ;
-            }
-            let updated = update::<R, O>(
-                (index, pointers_u),
-                (version, neighbours_u),
-                outs.iter()
-                    .map(|&(Reverse(dis_u), AlwaysEqual((_, u)))| (u, dis_u)),
-            );
-            drop(vertex_guard);
-            if updated != Ok(false) {
-                break 'occ;
-            }
+    let mut stale = Vec::new();
+    for &(Reverse(dis_t), AlwaysEqual((pointers_u, u, payload_u))) in outs.iter() {
+        if backlink::<R, O>(
+            index,
+            (dim, m, &alpha),
+            (pointers_u, u, payload_u),
+            (t, dis_t),
+        ) == Backlink::Stale
+        {
+            stale.push(u);
+        }
+    }
+    if stale.is_empty() {
+        return;
+    }
+    // Some selected neighbours were marked deleted, freed or replaced by a
+    // concurrent VACUUM before their backlinks were placed: take them out of
+    // the new vertex's list again, so it keeps no edge to a freed vertex. If
+    // none is left, link through the start vertex, which is never freed.
+    let mut fallback = None;
+    if stale.len() == outs.len()
+        && let Some(dis_s) = start_distance
+        && let Some((pointers_s, payload_s)) = read_vertex(index, s)
+        && backlink::<R, O>(
+            index,
+            (dim, m, &alpha),
+            (&pointers_s, s, payload_s),
+            (t, dis_s),
+        ) == Backlink::Done
+    {
+        fallback = Some((s, dis_s));
+    }
+    // Retried while the list changes under us; stops if its tuple is gone.
+    while let Ok((neighbours_t, _, version)) =
+        crate::vectors::read_without_accessor::<R, O, _>((index, &pointers_t), copy_all)
+    {
+        let mut list = neighbours_t
+            .iter()
+            .copied()
+            .filter(|(v, _)| !stale.contains(v))
+            .collect::<Vec<_>>();
+        if let Some((s, dis_s)) = fallback
+            && !list.iter().any(|&(v, _)| v == s)
+        {
+            list.insert(0, (s, dis_s));
+        }
+        if update::<R, O>(
+            (index, &pointers_t),
+            (version, neighbours_t),
+            list.into_iter(),
+        ) != Ok(false)
+        {
+            break;
+        }
+    }
+}
+
+/// Deleted vertices an insertion may pass through, besides the `ef` live
+/// vertices it collects (#26).
+const DELETED_TRAVERSAL_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backlink {
+    /// The neighbour list of the target was recomputed with the new vertex.
+    Done,
+    /// The target is no longer the vertex that was selected.
+    Stale,
+}
+
+fn read_vertex<R: RelationRead>(
+    index: &R,
+    u: (u32, u16),
+) -> Option<(Vec<Pointer>, Option<NonZero<u64>>)>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let vertex_guard = index.read(u.0);
+    let vertex_tuple = VertexTuple::deserialize_ref(vertex_guard.get(u.1)?);
+    Some((vertex_tuple.pointers().to_vec(), vertex_tuple.payload()))
+}
+
+/// Adds the new vertex `t` to the neighbour list of `u` (pruning it), if `u`
+/// is still the vertex that was selected, in the same state.
+fn backlink<R: RelationRead + RelationWrite, O: Operator>(
+    index: &R,
+    (dim, m, alpha): (u32, u32, &[f32]),
+    (pointers_u, u, payload_u): (&[Pointer], (u32, u16), Option<NonZero<u64>>),
+    (t, dis_t): ((u32, u16), Distance),
+) -> Backlink
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    loop {
+        let Ok((neighbours_u, _, version)) =
+            crate::vectors::read_without_accessor::<R, O, _>((index, pointers_u), copy_all)
+        else {
+            // the link is broken: `u` was freed
+            return Backlink::Stale;
+        };
+        let trace = neighbours_u
+            .iter()
+            .copied()
+            .chain(std::iter::once((t, dis_t)))
+            .map(|(v, dis_v)| (Reverse(dis_v), AlwaysEqual(v)))
+            .flat_map(|item| {
+                let (Reverse(dis_u), AlwaysEqual(u)) = item;
+                let vertex_guard = index.read(u.0);
+                let Some(vertex_bytes) = vertex_guard.get(u.1) else {
+                    // the link is broken
+                    return None;
+                };
+                let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
+                let pointers_u = vertex_tuple.pointers().to_vec();
+                Some((Reverse(dis_u), AlwaysEqual((pointers_u, u))))
+            })
+            .flat_map(|item| {
+                let (Reverse(dis_u), AlwaysEqual((pointers_u, u))) = item;
+                let Ok((vector_u, _, _, _)) = crate::vectors::read::<R, O, _, _>(
+                    by_read(index, pointers_u.iter().copied()),
+                    CloneAccessor::<O::Vector>::default_with_dimension(dim),
+                    copy_nothing,
+                ) else {
+                    // the link is broken
+                    return None;
+                };
+                Some(((Reverse(dis_u), AlwaysEqual((pointers_u, u))), vector_u))
+            })
+            .collect::<Vec<_>>();
+        let outs = crate::prune::prune(
+            |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
+            (pointers_u.to_vec(), u),
+            trace.into_iter(),
+            m,
+            alpha,
+            |(_, u)| *u,
+            O::DISTANCE == DistanceKind::L2S,
+        );
+        // Publish the backlink only while `u` is still the vertex that was
+        // selected, in the same state (#26): a VACUUM may have marked it
+        // deleted since, or freed it and reused its slot. Its vertex page
+        // stays share-locked through the update, so it cannot be marked or
+        // freed in between (vertex before vector, as in insert and maintain);
+        // the version check in `update`, also for an unchanged result, covers
+        // changes to the list since it was read.
+        let vertex_guard = index.read(u.0);
+        let Some(vertex_bytes) = vertex_guard.get(u.1) else {
+            return Backlink::Stale;
+        };
+        let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
+        if vertex_tuple.payload() != payload_u || vertex_tuple.pointers() != pointers_u {
+            return Backlink::Stale;
+        }
+        let updated = update::<R, O>(
+            (index, pointers_u),
+            (version, neighbours_u),
+            outs.iter()
+                .map(|&(Reverse(dis_u), AlwaysEqual((_, u)))| (u, dis_u)),
+        );
+        drop(vertex_guard);
+        match updated {
+            Ok(true) => return Backlink::Done,
+            Ok(false) => continue,
+            // the link is broken
+            Err(()) => return Backlink::Stale,
         }
     }
 }
