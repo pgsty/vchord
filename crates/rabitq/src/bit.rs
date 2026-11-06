@@ -72,7 +72,7 @@ pub type Code = (CodeMetadata, Vec<bool>);
 ///
 /// Rounding can also make `1 / x_0^2 - 1` slightly negative for vectors whose
 /// elements all have the same magnitude; it is clamped to zero.
-fn metadata(n: usize, sum_of_abs_x: f32, sum_of_x_2: f32, factor_cnt: f32) -> CodeMetadata {
+pub fn metadata(n: usize, sum_of_abs_x: f32, sum_of_x_2: f32, factor_cnt: f32) -> CodeMetadata {
     if sum_of_abs_x == 0.0 {
         return CodeMetadata {
             dis_u_2: sum_of_x_2,

@@ -1,0 +1,96 @@
+# Zero and 1-dimensional rabitq8/rabitq4 vectors used to get NaN code factors
+# in vchordrq. A NaN lower bound sorts after every other candidate, so an exact
+# match never came back under LIMIT (#23).
+
+statement ok
+CREATE TABLE rq_degenerate (id int, v8 rabitq8(8), v4 rabitq4(8));
+
+statement ok
+INSERT INTO rq_degenerate
+SELECT 0,
+       quantize_to_rabitq8(array_fill(0::real, ARRAY[8])::vector),
+       quantize_to_rabitq4(array_fill(0::real, ARRAY[8])::vector);
+
+statement ok
+INSERT INTO rq_degenerate
+SELECT i, quantize_to_rabitq8(v), quantize_to_rabitq4(v)
+FROM (
+  SELECT i, ARRAY(SELECT sin(i * 7 + j * 3)::real FROM generate_series(1, 8) j)::vector AS v
+  FROM generate_series(1, 500) i
+) s;
+
+statement ok
+CREATE INDEX rq_degenerate_v8 ON rq_degenerate USING vchordrq (v8 rabitq8_l2_ops);
+
+statement ok
+CREATE INDEX rq_degenerate_v4 ON rq_degenerate USING vchordrq (v4 rabitq4_l2_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT id FROM rq_degenerate
+ORDER BY v8 <-> quantize_to_rabitq8(array_fill(0::real, ARRAY[8])::vector) LIMIT 1;
+----
+0
+
+query I
+SELECT id FROM rq_degenerate
+ORDER BY v4 <-> quantize_to_rabitq4(array_fill(0::real, ARRAY[8])::vector) LIMIT 1;
+----
+0
+
+# Inserted into the existing index.
+statement ok
+INSERT INTO rq_degenerate
+SELECT 1000,
+       quantize_to_rabitq8(array_fill(0::real, ARRAY[8])::vector),
+       quantize_to_rabitq4(array_fill(0::real, ARRAY[8])::vector);
+
+query I
+SELECT id FROM (
+  SELECT id FROM rq_degenerate
+  ORDER BY v8 <-> quantize_to_rabitq8(array_fill(0::real, ARRAY[8])::vector) LIMIT 2
+) s ORDER BY id;
+----
+0
+1000
+
+query I
+SELECT id FROM (
+  SELECT id FROM rq_degenerate
+  ORDER BY v4 <-> quantize_to_rabitq4(array_fill(0::real, ARRAY[8])::vector) LIMIT 2
+) s ORDER BY id;
+----
+0
+1000
+
+# 1-dimensional vectors.
+statement ok
+CREATE TABLE rq_dim1 (id int, v rabitq8(1));
+
+statement ok
+INSERT INTO rq_dim1 SELECT i, quantize_to_rabitq8(ARRAY[i::real]::vector) FROM generate_series(1, 100) i;
+
+statement ok
+CREATE INDEX rq_dim1_v ON rq_dim1 USING vchordrq (v rabitq8_l2_ops);
+
+query I
+SELECT id FROM rq_dim1 ORDER BY v <-> quantize_to_rabitq8('[50]'::vector) LIMIT 1;
+----
+50
+
+query I
+SELECT id FROM (
+  SELECT id FROM rq_dim1 ORDER BY v <-> quantize_to_rabitq8('[3]'::vector) LIMIT 3
+) s ORDER BY id;
+----
+2
+3
+4
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE rq_degenerate, rq_dim1;
