@@ -25,7 +25,7 @@ pub mod types;
 pub use build::build;
 pub use bulkdelete::bulkdelete;
 pub use insert::insert;
-pub use maintain::{maintain, pending};
+pub use maintain::{Maintained, Reachability, maintain, pending};
 pub use prewarm::prewarm;
 pub use search::search;
 

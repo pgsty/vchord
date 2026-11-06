@@ -358,10 +358,38 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         pgrx::pg_sys::vacuum_delay_point(false);
     };
-    let live = crate::index::vchordg::dispatch::maintain(opfamily, &index, check);
+    // maintenance_work_mem is in kilobytes
+    let memory_limit =
+        usize::try_from(unsafe { pgrx::pg_sys::maintenance_work_mem }).unwrap_or(0) * 1024;
+    let maintained =
+        crate::index::vchordg::dispatch::maintain(opfamily, &index, check, memory_limit);
+    let name = unsafe {
+        CStr::from_ptr((*(*(*info).index).rd_rel).relname.data.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    match maintained.reachability {
+        vchordg::Reachability::Checked {
+            disconnected,
+            unreachable_before,
+            live,
+        } => {
+            if disconnected > 0 {
+                pgrx::warning!(
+                    "vchordg index \"{name}\": {disconnected} of {live} live vertices may have become unreachable from the entry point during VACUUM (concurrent inserts are not accounted for); REINDEX to restore recall"
+                );
+            }
+            pgrx::debug1!(
+                "vchordg index \"{name}\": reachability check: {disconnected} live vertices disconnected by VACUUM, {unreachable_before} unreachable before it, {live} live"
+            );
+        }
+        vchordg::Reachability::Skipped(reason) => {
+            pgrx::debug1!("vchordg index \"{name}\": reachability check skipped: {reason}");
+        }
+    }
     unsafe {
         (*stats).num_pages = relation_pages((*info).index);
-        (*stats).num_index_tuples = live as f64;
+        (*stats).num_index_tuples = maintained.live as f64;
         (*stats).estimated_count = false;
     }
     stats

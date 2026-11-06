@@ -93,35 +93,40 @@ where
     }
 }
 
-pub fn maintain<R>(opfamily: Opfamily, index: &R, check: impl Fn()) -> u64
+pub fn maintain<R>(
+    opfamily: Opfamily,
+    index: &R,
+    check: impl Fn(),
+    memory_limit: usize,
+) -> vchordg::Maintained
 where
     R: RelationRead + RelationWrite,
     R::Page: Page<Opaque = vchordg::Opaque>,
 {
     match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<VectOwned<f32>, L2S>>(index, &check)
+            vchordg::maintain::<_, Op<VectOwned<f32>, L2S>>(index, &check, memory_limit)
         }
         (VectorKind::Vecf32, DistanceKind::Dot) => {
-            vchordg::maintain::<_, Op<VectOwned<f32>, Dot>>(index, &check)
+            vchordg::maintain::<_, Op<VectOwned<f32>, Dot>>(index, &check, memory_limit)
         }
         (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<VectOwned<f16>, L2S>>(index, &check)
+            vchordg::maintain::<_, Op<VectOwned<f16>, L2S>>(index, &check, memory_limit)
         }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
-            vchordg::maintain::<_, Op<VectOwned<f16>, Dot>>(index, &check)
+            vchordg::maintain::<_, Op<VectOwned<f16>, Dot>>(index, &check, memory_limit)
         }
         (VectorKind::Rabitq8, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<Rabitq8Owned, L2S>>(index, &check)
+            vchordg::maintain::<_, Op<Rabitq8Owned, L2S>>(index, &check, memory_limit)
         }
         (VectorKind::Rabitq8, DistanceKind::Dot) => {
-            vchordg::maintain::<_, Op<Rabitq8Owned, Dot>>(index, &check)
+            vchordg::maintain::<_, Op<Rabitq8Owned, Dot>>(index, &check, memory_limit)
         }
         (VectorKind::Rabitq4, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<Rabitq4Owned, L2S>>(index, &check)
+            vchordg::maintain::<_, Op<Rabitq4Owned, L2S>>(index, &check, memory_limit)
         }
         (VectorKind::Rabitq4, DistanceKind::Dot) => {
-            vchordg::maintain::<_, Op<Rabitq4Owned, Dot>>(index, &check)
+            vchordg::maintain::<_, Op<Rabitq4Owned, Dot>>(index, &check, memory_limit)
         }
     }
 }

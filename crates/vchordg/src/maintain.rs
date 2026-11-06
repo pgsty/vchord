@@ -15,11 +15,45 @@ use always_equal::AlwaysEqual;
 use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
 use index_accessor::DefaultWithDimension;
 use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::Hash;
 use vector::VectorOwned;
 
+/// Deleted vertices a non-start vertex may expand while looking for a live
+/// neighbour (#21). The start vertex expands without a limit.
+const DEEP_EXPANSION_CAP: usize = 4096;
+
+pub struct Maintained {
+    /// Live (non-deleted) vertices.
+    pub live: u64,
+    pub reachability: Reachability,
+}
+
+/// Advisory reachability check (#21): compares what the start vertex reaches
+/// over the neighbour lists before edge repair (through deleted vertices,
+/// which searches traverse until they are freed) and after it (live vertices
+/// only). Vertices inserted concurrently are not accounted for.
+pub enum Reachability {
+    Checked {
+        /// Live vertices reachable before the repair but not after it.
+        disconnected: u64,
+        /// Live vertices not reachable before the repair. Graphs can have
+        /// these without any deletion, so they are reported separately.
+        unreachable_before: u64,
+        live: u64,
+    },
+    /// The check was skipped for the given reason.
+    Skipped(&'static str),
+}
+
 /// Repairs edges around deleted vertices, then frees deleted vertices and
-/// unreachable vectors. Returns the number of live (non-deleted) vertices.
-pub fn maintain<R: RelationRead + RelationWrite, O: Operator>(index: &R, check: impl Fn()) -> u64
+/// unreachable vectors. `memory_limit` (bytes) bounds the neighbour lists
+/// recorded for the reachability check.
+pub fn maintain<R: RelationRead + RelationWrite, O: Operator>(
+    index: &R,
+    check: impl Fn(),
+    memory_limit: usize,
+) -> Maintained
 where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -33,8 +67,12 @@ where
     let link = meta_guard.get_opaque().link;
     drop(meta_guard);
     let Some(s) = start.into_inner() else {
-        return 0;
+        return Maintained {
+            live: 0,
+            reachability: Reachability::Skipped("the index is empty"),
+        };
     };
+    let mut recorder = Recorder::new(memory_limit);
     // do it's best to remove broken edges
     {
         let mut current = link;
@@ -42,26 +80,44 @@ where
             check();
             let vertex_guard = index.read(current);
             let mut members = Vec::new();
+            let mut deleted_members = Vec::new();
             for i in 1..=vertex_guard.len() {
                 if let Some(vertex_bytes) = vertex_guard.get(i) {
                     let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
+                    let live_u = vertex_tuple.payload().is_some();
+                    let pointers_u = vertex_tuple.pointers().to_vec();
                     // The start vertex is never freed, even after it is deleted,
                     // because every search enters the graph through it. Keep its
                     // edges pointing at live vertices so the graph stays reachable.
-                    if vertex_tuple.payload().is_some() || (vertex_guard.id(), i) == s {
-                        let pointers_u = vertex_tuple.pointers().to_vec();
-                        members.push((pointers_u, (vertex_guard.id(), i)));
+                    if live_u || (vertex_guard.id(), i) == s {
+                        members.push((pointers_u, (vertex_guard.id(), i), live_u));
+                    } else {
+                        deleted_members.push((pointers_u, (vertex_guard.id(), i)));
                     }
                 }
             }
             let next = { vertex_guard }.get_opaque().next;
-            for (pointers_u, u) in members {
+            if recorder.active() {
+                for (pointers_u, u) in deleted_members {
+                    let outs_u = crate::vectors::read_without_accessor::<R, O, _>(
+                        (index, &pointers_u),
+                        copy_outs,
+                    )
+                    .map(|(outs, _, _)| Vec::from(outs))
+                    .unwrap_or_default();
+                    recorder.record_before(u, outs_u);
+                }
+            }
+            for (pointers_u, u, live_u) in members {
                 // A list whose neighbours are all live is left as it is:
                 // pruning an unchanged list reproduces it, so reading the
                 // neighbours' vectors and rewriting it is wasted work (#24).
-                if neighbours_all_live::<R, O>(index, &pointers_u) {
+                if let Some(outs_u) = live_neighbours::<R, O>(index, &pointers_u) {
+                    recorder.record_before(u, outs_u.clone());
+                    recorder.record_after(u, live_u, outs_u);
                     continue;
                 }
+                let mut before = true;
                 'occ: loop {
                     let Ok((vector_u, neighbours_u, _, version)) = crate::vectors::read::<R, O, _, _>(
                         by_read::<R>(index, pointers_u.iter().copied()),
@@ -69,12 +125,18 @@ where
                         copy_all,
                     ) else {
                         // the link is broken
+                        recorder.skip("a broken link was found");
                         break 'occ;
                     };
+                    if std::mem::take(&mut before) {
+                        recorder.record_before(u, neighbours_u.iter().map(|&(v, _)| v).collect());
+                    }
                     let trace = {
                         let mut trace = Vec::new();
                         let mut extend = Vec::new();
+                        let mut visited = HashSet::from([u]);
                         for &(v, dis_v) in neighbours_u.iter() {
+                            visited.insert(v);
                             let vertex_guard = index.read(v.0);
                             let Some(vertex_bytes) = vertex_guard.get(v.1) else {
                                 // the link is broken
@@ -101,16 +163,22 @@ where
                                 extend.extend(outs_v.iter().copied());
                             }
                         }
+                        // Second level. Vertices seen already (`u` itself, the
+                        // first level, repeats) would only be deduplicated or
+                        // removed by `prune`, so they are skipped.
+                        let mut deleted = Vec::new();
                         for v in extend {
-                            let vertex_guard = index.read(v.0);
-                            let Some(vertex_bytes) = vertex_guard.get(v.1) else {
-                                // the link is broken
+                            if !visited.insert(v) {
                                 continue;
+                            }
+                            let pointers_v = match probe(index, v) {
+                                Probe::Missing => continue,
+                                Probe::Deleted(pointers_v) => {
+                                    deleted.push((v, pointers_v));
+                                    continue;
+                                }
+                                Probe::Live(pointers_v) => pointers_v,
                             };
-                            let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-                            let pointers_v = vertex_tuple.pointers().to_vec();
-                            let payload_v = vertex_tuple.payload();
-                            drop(vertex_guard);
                             let Ok((vector_v, _, _, _)) = crate::vectors::read::<R, O, _, _>(
                                 by_read::<R>(index, pointers_v.iter().copied()),
                                 CloneAccessor::<O::Vector>::default_with_dimension(dim),
@@ -119,7 +187,43 @@ where
                                 // the link is broken
                                 continue;
                             };
-                            if payload_v.is_some() {
+                            let dis_v = O::distance(vector_u.as_borrowed(), vector_v.as_borrowed());
+                            trace.push(((Reverse(dis_v), AlwaysEqual((pointers_v, v))), vector_v));
+                        }
+                        // Two levels found no live vertex, so the list would
+                        // become empty and cut `u` off: keep expanding through
+                        // deleted vertices until a live one turns up (#21).
+                        // Non-empty results are left exactly as before.
+                        if trace.is_empty() {
+                            let cap = if u == s {
+                                None
+                            } else {
+                                Some(DEEP_EXPANSION_CAP)
+                            };
+                            let found = expand_deleted(
+                                deleted,
+                                &mut visited,
+                                cap,
+                                |v| probe(index, v),
+                                |pointers_w: &Vec<Pointer>| {
+                                    check();
+                                    crate::vectors::read_without_accessor::<R, O, _>(
+                                        (index, pointers_w),
+                                        copy_outs,
+                                    )
+                                    .map(|(outs, _, _)| Vec::from(outs))
+                                    .unwrap_or_default()
+                                },
+                            );
+                            for (v, pointers_v) in found {
+                                let Ok((vector_v, _, _, _)) = crate::vectors::read::<R, O, _, _>(
+                                    by_read::<R>(index, pointers_v.iter().copied()),
+                                    CloneAccessor::<O::Vector>::default_with_dimension(dim),
+                                    copy_nothing,
+                                ) else {
+                                    // the link is broken
+                                    continue;
+                                };
                                 let dis_v =
                                     O::distance(vector_u.as_borrowed(), vector_v.as_borrowed());
                                 trace.push((
@@ -139,20 +243,33 @@ where
                         |(_, u)| *u,
                         O::DISTANCE == DistanceKind::L2S,
                     );
-                    if update::<R, O>(
+                    let outs_u = outs
+                        .iter()
+                        .map(|&(_, AlwaysEqual((_, v)))| v)
+                        .collect::<Vec<_>>();
+                    match update::<R, O>(
                         (index, pointers_u.as_slice()),
                         (version, neighbours_u),
                         outs.iter()
                             .map(|&(Reverse(dis_u), AlwaysEqual((_, u)))| (u, dis_u)),
-                    ) != Ok(false)
-                    {
-                        break 'occ;
+                    ) {
+                        Ok(true) => {
+                            recorder.record_after(u, live_u, outs_u);
+                            break 'occ;
+                        }
+                        Ok(false) => {}
+                        Err(()) => {
+                            // the link is broken
+                            recorder.skip("a broken link was found");
+                            break 'occ;
+                        }
                     }
                 }
             }
             current = next;
         }
     }
+    let reachability = recorder.finish(s);
     let mut live = 0_u64;
     // remove vertices and vectors
     {
@@ -201,19 +318,20 @@ where
             current = vertex_guard.get_opaque().next;
         }
     }
-    live
+    Maintained { live, reachability }
 }
 
-fn neighbours_all_live<R: RelationRead, O: Operator>(index: &R, pointers_u: &[Pointer]) -> bool
+/// The neighbour list of a vertex, if every neighbour is live.
+fn live_neighbours<R: RelationRead, O: Operator>(
+    index: &R,
+    pointers_u: &[Pointer],
+) -> Option<Vec<(u32, u16)>>
 where
     R::Page: Page<Opaque = Opaque>,
 {
-    let Ok((neighbours, _, _)) =
-        crate::vectors::read_without_accessor::<R, O, _>((index, pointers_u), copy_all)
-    else {
-        return false;
-    };
-    neighbours.iter().all(|&(v, _)| {
+    let (neighbours, _, _) =
+        crate::vectors::read_without_accessor::<R, O, _>((index, pointers_u), copy_all).ok()?;
+    let all_live = neighbours.iter().all(|&(v, _)| {
         let vertex_guard = index.read(v.0);
         let Some(vertex_bytes) = vertex_guard.get(v.1) else {
             return false;
@@ -221,7 +339,179 @@ where
         VertexTuple::deserialize_ref(vertex_bytes)
             .payload()
             .is_some()
-    })
+    });
+    all_live.then(|| neighbours.into_iter().map(|(v, _)| v).collect())
+}
+
+enum Probe<P> {
+    Missing,
+    Live(P),
+    Deleted(P),
+}
+
+fn probe<R: RelationRead>(index: &R, v: (u32, u16)) -> Probe<Vec<Pointer>>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let vertex_guard = index.read(v.0);
+    let Some(vertex_bytes) = vertex_guard.get(v.1) else {
+        // the link is broken
+        return Probe::Missing;
+    };
+    let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
+    let pointers = vertex_tuple.pointers().to_vec();
+    if vertex_tuple.payload().is_some() {
+        Probe::Live(pointers)
+    } else {
+        Probe::Deleted(pointers)
+    }
+}
+
+/// Breadth-first search through deleted vertices, starting from `seeds`
+/// (deleted vertices with their data), for live vertices not in `visited`.
+/// Stops after the first expanded vertex that leads to a live vertex, when
+/// the reachable deleted region is exhausted, or after expanding `cap`
+/// deleted vertices; returns the live vertices found (#21).
+fn expand_deleted<V: Copy + Eq + Hash, P>(
+    seeds: Vec<(V, P)>,
+    visited: &mut HashSet<V>,
+    cap: Option<usize>,
+    mut probe: impl FnMut(V) -> Probe<P>,
+    mut outs: impl FnMut(&P) -> Vec<V>,
+) -> Vec<(V, P)> {
+    let mut queue = VecDeque::from(seeds);
+    let mut found = Vec::new();
+    let mut expanded = 0_usize;
+    while let Some((_, w)) = queue.pop_front() {
+        if cap.is_some_and(|cap| expanded >= cap) {
+            break;
+        }
+        expanded += 1;
+        for x in outs(&w) {
+            if !visited.insert(x) {
+                continue;
+            }
+            match probe(x) {
+                Probe::Missing => {}
+                Probe::Live(p) => found.push((x, p)),
+                Probe::Deleted(p) => queue.push_back((x, p)),
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+    }
+    found
+}
+
+/// Neighbour lists seen by edge repair, within a memory limit: before the
+/// repair for every vertex (deleted ones included), after it for the
+/// vertices the repair keeps (live vertices and the start vertex).
+struct Recorder {
+    before: HashMap<(u32, u16), Vec<(u32, u16)>>,
+    after: HashMap<(u32, u16), (bool, Vec<(u32, u16)>)>,
+    bytes: usize,
+    limit: usize,
+    skipped: Option<&'static str>,
+}
+
+impl Recorder {
+    /// Estimated bytes per recorded list besides its entries: the map entry
+    /// and its share of the check's visited set and queue.
+    const ENTRY: usize = 96;
+
+    fn new(limit: usize) -> Self {
+        Self {
+            before: HashMap::new(),
+            after: HashMap::new(),
+            bytes: 0,
+            limit,
+            skipped: None,
+        }
+    }
+    fn active(&self) -> bool {
+        self.skipped.is_none()
+    }
+    fn charge(&mut self, outs: &[(u32, u16)]) -> bool {
+        if self.skipped.is_some() {
+            return false;
+        }
+        self.bytes = self.bytes.saturating_add(Self::ENTRY + size_of_val(outs));
+        if self.bytes > self.limit {
+            self.skip("maintenance_work_mem is too small to hold the neighbour lists");
+            return false;
+        }
+        true
+    }
+    fn record_before(&mut self, u: (u32, u16), outs: Vec<(u32, u16)>) {
+        if self.charge(&outs) {
+            self.before.insert(u, outs);
+        }
+    }
+    fn record_after(&mut self, u: (u32, u16), live: bool, outs: Vec<(u32, u16)>) {
+        if self.charge(&outs) {
+            self.after.insert(u, (live, outs));
+        }
+    }
+    fn skip(&mut self, reason: &'static str) {
+        if self.skipped.is_none() {
+            self.skipped = Some(reason);
+            self.before = HashMap::new();
+            self.after = HashMap::new();
+        }
+    }
+    fn finish(self, s: (u32, u16)) -> Reachability {
+        if let Some(reason) = self.skipped {
+            return Reachability::Skipped(reason);
+        }
+        if !self.before.contains_key(&s) || !self.after.contains_key(&s) {
+            return Reachability::Skipped("the start vertex was not found");
+        }
+        compare_reachability(s, &self.before, &self.after)
+    }
+}
+
+/// Vertices reachable from `start`, following only vertices `outs` knows.
+fn reachable<'a, V: Copy + Eq + Hash + 'a>(
+    start: V,
+    outs: impl Fn(V) -> Option<&'a [V]>,
+) -> HashSet<V> {
+    let mut visited = HashSet::from([start]);
+    let mut queue = VecDeque::from([start]);
+    while let Some(v) = queue.pop_front() {
+        for &x in outs(v).unwrap_or_default() {
+            if outs(x).is_some() && visited.insert(x) {
+                queue.push_back(x);
+            }
+        }
+    }
+    visited
+}
+
+fn compare_reachability<V: Copy + Eq + Hash>(
+    start: V,
+    before: &HashMap<V, Vec<V>>,
+    after: &HashMap<V, (bool, Vec<V>)>,
+) -> Reachability {
+    let reached_before = reachable(start, |v| before.get(&v).map(Vec::as_slice));
+    let reached_after = reachable(start, |v| after.get(&v).map(|(_, outs)| outs.as_slice()));
+    let (mut disconnected, mut unreachable_before, mut live) = (0, 0, 0);
+    for (v, (live_v, _)) in after {
+        if !live_v {
+            continue;
+        }
+        live += 1;
+        match (reached_before.contains(v), reached_after.contains(v)) {
+            (false, _) => unreachable_before += 1,
+            (true, false) => disconnected += 1,
+            (true, true) => {}
+        }
+    }
+    Reachability::Checked {
+        disconnected,
+        unreachable_before,
+        live,
+    }
 }
 
 pub(crate) struct InspectedVertexPage {
@@ -311,4 +601,170 @@ where
         current = inspected.next;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A test graph: `live[v]` and `outs[v]`; vertices beyond `live` are
+    /// missing.
+    struct Graph {
+        live: Vec<bool>,
+        outs: Vec<Vec<usize>>,
+    }
+
+    impl Graph {
+        fn new(n: usize) -> Self {
+            Self {
+                live: vec![false; n],
+                outs: vec![Vec::new(); n],
+            }
+        }
+        fn probe(&self, v: usize) -> Probe<usize> {
+            match self.live.get(v) {
+                None => Probe::Missing,
+                Some(true) => Probe::Live(v),
+                Some(false) => Probe::Deleted(v),
+            }
+        }
+        /// Expands from `u`, whose neighbours `first` were all deleted and
+        /// were expanded once already (two-level repair).
+        fn expand(&self, u: usize, first: &[usize], cap: Option<usize>) -> Vec<usize> {
+            let mut visited = HashSet::from([u]);
+            visited.extend(first.iter().copied());
+            let mut seeds = Vec::new();
+            for &f in first {
+                for &v in &self.outs[f] {
+                    if visited.insert(v) && !self.live.get(v).copied().unwrap_or(true) {
+                        seeds.push((v, v));
+                    }
+                }
+            }
+            let mut found = expand_deleted(
+                seeds,
+                &mut visited,
+                cap,
+                |v| self.probe(v),
+                |&w| self.outs[w].clone(),
+            )
+            .into_iter()
+            .map(|(v, _)| v)
+            .collect::<Vec<_>>();
+            found.sort_unstable();
+            found
+        }
+    }
+
+    #[test]
+    fn branching() {
+        // u=0 -> 1 (deleted) -> {2, 3} (deleted); 2 -> 4 -> 6 (live), 3 -> 5 (live)
+        let mut g = Graph::new(7);
+        g.live[5] = true;
+        g.live[6] = true;
+        g.outs[0] = vec![1];
+        g.outs[1] = vec![2, 3];
+        g.outs[2] = vec![4];
+        g.outs[3] = vec![5];
+        g.outs[4] = vec![6];
+        // 2 and 3 are the seeds; expanding 2 finds nothing, 3 finds 5 and
+        // the search stops before reaching 6.
+        assert_eq!(g.expand(0, &[1], None), vec![5]);
+    }
+
+    #[test]
+    fn long_chain() {
+        // 0 -> 1 -> 2 -> ... -> 100 (deleted) -> 101 (live)
+        let mut g = Graph::new(102);
+        for v in 0..101 {
+            g.outs[v] = vec![v + 1];
+        }
+        g.live[101] = true;
+        assert_eq!(g.expand(0, &[1], None), vec![101]);
+        assert_eq!(g.expand(0, &[1], Some(4096)), vec![101]);
+        // The cap counts expanded deleted vertices; 2..=100 are 99.
+        assert_eq!(g.expand(0, &[1], Some(99)), vec![101]);
+        assert_eq!(g.expand(0, &[1], Some(98)), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn pocket_without_exits() {
+        // 1 -> 2 -> 3 -> 1 (all deleted), 3 -> 0 (u itself), 2 -> 9 (missing)
+        let mut g = Graph::new(4);
+        g.live[0] = true;
+        g.outs[0] = vec![1];
+        g.outs[1] = vec![2];
+        g.outs[2] = vec![3, 9];
+        g.outs[3] = vec![1, 0];
+        // The region is exhausted and `u` is not a candidate of its own.
+        assert_eq!(g.expand(0, &[1], None), Vec::<usize>::new());
+    }
+
+    fn check(
+        start: usize,
+        before: &[(usize, &[usize])],
+        after: &[(usize, bool, &[usize])],
+    ) -> (u64, u64, u64) {
+        let before = before
+            .iter()
+            .map(|&(v, outs)| (v, outs.to_vec()))
+            .collect::<HashMap<_, _>>();
+        let after = after
+            .iter()
+            .map(|&(v, live, outs)| (v, (live, outs.to_vec())))
+            .collect::<HashMap<_, _>>();
+        match compare_reachability(start, &before, &after) {
+            Reachability::Checked {
+                disconnected,
+                unreachable_before,
+                live,
+            } => (disconnected, unreachable_before, live),
+            Reachability::Skipped(_) => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn reachability() {
+        // Before: 0 (start) -> 1 (deleted) -> {2, 3}; 3 -> 4; 5 has no in-edges.
+        let before: &[(usize, &[usize])] = &[
+            (0, &[1]),
+            (1, &[2, 3]),
+            (2, &[]),
+            (3, &[4]),
+            (4, &[]),
+            (5, &[2]),
+        ];
+        // The repair links 0 to 2 only: 3 and 4 are cut off, 5 already was.
+        let after: &[(usize, bool, &[usize])] = &[
+            (0, false, &[2]),
+            (2, true, &[]),
+            (3, true, &[4]),
+            (4, true, &[]),
+            (5, true, &[2]),
+        ];
+        assert_eq!(check(0, before, after), (2, 1, 4));
+        // A repair that keeps everything reachable reports nothing new.
+        let after: &[(usize, bool, &[usize])] = &[
+            (0, true, &[2, 3]),
+            (2, true, &[]),
+            (3, true, &[4, 9]), // 9 is unknown (freed): not followed
+            (4, true, &[]),
+            (5, true, &[2]),
+        ];
+        assert_eq!(check(0, before, after), (0, 1, 5));
+    }
+
+    #[test]
+    fn recorder_memory_limit() {
+        let mut r = Recorder::new(2 * Recorder::ENTRY + 16);
+        r.record_before((1, 1), vec![(1, 2)]);
+        r.record_after((1, 1), true, vec![(1, 2)]);
+        assert!(matches!(r.finish((1, 1)), Reachability::Checked { .. }));
+        let mut r = Recorder::new(2 * Recorder::ENTRY + 16);
+        r.record_before((1, 1), vec![(1, 2)]);
+        r.record_after((1, 1), true, vec![(1, 2)]);
+        r.record_before((1, 2), vec![]);
+        assert!(!r.active());
+        assert!(matches!(r.finish((1, 1)), Reachability::Skipped(_)));
+    }
 }

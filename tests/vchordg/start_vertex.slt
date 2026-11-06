@@ -1,0 +1,131 @@
+# vchordg edge repair (#21): when the two-level repair would leave a vertex
+# without a live neighbour, VACUUM keeps expanding through deleted vertices
+# (without a limit for the start vertex, through which every search enters)
+# instead of writing an empty neighbour list.
+
+# Clustered delete: the start vertex lies in a deleted cluster. Before the
+# fix its list became empty and the index returned no rows at all.
+statement ok
+CREATE TABLE sv_cluster (id int, tenant text, v vector(16)) WITH (autovacuum_enabled = off);
+
+statement ok
+SELECT setseed(0.21);
+
+statement ok
+INSERT INTO sv_cluster SELECT i, 'X', ARRAY(SELECT 100 + random() * 0.01 + 0 * i FROM generate_series(1, 16))::vector(16) FROM generate_series(1, 8000) i;
+
+statement ok
+INSERT INTO sv_cluster SELECT i, 'Y', ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::vector(16) FROM generate_series(8001, 13000) i;
+
+statement ok
+CREATE INDEX sv_cluster_g ON sv_cluster USING vchordg (v vector_l2_ops) WITH (options = 'm = 8');
+
+statement ok
+DELETE FROM sv_cluster WHERE tenant = 'X';
+
+statement ok
+VACUUM sv_cluster;
+
+statement ok
+SET enable_seqscan = off;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE tenant = 'Y') FROM (
+  SELECT id, tenant FROM sv_cluster ORDER BY v <-> array_fill(0.5::real, ARRAY[16])::vector(16) LIMIT 10
+) s;
+----
+10 10
+
+statement ok
+RESET enable_seqscan;
+
+# A long tombstone chain from the start vertex: rows on a monotone curve,
+# inserted in order into an index without long edges (alpha = [1.0]), so the
+# graph is close to a path; the band of rows deleted contains the start
+# vertex. Before the fix the far side became unreachable.
+statement ok
+CREATE TABLE sv_chain (id int, v vector(4)) WITH (autovacuum_enabled = off);
+
+statement ok
+CREATE INDEX sv_chain_g ON sv_chain USING vchordg (v vector_l2_ops) WITH (options = 'alpha = [1.0]');
+
+statement ok
+INSERT INTO sv_chain SELECT i, ARRAY[i / 100.0, sin(i / 50.0) * 0.01, cos(i / 50.0) * 0.01, 0]::real[]::vector FROM generate_series(1, 3000) i;
+
+statement ok
+DELETE FROM sv_chain WHERE id <= 1000;
+
+statement ok
+VACUUM sv_chain;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordg.ef_search = 200;
+
+query I
+SELECT id FROM sv_chain ORDER BY v <-> ARRAY[25, sin(50.0) * 0.01, cos(50.0) * 0.01, 0]::real[]::vector LIMIT 1;
+----
+2500
+
+statement ok
+RESET vchordg.ef_search;
+
+statement ok
+RESET enable_seqscan;
+
+# Scattered deletes do not trigger the expansion; recall stays where it was
+# (on this data the graph is approximate even when fresh: the average top-10
+# overlap with the exact answer is 9.33 fresh and 9.05 after this VACUUM).
+statement ok
+CREATE TABLE sv_scatter (id int, v vector(8)) WITH (autovacuum_enabled = off);
+
+statement ok
+SELECT setseed(0.5);
+
+statement ok
+INSERT INTO sv_scatter SELECT i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 8))::vector(8) FROM generate_series(1, 3000) i;
+
+statement ok
+CREATE INDEX sv_scatter_g ON sv_scatter USING vchordg (v vector_l2_ops);
+
+statement ok
+DELETE FROM sv_scatter WHERE id % 3 = 0;
+
+statement ok
+VACUUM sv_scatter;
+
+statement ok
+SET enable_indexscan = off;
+
+statement ok
+CREATE TABLE sv_scatter_exact AS
+SELECT q.id AS qid, ARRAY(SELECT s.id FROM sv_scatter s ORDER BY s.v <-> q.v LIMIT 10) AS ids
+FROM sv_scatter q WHERE q.id % 100 = 1;
+
+statement ok
+RESET enable_indexscan;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordg.ef_search = 200;
+
+query T
+SELECT avg(cardinality(ARRAY(
+  SELECT unnest(e.ids) INTERSECT SELECT unnest(ARRAY(SELECT s.id FROM sv_scatter s ORDER BY s.v <-> q.v LIMIT 10))
+))) >= 8.5
+FROM sv_scatter_exact e JOIN sv_scatter q ON q.id = e.qid;
+----
+t
+
+statement ok
+RESET vchordg.ef_search;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE sv_cluster, sv_chain, sv_scatter, sv_scatter_exact;
