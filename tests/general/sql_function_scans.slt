@@ -1,0 +1,71 @@
+# Index scans started from a non-inlinable SQL function, once per outer row
+# (#25). On PostgreSQL 14-17 the scan used to live in the function's
+# call-spanning context and accumulated for the whole outer query; this test is
+# a functional smoke test on every version.
+
+statement ok
+CREATE TABLE fn_items (id int, emb vector(3));
+
+statement ok
+INSERT INTO fn_items SELECT i, ARRAY[i, i + 1, i + 2]::real[]::vector FROM generate_series(1, 2000) i;
+
+statement ok
+CREATE INDEX fn_items_rq ON fn_items USING vchordrq (emb vector_l2_ops);
+
+statement ok
+CREATE TABLE fn_queries AS SELECT i, ARRAY[i, i + 1, i + 2]::real[]::vector AS q FROM generate_series(1, 2000, 7) i;
+
+# Volatile and with SET: never inlined.
+statement ok
+CREATE FUNCTION fn_nn(q vector) RETURNS int VOLATILE LANGUAGE sql SET enable_seqscan = off
+AS 'SELECT id FROM fn_items ORDER BY emb <-> q LIMIT 1';
+
+query I
+SELECT count(*) FROM fn_queries WHERE fn_nn(q) = i;
+----
+286
+
+# LATERAL rescans of the same index scan node.
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM fn_queries, LATERAL (SELECT id FROM fn_items ORDER BY emb <-> q LIMIT 1) s WHERE s.id = i;
+----
+286
+
+# vchordg is approximate on this collinear data; a scan inside the function
+# must give the same answers as the same scan in a LATERAL subquery.
+statement ok
+DROP INDEX fn_items_rq;
+
+statement ok
+CREATE INDEX fn_items_g ON fn_items USING vchordg (emb vector_l2_ops);
+
+query T
+SELECT (SELECT count(*) FROM fn_queries WHERE fn_nn(q) = i)
+     = (SELECT count(*) FROM fn_queries, LATERAL (SELECT id FROM fn_items ORDER BY emb <-> q LIMIT 1) s WHERE s.id = i);
+----
+t
+
+# An error raised inside the function after the scan began.
+statement ok
+CREATE FUNCTION fn_nn_error(q vector) RETURNS int VOLATILE LANGUAGE sql SET enable_seqscan = off
+AS 'SELECT id / (id - 50) FROM fn_items ORDER BY emb <-> q LIMIT 1';
+
+statement error division by zero
+SELECT count(*) FROM fn_queries WHERE fn_nn_error(q) IS NOT NULL;
+
+query T
+SELECT count(*) > 0 FROM fn_queries WHERE fn_nn(q) = i;
+----
+t
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP FUNCTION fn_nn(vector), fn_nn_error(vector);
+
+statement ok
+DROP TABLE fn_items, fn_queries;
