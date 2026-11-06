@@ -101,25 +101,29 @@ impl Opfamily {
         let tuple = unsafe { PgHeapTuple::from_composite_datum(datum) };
         let center = match self {
             Self::VectorL2 | Self::VectorCosine | Self::VectorIp => {
-                let vector = tuple.get_by_index::<VectorOutput>(attno_1)
+                let vector = tuple
+                    .get_by_index::<VectorOutput>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Vecf32(vector.as_borrowed()))
             }
             Self::HalfvecL2 | Self::HalfvecCosine | Self::HalfvecIp => {
-                let vector = tuple.get_by_index::<HalfvecOutput>(attno_1)
+                let vector = tuple
+                    .get_by_index::<HalfvecOutput>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
             }
             Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
-                let vector = tuple.get_by_index::<Rabitq8Output>(attno_1)
+                let vector = tuple
+                    .get_by_index::<Rabitq8Output>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
             }
             Self::Rabitq4L2 | Self::Rabitq4Cosine | Self::Rabitq4Ip => {
-                let vector = tuple.get_by_index::<Rabitq4Output>(attno_1)
+                let vector = tuple
+                    .get_by_index::<Rabitq4Output>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Rabitq4(vector.as_borrowed()))

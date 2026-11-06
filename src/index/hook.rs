@@ -60,7 +60,8 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                     // `IndexNext` would; otherwise the Scanner lives as long as
                     // the caller's context (for an SQL function on PG14-17, the
                     // whole outer query) (#25).
-                    let _switch = crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+                    let _switch =
+                        crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
                     (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
@@ -94,7 +95,8 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                     // `IndexNext` would; otherwise the Scanner lives as long as
                     // the caller's context (for an SQL function on PG14-17, the
                     // whole outer query) (#25).
-                    let _switch = crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+                    let _switch =
+                        crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
                     (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,

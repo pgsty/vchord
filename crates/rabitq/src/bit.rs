@@ -65,7 +65,11 @@ impl CodeMetadata {
 #[inline(always)]
 fn residual_norm(dis_v_2: f32, norm: f32, dis_f: f32) -> f32 {
     let r = dis_v_2 + norm * norm + 2.0 * dis_f;
-    if r.is_finite() && r < 0.0 { 0.0 } else { r.sqrt() }
+    if r.is_finite() && r < 0.0 {
+        0.0
+    } else {
+        r.sqrt()
+    }
 }
 
 pub type Code = (CodeMetadata, Vec<bool>);

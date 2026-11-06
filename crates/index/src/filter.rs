@@ -99,10 +99,13 @@ mod tests {
     #[test]
     fn predicate_runs_once_per_item() {
         let calls = Cell::new(0);
-        let mut f = filter(heap(&[(1, 0), (1, 1), (2, 2), (3, 3)]), |Reverse((_, id)): &Reverse<(u32, u32)>| {
-            calls.set(calls.get() + 1);
-            id % 2 == 1
-        });
+        let mut f = filter(
+            heap(&[(1, 0), (1, 1), (2, 2), (3, 3)]),
+            |Reverse((_, id)): &Reverse<(u32, u32)>| {
+                calls.set(calls.get() + 1);
+                id % 2 == 1
+            },
+        );
         // peek -> peek -> next on the same head evaluates it once.
         assert_eq!(f.peek(), Some(&Reverse((1, 1))));
         assert_eq!(f.peek(), Some(&Reverse((1, 1))));
@@ -120,10 +123,13 @@ mod tests {
     #[test]
     fn equal_values_distinct_heads() {
         let calls = Cell::new(0);
-        let mut f = filter(heap(&[(5, 0), (5, 1), (5, 2)]), |_: &Reverse<(u32, u32)>| {
-            calls.set(calls.get() + 1);
-            true
-        });
+        let mut f = filter(
+            heap(&[(5, 0), (5, 1), (5, 2)]),
+            |_: &Reverse<(u32, u32)>| {
+                calls.set(calls.get() + 1);
+                true
+            },
+        );
         let mut seen = Vec::new();
         while let Some(Reverse((_, id))) = f.next() {
             let _ = f.peek();

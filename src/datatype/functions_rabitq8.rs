@@ -72,11 +72,7 @@ fn _vchord_rabitq8_dequantize_to_vector(vector: Rabitq8Input) -> VectorOutput {
         result.push((base + c as f32) * scale);
     }
     rabitq::rotate::rotate_reversed_inplace(&mut result);
-    rabitq_io::check_dequantized(
-        "vector",
-        vector.dim(),
-        result.iter().all(|x| x.is_finite()),
-    );
+    rabitq_io::check_dequantized("vector", vector.dim(), result.iter().all(|x| x.is_finite()));
     VectorOutput::new(VectBorrowed::new(&result))
 }
 

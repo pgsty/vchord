@@ -323,7 +323,11 @@ pub fn quantize(lut: &[f32], n: f32) -> (f32, f32, Vec<u8>) {
         // it saturates, and reconstruction is approximate.
         let k = f64::from(k);
         lut.iter()
-            .map(|&x| ((f64::from(x) - f64::from(b)) / k).round_ties_even().clamp(0.0, f64::from(n)) as u8)
+            .map(|&x| {
+                ((f64::from(x) - f64::from(b)) / k)
+                    .round_ties_even()
+                    .clamp(0.0, f64::from(n)) as u8
+            })
             .collect()
     };
     let top = n as u8;
@@ -355,7 +359,9 @@ mod quantize_tests {
 
     #[test]
     fn extremes() {
-        let near = (0..64).map(|i| 1000.0 + i as f32 * 1.0e-4).collect::<Vec<_>>();
+        let near = (0..64)
+            .map(|i| 1000.0 + i as f32 * 1.0e-4)
+            .collect::<Vec<_>>();
         check(&near, 63.0);
         check(&near, 15.0);
         check(&near, 255.0);
@@ -364,14 +370,20 @@ mod quantize_tests {
         // With n = 1 the scale saturates at f32::MAX: codes stay in range.
         let (k, _, codes) = quantize(&wide, 1.0);
         assert!(k.is_finite() && codes.iter().all(|&c| c <= 1));
-        let random = (0..1000).map(|i| ((i * 7919) % 1000) as f32 / 37.0 - 13.0).collect::<Vec<_>>();
+        let random = (0..1000)
+            .map(|i| ((i * 7919) % 1000) as f32 / 37.0 - 13.0)
+            .collect::<Vec<_>>();
         check(&random, 63.0);
         check(&random, 255.0);
     }
 
     #[test]
     fn degenerate_spans() {
-        for lut in [vec![5.0f32; 10], vec![0.0, f32::MIN_POSITIVE * 1.0e-3], vec![1.0e-40, 2.0e-40]] {
+        for lut in [
+            vec![5.0f32; 10],
+            vec![0.0, f32::MIN_POSITIVE * 1.0e-3],
+            vec![1.0e-40, 2.0e-40],
+        ] {
             let (k, b, codes) = quantize(&lut, 63.0);
             assert_eq!(k, 0.0);
             assert_eq!(b, lut.iter().copied().fold(f32::INFINITY, f32::min));

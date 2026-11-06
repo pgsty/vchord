@@ -1020,9 +1020,21 @@ mod tests {
 
     fn assert_finite(m: rabitq::bit::CodeMetadata, what: &str) {
         assert!(m.dis_u_2.is_finite(), "{what}: dis_u_2 = {}", m.dis_u_2);
-        assert!(m.factor_cnt.is_finite(), "{what}: factor_cnt = {}", m.factor_cnt);
-        assert!(m.factor_ip.is_finite(), "{what}: factor_ip = {}", m.factor_ip);
-        assert!(m.factor_err.is_finite(), "{what}: factor_err = {}", m.factor_err);
+        assert!(
+            m.factor_cnt.is_finite(),
+            "{what}: factor_cnt = {}",
+            m.factor_cnt
+        );
+        assert!(
+            m.factor_ip.is_finite(),
+            "{what}: factor_ip = {}",
+            m.factor_ip
+        );
+        assert!(
+            m.factor_err.is_finite(),
+            "{what}: factor_err = {}",
+            m.factor_err
+        );
     }
 
     // Zero and 1-dimensional vectors produced NaN factors (#23), and equal
@@ -1036,7 +1048,12 @@ mod tests {
             ("dim 1 positive", vec![3.0]),
             ("dim 1 negative", vec![-0.25]),
             ("equal magnitude", vec![1.0; 64]),
-            ("equal magnitude signs", (0..65).map(|i| if i % 2 == 0 { 0.5 } else { -0.5 }).collect()),
+            (
+                "equal magnitude signs",
+                (0..65)
+                    .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+                    .collect(),
+            ),
         ];
         for (what, x) in inputs {
             let v8 = rabitq8(&x);
