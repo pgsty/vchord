@@ -24,6 +24,16 @@ pub fn init() {
     hook::init();
     vchordrq::am::init();
     vchordg::am::init();
+    ::index::interrupt::set(check_for_interrupts);
+}
+
+/// Interrupt check for the algorithm crates' long loops (#28). Only the
+/// backend's main thread may call into PostgreSQL; build worker threads skip
+/// it. pgrx turns a raised error into a Rust panic that unwinds normally.
+fn check_for_interrupts() {
+    if crate::is_main() {
+        pgrx::pg_sys::check_for_interrupts!();
+    }
 }
 
 /// Cost given to index paths the access methods cannot execute (no ORDER BY

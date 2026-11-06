@@ -1,0 +1,85 @@
+# Smoke test for interrupt checks in index scans (#28): a prefiltered qual that
+# rejects every candidate is cancelled by statement_timeout, and without a
+# timeout every candidate is evaluated exactly once. (The qual is a plpgsql
+# function, which checks interrupts itself, so this does not measure the
+# latency of the index's own checks; that was verified separately by comparing
+# cancel latency of tombstone-heavy scans: 41/75 ms before, 3.6/3.5 ms after,
+# for vchordrq/vchordg on 120000 dead rows.)
+#
+# The qual counts its evaluations in a sequence (sequences survive the error).
+# It is declared STABLE on purpose so that it is prefiltered (volatile quals
+# stay in the executor since #34).
+
+statement ok
+CREATE TABLE interrupts (id int, v vector(8));
+
+statement ok
+INSERT INTO interrupts
+SELECT i, ARRAY(SELECT sin(i * 0.37 + j)::real FROM generate_series(1, 8) j)::vector
+FROM generate_series(1, 120000) i;
+
+statement ok
+CREATE INDEX interrupts_rq ON interrupts USING vchordrq (v vector_l2_ops);
+
+statement ok
+CREATE SEQUENCE interrupts_seq;
+
+statement ok
+CREATE FUNCTION interrupts_reject(int) RETURNS bool STABLE LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM nextval('interrupts_seq');
+  RETURN false;
+END
+$$;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.prefilter = on;
+
+statement ok
+SET statement_timeout = '20ms';
+
+statement error canceling statement due to statement timeout
+SELECT id FROM interrupts WHERE interrupts_reject(id) ORDER BY v <-> '[0,0,0,0,0,0,0,0]' LIMIT 1;
+
+statement ok
+RESET statement_timeout;
+
+# Canceled long before all 120000 candidates were evaluated.
+query T
+SELECT currval('interrupts_seq') < 60000;
+----
+t
+
+# Without a timeout every candidate is evaluated once.
+statement ok
+SELECT setval('interrupts_seq', 1, false);
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM interrupts WHERE interrupts_reject(id) ORDER BY v <-> '[0,0,0,0,0,0,0,0]' LIMIT 1
+) s;
+----
+0
+
+query I
+SELECT currval('interrupts_seq');
+----
+120000
+
+statement ok
+RESET vchordrq.prefilter;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE interrupts;
+
+statement ok
+DROP FUNCTION interrupts_reject(int);
+
+statement ok
+DROP SEQUENCE interrupts_seq;

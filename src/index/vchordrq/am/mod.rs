@@ -706,6 +706,9 @@ pub unsafe extern "C-unwind" fn amgettuple(
     if direction != pgrx::pg_sys::ScanDirection::ForwardScanDirection {
         pgrx::error!("vector search without a forward scan direction is not supported");
     }
+    // `index_getnext_slot` calls back without checking interrupts while heap
+    // tuples are invisible; no buffer lock is held here (#28).
+    pgrx::pg_sys::check_for_interrupts!();
     // https://www.postgresql.org/docs/current/index-locking.html
     // If heap entries referenced physical pointers are deleted before
     // they are consumed by PostgreSQL, PostgreSQL will received wrong
