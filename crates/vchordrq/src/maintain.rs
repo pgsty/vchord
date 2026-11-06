@@ -315,9 +315,8 @@ where
     for guard in tape::by_next(index, jump_tuple.appendable_first()) {
         for i in 1..=guard.len() {
             let bytes = guard.get(i).expect("data corruption");
-            if AppendableTuple::deserialize_ref(bytes).payload().is_none() {
-                return None;
-            }
+            // a deleted entry: the list needs compacting
+            AppendableTuple::deserialize_ref(bytes).payload()?;
             appendable += 1;
         }
         if appendable >= 32 {
