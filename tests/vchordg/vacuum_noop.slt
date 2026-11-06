@@ -1,0 +1,86 @@
+# A VACUUM that deleted nothing must not rewrite the index (#24). It used to
+# rewrite and WAL-log every page (vchordg) on every VACUUM.
+
+statement ok
+CREATE TABLE vchordg_noop (id int, v vector(32)) WITH (autovacuum_enabled = off);
+
+statement ok
+INSERT INTO vchordg_noop
+SELECT i, ARRAY(SELECT (((i * 7919 + j * 104729) % 1000003)::real / 1000003) FROM generate_series(1, 32) j)::vector
+FROM generate_series(1, 20003) i;
+
+statement ok
+CREATE INDEX vchordg_noop_idx ON vchordg_noop USING vchordg (v vector_l2_ops) WITH (options = $$m = 16$$);
+
+statement ok
+VACUUM vchordg_noop;
+
+statement ok
+CREATE TEMP TABLE vchordg_noop_state AS
+SELECT pg_current_wal_insert_lsn() AS lsn,
+       (SELECT reltuples FROM pg_class WHERE relname = 'vchordg_noop_idx') AS reltuples;
+
+statement ok
+VACUUM vchordg_noop;
+
+statement ok
+VACUUM vchordg_noop;
+
+query T
+SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), lsn) < pg_relation_size('vchordg_noop_idx') / 100
+FROM vchordg_noop_state;
+----
+t
+
+query T
+SELECT (SELECT reltuples FROM pg_class WHERE relname = 'vchordg_noop_idx') = reltuples FROM vchordg_noop_state;
+----
+t
+
+# Deletions are still reclaimed: the index count follows the table, and the
+# freed space is reused by the same number of new rows.
+statement ok
+DELETE FROM vchordg_noop WHERE id % 2 = 0;
+
+statement ok
+VACUUM vchordg_noop;
+
+query I
+SELECT reltuples::int FROM pg_class WHERE relname = 'vchordg_noop_idx';
+----
+10002
+
+statement ok
+CREATE TEMP TABLE vchordg_noop_size AS SELECT pg_relation_size('vchordg_noop_idx') AS size;
+
+statement ok
+INSERT INTO vchordg_noop
+SELECT i, ARRAY(SELECT (((i * 7919 + j * 104729) % 1000003)::real / 1000003) FROM generate_series(1, 32) j)::vector
+FROM generate_series(30001, 40001) i;
+
+query T
+SELECT pg_relation_size('vchordg_noop_idx') < size * 1.2 FROM vchordg_noop_size;
+----
+t
+
+statement ok
+SET enable_seqscan = off;
+
+# The data lies on a wrapped one-dimensional curve, which is hard for a
+# graph; a wide search finds the exact match after the reinsert.
+statement ok
+SET vchordg.ef_search = 2000;
+
+query I
+SELECT id FROM vchordg_noop ORDER BY v <-> (SELECT v FROM vchordg_noop WHERE id = 7) LIMIT 1;
+----
+7
+
+statement ok
+RESET vchordg.ef_search;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE vchordg_noop, vchordg_noop_state, vchordg_noop_size;

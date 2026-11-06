@@ -1,0 +1,87 @@
+# A VACUUM that deleted nothing must not rewrite the index (#24). It used to
+# rewrite and WAL-log every page (vchordrq) on every VACUUM.
+
+statement ok
+CREATE TABLE vchordrq_noop (id int, v vector(32)) WITH (autovacuum_enabled = off);
+
+statement ok
+INSERT INTO vchordrq_noop
+SELECT i, ARRAY(SELECT (((i * 7919 + j * 104729) % 1000003)::real / 1000003) FROM generate_series(1, 32) j)::vector
+FROM generate_series(1, 20003) i;
+
+statement ok
+CREATE INDEX vchordrq_noop_idx ON vchordrq_noop USING vchordrq (v vector_l2_ops) WITH (options = $$
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+VACUUM vchordrq_noop;
+
+statement ok
+CREATE TEMP TABLE vchordrq_noop_state AS
+SELECT pg_current_wal_insert_lsn() AS lsn,
+       (SELECT reltuples FROM pg_class WHERE relname = 'vchordrq_noop_idx') AS reltuples;
+
+statement ok
+VACUUM vchordrq_noop;
+
+statement ok
+VACUUM vchordrq_noop;
+
+query T
+SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), lsn) < pg_relation_size('vchordrq_noop_idx') / 100
+FROM vchordrq_noop_state;
+----
+t
+
+query T
+SELECT (SELECT reltuples FROM pg_class WHERE relname = 'vchordrq_noop_idx') = reltuples FROM vchordrq_noop_state;
+----
+t
+
+# Deletions are still reclaimed: the index count follows the table, and the
+# freed space is reused by the same number of new rows.
+statement ok
+DELETE FROM vchordrq_noop WHERE id % 2 = 0;
+
+statement ok
+VACUUM vchordrq_noop;
+
+query I
+SELECT reltuples::int FROM pg_class WHERE relname = 'vchordrq_noop_idx';
+----
+10002
+
+statement ok
+CREATE TEMP TABLE vchordrq_noop_size AS SELECT pg_relation_size('vchordrq_noop_idx') AS size;
+
+statement ok
+INSERT INTO vchordrq_noop
+SELECT i, ARRAY(SELECT (((i * 7919 + j * 104729) % 1000003)::real / 1000003) FROM generate_series(1, 32) j)::vector
+FROM generate_series(30001, 40001) i;
+
+query T
+SELECT pg_relation_size('vchordrq_noop_idx') < size * 1.2 FROM vchordrq_noop_size;
+----
+t
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '32';
+
+query I
+SELECT id FROM vchordrq_noop ORDER BY v <-> (SELECT v FROM vchordrq_noop WHERE id = 7) LIMIT 1;
+----
+7
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE vchordrq_noop, vchordrq_noop_state, vchordrq_noop_size;

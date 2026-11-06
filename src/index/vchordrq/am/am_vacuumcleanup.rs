@@ -29,7 +29,7 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     let index_relation = unsafe { (*info).index };
     let tuples = unsafe { sequential_vacuumcleanup(index_relation, || (), || ()) };
     unsafe {
-        // Every list was compacted, so the count is exact.
+        // Compacted and skipped lists are both counted exactly.
         (*stats).num_index_tuples = tuples as f64;
         (*stats).estimated_count = false;
         (*stats).num_pages = pgrx::pg_sys::RelationGetNumberOfBlocksInFork(
@@ -48,6 +48,11 @@ unsafe fn sequential_vacuumcleanup(
     struct ChooseAll;
     impl MaintainChooser for ChooseAll {
         fn choose(&mut self, _: usize) -> bool {
+            true
+        }
+        // Lists with nothing to compact are left alone: VACUUM used to
+        // rewrite and WAL-log every list, even with nothing deleted (#24).
+        fn skip_unchanged(&self) -> bool {
             true
         }
     }

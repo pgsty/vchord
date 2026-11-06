@@ -8,7 +8,7 @@
 
 use crate::Opaque;
 use crate::operator::{CloneAccessor, Operator};
-use crate::tuples::{MetaTuple, VertexTuple, WithReader};
+use crate::tuples::{MetaTuple, Pointer, VertexTuple, WithReader};
 use crate::types::DistanceKind;
 use crate::vectors::{by_read, copy_all, copy_nothing, copy_outs, update};
 use always_equal::AlwaysEqual;
@@ -56,6 +56,12 @@ where
             }
             let next = { vertex_guard }.get_opaque().next;
             for (pointers_u, u) in members {
+                // A list whose neighbours are all live is left as it is:
+                // pruning an unchanged list reproduces it, so reading the
+                // neighbours' vectors and rewriting it is wasted work (#24).
+                if neighbours_all_live::<R, O>(index, &pointers_u) {
+                    continue;
+                }
                 'occ: loop {
                     let Ok((vector_u, neighbours_u, _, version)) = crate::vectors::read::<R, O, _, _>(
                         by_read::<R>(index, pointers_u.iter().copied()),
@@ -153,6 +159,14 @@ where
         let mut current = link;
         while current != u32::MAX {
             check();
+            // Decide under share locks whether this page has anything to free;
+            // only then take the write locks, re-evaluating there (#24).
+            let inspected = inspect_vertex_page(index, current, s);
+            if !inspected.reclaim {
+                live += inspected.live;
+                current = inspected.next;
+                continue;
+            }
             let mut vertex_guard = index.write(current, true);
             let mut reachable_set = Vec::<(u32, u16)>::new();
             for i in 1..=vertex_guard.len() {
@@ -188,4 +202,113 @@ where
         }
     }
     live
+}
+
+fn neighbours_all_live<R: RelationRead, O: Operator>(index: &R, pointers_u: &[Pointer]) -> bool
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let Ok((neighbours, _, _)) =
+        crate::vectors::read_without_accessor::<R, O, _>((index, pointers_u), copy_all)
+    else {
+        return false;
+    };
+    neighbours.iter().all(|&(v, _)| {
+        let vertex_guard = index.read(v.0);
+        let Some(vertex_bytes) = vertex_guard.get(v.1) else {
+            return false;
+        };
+        VertexTuple::deserialize_ref(vertex_bytes)
+            .payload()
+            .is_some()
+    })
+}
+
+pub(crate) struct InspectedVertexPage {
+    /// The page holds a deleted vertex (other than the start vertex) or a
+    /// vector tuple that none of its vertices reference.
+    pub reclaim: bool,
+    /// Live (non-deleted) vertices on the page.
+    pub live: u64,
+    pub next: u32,
+}
+
+/// Inspects a vertex page and its vector pages under share locks. The vertex
+/// page stays share-locked while its vector pages are read: inserts write
+/// their vector tuples while holding the vertex page exclusively, so none can
+/// be observed half-inserted.
+pub(crate) fn inspect_vertex_page<R: RelationRead>(
+    index: &R,
+    id: u32,
+    s: (u32, u16),
+) -> InspectedVertexPage
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let vertex_guard = index.read(id);
+    let mut reachable_set = Vec::<(u32, u16)>::new();
+    let mut live = 0_u64;
+    let mut reclaim = false;
+    for i in 1..=vertex_guard.len() {
+        if let Some(bytes) = vertex_guard.get(i) {
+            let tuple = VertexTuple::deserialize_ref(bytes);
+            let p = tuple.payload();
+            if p.is_none() && (id, i) != s {
+                reclaim = true;
+            } else {
+                live += u64::from(p.is_some());
+                reachable_set.extend(tuple.pointers().iter().map(|pointer| pointer.into_inner()));
+            }
+        }
+    }
+    let opaque = *vertex_guard.get_opaque();
+    if !reclaim {
+        reachable_set.sort_unstable();
+        let mut current = opaque.link;
+        'vectors: while current != u32::MAX {
+            let vector_guard = index.read(current);
+            for i in 1..=vector_guard.len() {
+                if vector_guard.get(i).is_some()
+                    && reachable_set.binary_search(&(current, i)).is_err()
+                {
+                    reclaim = true;
+                    break 'vectors;
+                }
+            }
+            current = vector_guard.get_opaque().next;
+        }
+    }
+    drop(vertex_guard);
+    InspectedVertexPage {
+        reclaim,
+        live,
+        next: opaque.next,
+    }
+}
+
+/// Whether a VACUUM that deleted nothing still has work: deleted vertices
+/// other than the start vertex, or vector tuples left unreferenced (for
+/// example by an interrupted earlier VACUUM). Read-only (#24).
+pub fn pending<R: RelationRead>(index: &R) -> bool
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let meta_guard = index.read(0);
+    let meta_bytes = meta_guard.get(1).expect("data corruption");
+    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
+    let start = meta_tuple.start();
+    let link = meta_guard.get_opaque().link;
+    drop(meta_guard);
+    let Some(s) = start.into_inner() else {
+        return false;
+    };
+    let mut current = link;
+    while current != u32::MAX {
+        let inspected = inspect_vertex_page(index, current, s);
+        if inspected.reclaim {
+            return true;
+        }
+        current = inspected.next;
+    }
+    false
 }

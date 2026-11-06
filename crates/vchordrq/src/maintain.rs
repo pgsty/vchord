@@ -21,6 +21,12 @@ use std::cell::RefCell;
 
 pub trait MaintainChooser {
     fn choose(&mut self, i: usize) -> bool;
+    /// Whether a chosen list whose compaction would reproduce its tapes
+    /// unchanged may be skipped (VACUUM); parallel build compaction always
+    /// rewrites.
+    fn skip_unchanged(&self) -> bool {
+        false
+    }
 }
 
 pub struct Maintain {
@@ -88,6 +94,14 @@ where
 
     for (idx, first) in state.into_iter().enumerate() {
         if !chooser.choose(idx) {
+            continue;
+        }
+
+        if chooser.skip_unchanged()
+            && let Some(tuples) = inspect_unchanged::<R>(index, first)
+        {
+            number_of_tuples += tuples;
+            check();
             continue;
         }
 
@@ -266,6 +280,52 @@ where
         number_of_freed_pages,
         number_of_tuples,
     }
+}
+
+/// Decides, under the list's jump page share lock, whether compacting the
+/// list would reproduce its tapes unchanged: no frozen or appendable entry is
+/// deleted (raw payload slots are inspected; the tape readers skip deleted
+/// entries) and the appendable tape holds fewer tuples than one frozen block,
+/// so compaction would write the same frozen blocks and the same remainder.
+/// Returns the live tuple count of an unchanged list (#24).
+fn inspect_unchanged<R: RelationRead>(index: &R, first: u32) -> Option<u64>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let jump_guard = index.read(first);
+    let jump_bytes = jump_guard.get(1).expect("data corruption");
+    let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+    let mut frozen = 0_u64;
+    let directory =
+        tape::read_directory_tape::<R>(tape::by_next(index, jump_tuple.directory_first()))
+            .collect::<Vec<_>>();
+    for id in directory {
+        let guard = index.read(id);
+        for i in 1..=guard.len() {
+            let bytes = guard.get(i).expect("data corruption");
+            if let FrozenTupleReader::_0(tuple) = FrozenTuple::deserialize_ref(bytes) {
+                if tuple.payload().iter().any(Option::is_none) {
+                    return None;
+                }
+                frozen += 32;
+            }
+        }
+    }
+    let mut appendable = 0_u64;
+    for guard in tape::by_next(index, jump_tuple.appendable_first()) {
+        for i in 1..=guard.len() {
+            let bytes = guard.get(i).expect("data corruption");
+            if AppendableTuple::deserialize_ref(bytes).payload().is_none() {
+                return None;
+            }
+            appendable += 1;
+        }
+        if appendable >= 32 {
+            return None;
+        }
+    }
+    drop(jump_guard);
+    Some(frozen + appendable)
 }
 
 #[derive(Clone)]

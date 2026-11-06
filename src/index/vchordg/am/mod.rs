@@ -335,6 +335,15 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     if unsafe { (*info).analyze_only } {
         return stats;
     }
+    // Without a bulk delete in this VACUUM, rewrite nothing unless an earlier
+    // VACUUM left deleted vertices or unreferenced vectors behind. Returning
+    // NULL tells PostgreSQL the index did not change (#24).
+    if stats.is_null() {
+        let index = unsafe { PostgresRelation::new((*info).index) };
+        if !vchordg::pending(&index) {
+            return stats;
+        }
+    }
     let mut stats = stats;
     if stats.is_null() {
         stats = unsafe {
