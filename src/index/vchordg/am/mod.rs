@@ -375,9 +375,17 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
             live,
         } => {
             if disconnected > 0 {
-                pgrx::warning!(
+                let message = format!(
                     "vchordg index \"{name}\": {disconnected} of {live} live vertices may have become unreachable from the entry point during VACUUM (concurrent inserts are not accounted for); REINDEX to restore recall"
                 );
+                // Edge repair can cut off a few vertices after ordinary
+                // deletes; warn the session only when it is a noticeable
+                // share of the index, and keep smaller counts in the log.
+                if disconnected.saturating_mul(100) >= live {
+                    pgrx::warning!("{message}");
+                } else {
+                    pgrx::log!("{message}");
+                }
             }
             pgrx::debug1!(
                 "vchordg index \"{name}\": reachability check: {disconnected} live vertices disconnected by VACUUM, {unreachable_before} unreachable before it, {live} live"

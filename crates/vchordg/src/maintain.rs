@@ -20,8 +20,13 @@ use std::hash::Hash;
 use vector::VectorOwned;
 
 /// Deleted vertices a non-start vertex may expand while looking for a live
-/// neighbour (#21). The start vertex expands without a limit.
+/// neighbour (#21). The start vertex has no such cap; both are bounded by
+/// `maintenance_work_mem` through `EXPANSION_BYTES_PER_VERTEX`.
 const DEEP_EXPANSION_CAP: usize = 4096;
+
+/// Estimated bytes per vertex an expansion visits: its entry in the visited
+/// set (with the hash table's spare capacity) and in the queue.
+const EXPANSION_BYTES_PER_VERTEX: usize = 48;
 
 pub struct Maintained {
     /// Live (non-deleted) vertices.
@@ -73,6 +78,9 @@ where
         };
     };
     let mut recorder = Recorder::new(memory_limit);
+    // Bounds the vertices one expansion may visit (its visited set and
+    // queue), the start vertex's included.
+    let max_visited = (memory_limit / EXPANSION_BYTES_PER_VERTEX).max(1);
     // do it's best to remove broken edges
     {
         let mut current = link;
@@ -173,8 +181,8 @@ where
                             }
                             let pointers_v = match probe(index, v) {
                                 Probe::Missing => continue,
-                                Probe::Deleted(pointers_v) => {
-                                    deleted.push((v, pointers_v));
+                                Probe::Deleted => {
+                                    deleted.push(v);
                                     continue;
                                 }
                                 Probe::Live(pointers_v) => pointers_v,
@@ -203,12 +211,16 @@ where
                             let found = expand_deleted(
                                 deleted,
                                 &mut visited,
-                                cap,
+                                (cap, max_visited),
                                 |v| probe(index, v),
-                                |pointers_w: &Vec<Pointer>| {
+                                |w| {
                                     check();
+                                    let Some(pointers_w) = vertex_pointers(index, w) else {
+                                        // the link is broken
+                                        return Vec::new();
+                                    };
                                     crate::vectors::read_without_accessor::<R, O, _>(
-                                        (index, pointers_w),
+                                        (index, &pointers_w),
                                         copy_outs,
                                     )
                                     .map(|(outs, _, _)| Vec::from(outs))
@@ -301,9 +313,10 @@ where
             }
             reachable_set.sort_unstable();
             {
+                // No `check()` here: the vertex page is locked exclusively, and
+                // a cost-based sleep or an interrupt must not happen under it.
                 let mut current = vertex_guard.get_opaque().link;
                 while current != u32::MAX {
-                    check();
                     let mut vector_guard = index.write(current, false);
                     for i in 1..=vector_guard.len() {
                         if vector_guard.get(i).is_some() {
@@ -346,7 +359,7 @@ where
 enum Probe<P> {
     Missing,
     Live(P),
-    Deleted(P),
+    Deleted,
 }
 
 fn probe<R: RelationRead>(index: &R, v: (u32, u16)) -> Probe<Vec<Pointer>>
@@ -363,38 +376,56 @@ where
     if vertex_tuple.payload().is_some() {
         Probe::Live(pointers)
     } else {
-        Probe::Deleted(pointers)
+        Probe::Deleted
     }
 }
 
+fn vertex_pointers<R: RelationRead>(index: &R, v: (u32, u16)) -> Option<Vec<Pointer>>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let vertex_guard = index.read(v.0);
+    let vertex_bytes = vertex_guard.get(v.1)?;
+    Some(
+        VertexTuple::deserialize_ref(vertex_bytes)
+            .pointers()
+            .to_vec(),
+    )
+}
+
 /// Breadth-first search through deleted vertices, starting from `seeds`
-/// (deleted vertices with their data), for live vertices not in `visited`.
-/// Stops after the first expanded vertex that leads to a live vertex, when
-/// the reachable deleted region is exhausted, or after expanding `cap`
-/// deleted vertices; returns the live vertices found (#21).
+/// (deleted vertices), for live vertices not in `visited`. Stops after the
+/// first expanded vertex that leads to a live vertex, when the reachable
+/// deleted region is exhausted, after expanding `cap` deleted vertices, or
+/// once `visited` holds `max_visited` vertices; returns the live vertices
+/// found (#21). The queue holds vertex ids only; `outs` reads a vertex's
+/// neighbours when it is expanded.
 fn expand_deleted<V: Copy + Eq + Hash, P>(
-    seeds: Vec<(V, P)>,
+    seeds: Vec<V>,
     visited: &mut HashSet<V>,
-    cap: Option<usize>,
+    (cap, max_visited): (Option<usize>, usize),
     mut probe: impl FnMut(V) -> Probe<P>,
-    mut outs: impl FnMut(&P) -> Vec<V>,
+    mut outs: impl FnMut(V) -> Vec<V>,
 ) -> Vec<(V, P)> {
     let mut queue = VecDeque::from(seeds);
     let mut found = Vec::new();
     let mut expanded = 0_usize;
-    while let Some((_, w)) = queue.pop_front() {
+    while let Some(w) = queue.pop_front() {
         if cap.is_some_and(|cap| expanded >= cap) {
             break;
         }
         expanded += 1;
-        for x in outs(&w) {
+        for x in outs(w) {
+            if visited.len() >= max_visited {
+                return found;
+            }
             if !visited.insert(x) {
                 continue;
             }
             match probe(x) {
                 Probe::Missing => {}
                 Probe::Live(p) => found.push((x, p)),
-                Probe::Deleted(p) => queue.push_back((x, p)),
+                Probe::Deleted => queue.push_back(x),
             }
         }
         if !found.is_empty() {
@@ -416,9 +447,11 @@ struct Recorder {
 }
 
 impl Recorder {
-    /// Estimated bytes per recorded list besides its entries: the map entry
-    /// and its share of the check's visited set and queue.
-    const ENTRY: usize = 96;
+    /// Estimated bytes per recorded list besides its elements: the map slot
+    /// with the hash table's spare capacity (up to about 2.3 slots per entry
+    /// after growth), the list's allocation overhead, and the vertex's share
+    /// of the visited sets and queues that the check allocates.
+    const ENTRY: usize = 192;
 
     fn new(limit: usize) -> Self {
         Self {
@@ -436,20 +469,24 @@ impl Recorder {
         if self.skipped.is_some() {
             return false;
         }
-        self.bytes = self.bytes.saturating_add(Self::ENTRY + size_of_val(outs));
+        self.bytes = self
+            .bytes
+            .saturating_add(Self::ENTRY + size_of_val(outs).next_multiple_of(16));
         if self.bytes > self.limit {
             self.skip("maintenance_work_mem is too small to hold the neighbour lists");
             return false;
         }
         true
     }
-    fn record_before(&mut self, u: (u32, u16), outs: Vec<(u32, u16)>) {
+    fn record_before(&mut self, u: (u32, u16), mut outs: Vec<(u32, u16)>) {
         if self.charge(&outs) {
+            outs.shrink_to_fit();
             self.before.insert(u, outs);
         }
     }
-    fn record_after(&mut self, u: (u32, u16), live: bool, outs: Vec<(u32, u16)>) {
+    fn record_after(&mut self, u: (u32, u16), live: bool, mut outs: Vec<(u32, u16)>) {
         if self.charge(&outs) {
+            outs.shrink_to_fit();
             self.after.insert(u, (live, outs));
         }
     }
@@ -625,28 +662,37 @@ mod tests {
             match self.live.get(v) {
                 None => Probe::Missing,
                 Some(true) => Probe::Live(v),
-                Some(false) => Probe::Deleted(v),
+                Some(false) => Probe::Deleted,
             }
+        }
+        fn expand(&self, u: usize, first: &[usize], cap: Option<usize>) -> Vec<usize> {
+            self.expand_bounded(u, first, cap, usize::MAX)
         }
         /// Expands from `u`, whose neighbours `first` were all deleted and
         /// were expanded once already (two-level repair).
-        fn expand(&self, u: usize, first: &[usize], cap: Option<usize>) -> Vec<usize> {
+        fn expand_bounded(
+            &self,
+            u: usize,
+            first: &[usize],
+            cap: Option<usize>,
+            max_visited: usize,
+        ) -> Vec<usize> {
             let mut visited = HashSet::from([u]);
             visited.extend(first.iter().copied());
             let mut seeds = Vec::new();
             for &f in first {
                 for &v in &self.outs[f] {
                     if visited.insert(v) && !self.live.get(v).copied().unwrap_or(true) {
-                        seeds.push((v, v));
+                        seeds.push(v);
                     }
                 }
             }
             let mut found = expand_deleted(
                 seeds,
                 &mut visited,
-                cap,
+                (cap, max_visited),
                 |v| self.probe(v),
-                |&w| self.outs[w].clone(),
+                |w| self.outs.get(w).cloned().unwrap_or_default(),
             )
             .into_iter()
             .map(|(v, _)| v)
@@ -685,6 +731,25 @@ mod tests {
         // The cap counts expanded deleted vertices; 2..=100 are 99.
         assert_eq!(g.expand(0, &[1], Some(99)), vec![101]);
         assert_eq!(g.expand(0, &[1], Some(98)), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn wide_frontier_is_bounded() {
+        // 0 -> 1 -> {2..=1001} (deleted), each -> v + 1000 (deleted), and only
+        // 3000 is live, behind the second layer.
+        let mut g = Graph::new(3001);
+        g.live[3000] = true;
+        g.outs[0] = vec![1];
+        g.outs[1] = (2..=1001).collect();
+        for v in 2..=1001 {
+            g.outs[v] = vec![v + 1000];
+        }
+        g.outs[2001] = vec![3000];
+        // Unbounded, the search crosses both layers.
+        assert_eq!(g.expand(0, &[1], None), vec![3000]);
+        // With room for 1500 visited vertices it stops in the second layer,
+        // even for the start vertex (no cap), and finds nothing.
+        assert_eq!(g.expand_bounded(0, &[1], None, 1500), Vec::<usize>::new());
     }
 
     #[test]
@@ -756,11 +821,11 @@ mod tests {
 
     #[test]
     fn recorder_memory_limit() {
-        let mut r = Recorder::new(2 * Recorder::ENTRY + 16);
+        let mut r = Recorder::new(2 * (Recorder::ENTRY + 16));
         r.record_before((1, 1), vec![(1, 2)]);
         r.record_after((1, 1), true, vec![(1, 2)]);
         assert!(matches!(r.finish((1, 1)), Reachability::Checked { .. }));
-        let mut r = Recorder::new(2 * Recorder::ENTRY + 16);
+        let mut r = Recorder::new(2 * (Recorder::ENTRY + 16));
         r.record_before((1, 1), vec![(1, 2)]);
         r.record_after((1, 1), true, vec![(1, 2)]);
         r.record_before((1, 2), vec![]);
