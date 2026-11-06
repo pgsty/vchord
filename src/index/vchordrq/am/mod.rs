@@ -562,6 +562,24 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     scan
 }
 
+/// Prefiltering evaluates the executor's qual inside the index scan, and the
+/// executor evaluates it again on returned rows. Keep quals with volatile
+/// functions or SubPlans (whose plans `contain_volatile_functions` does not
+/// inspect) in the executor only (#34).
+unsafe fn prefilter_safe(hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>) -> bool {
+    let Some(hack) = hack else {
+        return true;
+    };
+    unsafe {
+        let plan = (*hack.as_ptr()).ss.ps.plan;
+        if plan.is_null() {
+            return true;
+        }
+        let qual = (*plan).qual.cast::<pgrx::pg_sys::Node>();
+        !(pgrx::pg_sys::contain_volatile_functions(qual) || pgrx::pg_sys::contain_subplans(qual))
+    }
+}
+
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn amrescan(
     scan: pgrx::pg_sys::IndexScanDesc,
@@ -609,7 +627,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             maxsim_threshold: gucs::vchordrq_maxsim_threshold((*scan).indexRelation),
             io_search: gucs::vchordrq_io_search(),
             io_rerank: gucs::vchordrq_io_rerank(),
-            prefilter: gucs::vchordrq_prefilter(),
+            prefilter: gucs::vchordrq_prefilter() && prefilter_safe(scanner.hack),
         };
         let fetcher = {
             let hack = scanner.hack;

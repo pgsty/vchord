@@ -9,7 +9,6 @@
 pub mod am;
 mod build;
 pub mod dispatch;
-mod filter;
 pub mod opclass;
 mod scanners;
 pub mod types;

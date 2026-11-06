@@ -10,7 +10,7 @@ use crate::index::fetcher::*;
 use crate::index::opclass::Sphere;
 use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordrq::dispatch::*;
-use crate::index::vchordrq::filter::filter;
+use index::filter::filter;
 use crate::index::vchordrq::opclass::Opfamily;
 use crate::index::vchordrq::scanners::SearchOptions;
 use crate::recorder::{Recorder, text};
