@@ -210,7 +210,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     for element @ (Reverse(dis_c), AlwaysEqual((_, (u, payload_u)))) in iter.by_ref() {
         if payload_u.is_none() && u != s {
             passed += 1;
-            if passed > DELETED_TRAVERSAL_LIMIT {
+            if passed > DELETED_TRAVERSAL_FACTOR * ef as usize {
                 break;
             }
             continue;
@@ -279,6 +279,10 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             stale.push(u);
         }
     }
+    // A neighbour validated by its backlink was live after this list was
+    // written. Freeing it later needs a VACUUM that marks it and then runs a
+    // complete edge-repair pass before freeing anything; that pass visits
+    // this vertex and repairs the edge. So only the stale ones need care.
     if stale.is_empty() {
         return;
     }
@@ -286,6 +290,8 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     // concurrent VACUUM before their backlinks were placed: take them out of
     // the new vertex's list again, so it keeps no edge to a freed vertex. If
     // none is left, link through the start vertex, which is never freed.
+    // (Matching by slot can also drop an edge to a vertex that reused a
+    // freed slot meanwhile; that edge was never chosen, so nothing is lost.)
     let mut fallback = None;
     if stale.len() == outs.len()
         && let Some(dis_s) = start_distance
@@ -299,10 +305,14 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     {
         fallback = Some((s, dis_s));
     }
-    // Retried while the list changes under us; stops if its tuple is gone.
-    while let Ok((neighbours_t, _, version)) =
-        crate::vectors::read_without_accessor::<R, O, _>((index, &pointers_t), copy_all)
-    {
+    // Retried while the list changes under us, a bounded number of times;
+    // stops if its tuple is gone.
+    for _ in 0..MAX_RETRIES {
+        let Ok((neighbours_t, _, version)) =
+            crate::vectors::read_without_accessor::<R, O, _>((index, &pointers_t), copy_all)
+        else {
+            break;
+        };
         let mut list = neighbours_t
             .iter()
             .copied()
@@ -324,9 +334,15 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     }
 }
 
-/// Deleted vertices an insertion may pass through, besides the `ef` live
-/// vertices it collects (#26).
-const DELETED_TRAVERSAL_LIMIT: usize = 4096;
+/// An insertion may pass through `DELETED_TRAVERSAL_FACTOR * ef` deleted
+/// vertices besides the `ef` live ones it collects (#26). This also bounds
+/// the candidates and visited vertices those passes add.
+const DELETED_TRAVERSAL_FACTOR: usize = 4;
+
+/// Recomputations of one neighbour list after concurrent changes before an
+/// insertion gives up on it (the edge is then left out, or left in for
+/// edge repair to handle).
+const MAX_RETRIES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backlink {
@@ -359,7 +375,7 @@ fn backlink<R: RelationRead + RelationWrite, O: Operator>(
 where
     R::Page: Page<Opaque = Opaque>,
 {
-    loop {
+    for _ in 0..MAX_RETRIES {
         let Ok((neighbours_u, _, version)) =
             crate::vectors::read_without_accessor::<R, O, _>((index, pointers_u), copy_all)
         else {
@@ -433,6 +449,9 @@ where
             Err(()) => return Backlink::Stale,
         }
     }
+    // The list kept changing; `u` is live, so the edge from the new vertex
+    // stays and only the backlink is skipped.
+    Backlink::Done
 }
 
 fn append_vertex_tuple<'b, R: RelationRead + RelationWrite>(

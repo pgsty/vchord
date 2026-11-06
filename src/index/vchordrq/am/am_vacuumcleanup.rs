@@ -29,7 +29,9 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     let index_relation = unsafe { (*info).index };
     let tuples = unsafe { sequential_vacuumcleanup(index_relation, || (), || ()) };
     unsafe {
-        // Compacted and skipped lists are both counted exactly.
+        // Compacted and skipped lists are both counted, each when it is
+        // visited; tuples inserted into a list after that are not, as in
+        // 1.2.0 (which counted during compaction) and in btree.
         (*stats).num_index_tuples = tuples as f64;
         (*stats).estimated_count = false;
         (*stats).num_pages = pgrx::pg_sys::RelationGetNumberOfBlocksInFork(

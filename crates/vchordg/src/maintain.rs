@@ -77,10 +77,11 @@ where
             reachability: Reachability::Skipped("the index is empty"),
         };
     };
-    let mut recorder = Recorder::new(memory_limit);
-    // Bounds the vertices one expansion may visit (its visited set and
-    // queue), the start vertex's included.
-    let max_visited = (memory_limit / EXPANSION_BYTES_PER_VERTEX).max(1);
+    // The recorded lists and one expansion share `maintenance_work_mem`,
+    // half each. The expansion bound covers its visited set and queue, the
+    // start vertex's included.
+    let mut recorder = Recorder::new(memory_limit / 2);
+    let max_visited = (memory_limit / 2 / EXPANSION_BYTES_PER_VERTEX).max(1);
     // do it's best to remove broken edges
     {
         let mut current = link;

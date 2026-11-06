@@ -397,6 +397,8 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     }
     unsafe {
         (*stats).num_pages = relation_pages((*info).index);
+        // Each vertex page is counted when it is visited; vertices inserted
+        // into a page after that are not, as in btree.
         (*stats).num_index_tuples = maintained.live as f64;
         (*stats).estimated_count = false;
     }
