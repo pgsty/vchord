@@ -72,6 +72,11 @@ fn _vchord_rabitq8_dequantize_to_vector(vector: Rabitq8Input) -> VectorOutput {
         result.push((base + c as f32) * scale);
     }
     rabitq::rotate::rotate_reversed_inplace(&mut result);
+    rabitq_io::check_dequantized(
+        "vector",
+        vector.dim(),
+        result.iter().all(|x| x.is_finite()),
+    );
     VectorOutput::new(VectBorrowed::new(&result))
 }
 
@@ -86,5 +91,11 @@ fn _vchord_rabitq8_dequantize_to_halfvec(vector: Rabitq8Input) -> HalfvecOutput 
     }
     rabitq::rotate::rotate_reversed_inplace(&mut result);
     let result = f16::vector_from_f32(&result);
+    // Narrowing to f16 overflows above 65504.
+    rabitq_io::check_dequantized(
+        "halfvec",
+        vector.dim(),
+        result.iter().all(|x| x.to_f32().is_finite()),
+    );
     HalfvecOutput::new(VectBorrowed::new(&result))
 }
