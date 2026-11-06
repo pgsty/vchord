@@ -138,6 +138,8 @@ impl Opfamily {
         Some(store)
     }
     pub unsafe fn input_sphere(self, datum: Datum) -> Option<Sphere<OwnedVector>> {
+        // A NULL sphere matches nothing; PostgreSQL rechecks it. A sphere
+        // with a NULL center or radius is malformed, as for the operators.
         if datum.is_null() {
             return None;
         }
@@ -146,23 +148,34 @@ impl Opfamily {
         let tuple = unsafe { PgHeapTuple::from_composite_datum(datum) };
         let center = match self {
             Self::VectorL2 | Self::VectorIp | Self::VectorCosine | Self::VectorMaxsim => {
-                let vector = tuple.get_by_index::<VectorOutput>(attno_1).unwrap()?;
+                let vector = tuple.get_by_index::<VectorOutput>(attno_1)
+                    .unwrap()
+                    .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Vecf32(vector.as_borrowed()))
             }
             Self::HalfvecL2 | Self::HalfvecIp | Self::HalfvecCosine | Self::HalfvecMaxsim => {
-                let vector = tuple.get_by_index::<HalfvecOutput>(attno_1).unwrap()?;
+                let vector = tuple.get_by_index::<HalfvecOutput>(attno_1)
+                    .unwrap()
+                    .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
             }
             Self::Rabitq8L2 | Self::Rabitq8Ip | Self::Rabitq8Cosine | Self::Rabitq8Maxsim => {
-                let vector = tuple.get_by_index::<Rabitq8Output>(attno_1).unwrap()?;
+                let vector = tuple.get_by_index::<Rabitq8Output>(attno_1)
+                    .unwrap()
+                    .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
             }
             Self::Rabitq4L2 | Self::Rabitq4Ip | Self::Rabitq4Cosine | Self::Rabitq4Maxsim => {
-                let vector = tuple.get_by_index::<Rabitq4Output>(attno_1).unwrap()?;
+                let vector = tuple.get_by_index::<Rabitq4Output>(attno_1)
+                    .unwrap()
+                    .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Rabitq4(vector.as_borrowed()))
             }
         };
-        let radius = tuple.get_by_index::<f32>(attno_2).unwrap()?;
+        let radius = tuple
+            .get_by_index::<f32>(attno_2)
+            .unwrap()
+            .unwrap_or_else(|| pgrx::error!("Bad input: empty radius at sphere"));
         Some(Sphere { center, radius })
     }
     pub unsafe fn input_vector(self, datum: Datum) -> Option<OwnedVector> {

@@ -1,0 +1,138 @@
+# vchordrq dropped NULL sphere keys without asking PostgreSQL to recheck, so
+# rows came back that the qual excludes (#20). A sphere with a NULL center or
+# radius must fail as it does for the operators in a sequential scan.
+
+statement ok
+CREATE TABLE rq_sphere_null (id int, v vector(3));
+
+statement ok
+INSERT INTO rq_sphere_null SELECT i, ARRAY[i, i, i]::real[]::vector FROM generate_series(1, 100) i;
+
+statement ok
+CREATE INDEX rq_sphere_null_v ON rq_sphere_null USING vchordrq (v vector_l2_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET plan_cache_mode = force_generic_plan;
+
+statement ok
+PREPARE rq_sphere_null_q(sphere_vector) AS
+SELECT array_agg(id) FROM (
+  SELECT id FROM rq_sphere_null WHERE v <<->> $1 ORDER BY v <-> '[1,1,1]' LIMIT 3
+) s;
+
+query T
+EXPLAIN (COSTS OFF) EXECUTE rq_sphere_null_q(NULL);
+----
+Aggregate
+  ->  Limit
+        ->  Index Scan using rq_sphere_null_v on rq_sphere_null
+              Index Cond: (v <<->> $1)
+              Order By: (v <-> '[1,1,1]'::vector)
+
+# The ORDER BY vector drives the scan; the null sphere must still exclude all.
+query T
+EXECUTE rq_sphere_null_q(NULL);
+----
+NULL
+
+query T
+EXECUTE rq_sphere_null_q(sphere('[1,1,1]'::vector, 2));
+----
+{1,2}
+
+statement ok
+DEALLOCATE rq_sphere_null_q;
+
+statement ok
+RESET plan_cache_mode;
+
+# A null sphere next to a valid one: the null one excludes everything.
+query I
+SELECT count(*) FROM rq_sphere_null
+WHERE v <<->> sphere('[5,5,5]'::vector, 10) AND v <<->> (NULL::sphere_vector);
+----
+0
+
+# Two valid spheres: only the intersection survives the recheck.
+query I
+SELECT id FROM rq_sphere_null
+WHERE v <<->> sphere('[5,5,5]'::vector, 3) AND v <<->> sphere('[6,6,6]'::vector, 1)
+ORDER BY id;
+----
+6
+
+query I
+SELECT id FROM rq_sphere_null
+WHERE v <<->> sphere('[5,5,5]'::vector, 3) AND v <<->> sphere('[6,6,6]'::vector, 1)
+ORDER BY v <-> '[0,0,0]';
+----
+6
+
+# Malformed spheres raise the operator's errors in index scans ...
+statement error empty center
+SELECT id FROM rq_sphere_null WHERE v <<->> sphere(NULL::vector, 1) ORDER BY v <-> '[1,1,1]' LIMIT 3;
+
+statement error empty radius
+SELECT id FROM rq_sphere_null WHERE v <<->> sphere('[1,1,1]'::vector, NULL) ORDER BY v <-> '[1,1,1]' LIMIT 3;
+
+statement error empty center
+SELECT count(*) FROM rq_sphere_null WHERE v <<->> sphere(NULL::vector, 1);
+
+# ... as in sequential scans.
+statement ok
+SET enable_seqscan = on;
+
+statement ok
+SET enable_indexscan = off;
+
+statement ok
+SET enable_bitmapscan = off;
+
+statement error empty center
+SELECT count(*) FROM rq_sphere_null WHERE v <<->> sphere(NULL::vector, 1);
+
+statement error empty radius
+SELECT count(*) FROM rq_sphere_null WHERE v <<->> sphere('[1,1,1]'::vector, NULL);
+
+statement ok
+RESET enable_indexscan;
+
+statement ok
+RESET enable_bitmapscan;
+
+statement ok
+DROP TABLE rq_sphere_null;
+
+# The same malformed spheres in vchordg.
+statement ok
+CREATE TABLE g_sphere_null (id int, v vector(3));
+
+statement ok
+INSERT INTO g_sphere_null SELECT i, ARRAY[i, i, i]::real[]::vector FROM generate_series(1, 100) i;
+
+statement ok
+CREATE INDEX g_sphere_null_v ON g_sphere_null USING vchordg (v vector_l2_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+statement error empty center
+SELECT id FROM g_sphere_null WHERE v <<->> sphere(NULL::vector, 1) ORDER BY v <-> '[1,1,1]' LIMIT 3;
+
+statement error empty radius
+SELECT count(*) FROM g_sphere_null WHERE v <<->> sphere('[1,1,1]'::vector, NULL);
+
+query I
+SELECT count(*) FROM g_sphere_null
+WHERE v <<->> sphere('[5,5,5]'::vector, 10) AND v <<->> (NULL::sphere_vector);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE g_sphere_null;
