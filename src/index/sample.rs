@@ -212,17 +212,8 @@ impl Tuple for HeapTuple<'_> {
 }
 
 fn sample(n: u32) -> Box<dyn Iterator<Item = u32>> {
-    let width = (n.ilog2() + 1).next_multiple_of(2);
-    let key_0 = rand::RngExt::random(&mut rand::rng());
-    let key_1 = rand::RngExt::random(&mut rand::rng());
-    let secret = move |round: u32, x: u32| {
-        let buffer = [round.to_le_bytes(), x.to_le_bytes(), key_0, key_1];
-        wyhash::wyhash(buffer.as_flattened(), 0) as u32
-    };
-    let permutation = (0..1 << width)
-        .map(move |i| feistel::feistel(width, i, 8, secret))
-        .filter(move |&x| x < n);
-    Box::new(permutation)
+    let key: [u8; 8] = rand::RngExt::random(&mut rand::rng());
+    Box::new(feistel::sample(n, key))
 }
 
 pub struct State {
