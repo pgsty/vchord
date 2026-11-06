@@ -1,0 +1,206 @@
+# The rabitq8/rabitq4 cosine operator reported -cos while both index access
+# methods (and vector/halfvec) report the cosine distance 1 - cos, so sphere
+# predicates returned different rows with and without an index (#22).
+
+statement ok
+CREATE TABLE rq_cos_basis (name text, v vector(64));
+
+statement ok
+INSERT INTO rq_cos_basis VALUES
+  ('x', array_cat(ARRAY[1, 0]::real[], array_fill(0::real, ARRAY[62]))::vector),
+  ('y', array_cat(ARRAY[0, 1]::real[], array_fill(0::real, ARRAY[62]))::vector),
+  ('-x', array_cat(ARRAY[-1, 0]::real[], array_fill(0::real, ARRAY[62]))::vector);
+
+# Same direction ~0, orthogonal ~1, opposite ~2 (approximate estimates).
+query TTT
+SELECT a.name, b.name,
+       abs((quantize_to_rabitq8(a.v) <=> quantize_to_rabitq8(b.v)) - (a.v <=> b.v)) < 0.05
+FROM rq_cos_basis a, rq_cos_basis b WHERE a.name = 'x' ORDER BY b.name;
+----
+x -x t
+x x t
+x y t
+
+query TTT
+SELECT a.name, b.name,
+       abs((quantize_to_rabitq4(a.v) <=> quantize_to_rabitq4(b.v)) - (a.v <=> b.v)) < 0.15
+FROM rq_cos_basis a, rq_cos_basis b WHERE a.name = 'x' ORDER BY b.name;
+----
+x -x t
+x x t
+x y t
+
+# Unit vectors in a plane at 0, 5, ..., 180 degrees. Cosine distances to the
+# 0-degree vector: 25 degrees -> 0.094, 30 degrees -> 0.134. A radius of
+# 0.115 is far from both, so quantization error cannot move rows across it.
+statement ok
+CREATE TABLE rq_cos (id int, v8 rabitq8(64), v4 rabitq4(64));
+
+statement ok
+INSERT INTO rq_cos
+SELECT i, quantize_to_rabitq8(v), quantize_to_rabitq4(v)
+FROM (
+  SELECT i, array_cat(ARRAY[cos(radians(i * 5)), sin(radians(i * 5))]::real[], array_fill(0::real, ARRAY[62]))::vector AS v
+  FROM generate_series(0, 36) i
+) s;
+
+statement ok
+CREATE TABLE rq_cos_q AS SELECT
+  quantize_to_rabitq8(array_cat(ARRAY[1, 0]::real[], array_fill(0::real, ARRAY[62]))::vector) AS q8,
+  quantize_to_rabitq4(array_cat(ARRAY[1, 0]::real[], array_fill(0::real, ARRAY[62]))::vector) AS q4;
+
+query I
+SELECT array_agg(id ORDER BY id) FROM rq_cos, rq_cos_q WHERE v8 <<=>> sphere(q8, 0.115);
+----
+{0,1,2,3,4,5}
+
+query I
+SELECT array_agg(id ORDER BY id) FROM rq_cos, rq_cos_q WHERE v4 <<=>> sphere(q4, 0.115);
+----
+{0,1,2,3,4,5}
+
+# All values are cosine distances in [0, 2].
+query T
+SELECT min(v8 <=> q8) > -0.01 AND max(v8 <=> q8) < 2.01 AND min(v4 <=> q4) > -0.05 AND max(v4 <=> q4) < 2.05
+FROM rq_cos, rq_cos_q;
+----
+t
+
+statement ok
+CREATE INDEX rq_cos_rq8 ON rq_cos USING vchordrq (v8 rabitq8_cosine_ops);
+
+statement ok
+CREATE INDEX rq_cos_rq4 ON rq_cos USING vchordrq (v4 rabitq4_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT array_agg(id ORDER BY id) FROM rq_cos WHERE v8 <<=>> sphere((SELECT q8 FROM rq_cos_q), 0.115);
+----
+{0,1,2,3,4,5}
+
+query I
+SELECT array_agg(id ORDER BY id) FROM rq_cos WHERE v4 <<=>> sphere((SELECT q4 FROM rq_cos_q), 0.115);
+----
+{0,1,2,3,4,5}
+
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM rq_cos WHERE v8 <<=>> sphere((SELECT q8 FROM rq_cos_q), 0.115)
+  ORDER BY v8 <=> (SELECT q8 FROM rq_cos_q)
+) s;
+----
+{0,1,2,3,4,5}
+
+statement ok
+DROP INDEX rq_cos_rq8, rq_cos_rq4;
+
+statement ok
+CREATE INDEX rq_cos_g8 ON rq_cos USING vchordg (v8 rabitq8_cosine_ops);
+
+statement ok
+CREATE INDEX rq_cos_g4 ON rq_cos USING vchordg (v4 rabitq4_cosine_ops);
+
+query I
+SELECT array_agg(id ORDER BY id) FROM rq_cos WHERE v8 <<=>> sphere((SELECT q8 FROM rq_cos_q), 0.115);
+----
+{0,1,2,3,4,5}
+
+query I
+SELECT array_agg(id ORDER BY id) FROM rq_cos WHERE v4 <<=>> sphere((SELECT q4 FROM rq_cos_q), 0.115);
+----
+{0,1,2,3,4,5}
+
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM rq_cos WHERE v8 <<=>> sphere((SELECT q8 FROM rq_cos_q), 0.115)
+  ORDER BY v8 <=> (SELECT q8 FROM rq_cos_q)
+) s;
+----
+{0,1,2,3,4,5}
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE rq_cos_basis, rq_cos, rq_cos_q;
+
+# Zero vectors have no direction. Their cosine distances are unchanged by #22
+# apart from the uniform shift, and still differ between the scalar operator
+# (an estimate from the mid-lattice code), vchordrq (1) and vchordg (0.5); this
+# records the current placement so that a future change is deliberate.
+statement ok
+CREATE TABLE rq_cos_zero (id int, v8 rabitq8(64), v4 rabitq4(64));
+
+statement ok
+INSERT INTO rq_cos_zero VALUES (0,
+  quantize_to_rabitq8(array_fill(0::real, ARRAY[64])::vector),
+  quantize_to_rabitq4(array_fill(0::real, ARRAY[64])::vector));
+
+statement ok
+INSERT INTO rq_cos_zero
+SELECT i, quantize_to_rabitq8(v), quantize_to_rabitq4(v)
+FROM (
+  SELECT i, array_cat(ARRAY[cos(radians(i * 25)), sin(radians(i * 25))]::real[], array_fill(0::real, ARRAY[62]))::vector AS v
+  FROM generate_series(1, 6) i
+) s;
+
+statement ok
+CREATE TABLE rq_cos_zero_q AS SELECT
+  quantize_to_rabitq8(array_cat(ARRAY[1, 0]::real[], array_fill(0::real, ARRAY[62]))::vector) AS q8,
+  quantize_to_rabitq4(array_cat(ARRAY[1, 0]::real[], array_fill(0::real, ARRAY[62]))::vector) AS q4;
+
+query T
+SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v8 <=> (SELECT q8 FROM rq_cos_zero_q) LIMIT 7) s;
+----
+{1,2,3,0,4,5,6}
+
+query T
+SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v4 <=> (SELECT q4 FROM rq_cos_zero_q) LIMIT 7) s;
+----
+{1,2,3,0,4,5,6}
+
+statement ok
+CREATE INDEX rq_cos_zero_rq8 ON rq_cos_zero USING vchordrq (v8 rabitq8_cosine_ops);
+
+statement ok
+CREATE INDEX rq_cos_zero_rq4 ON rq_cos_zero USING vchordrq (v4 rabitq4_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query T
+SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v8 <=> (SELECT q8 FROM rq_cos_zero_q) LIMIT 7) s;
+----
+{1,2,3,0,4,5,6}
+
+query T
+SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v4 <=> (SELECT q4 FROM rq_cos_zero_q) LIMIT 7) s;
+----
+{1,2,3,0,4,5,6}
+
+statement ok
+DROP INDEX rq_cos_zero_rq8, rq_cos_zero_rq4;
+
+statement ok
+CREATE INDEX rq_cos_zero_g8 ON rq_cos_zero USING vchordg (v8 rabitq8_cosine_ops);
+
+statement ok
+CREATE INDEX rq_cos_zero_g4 ON rq_cos_zero USING vchordg (v4 rabitq4_cosine_ops);
+
+query T
+SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v8 <=> (SELECT q8 FROM rq_cos_zero_q) LIMIT 7) s;
+----
+{1,2,0,3,4,5,6}
+
+query T
+SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v4 <=> (SELECT q4 FROM rq_cos_zero_q) LIMIT 7) s;
+----
+{1,2,0,3,4,5,6}
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE rq_cos_zero, rq_cos_zero_q;

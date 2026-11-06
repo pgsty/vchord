@@ -300,8 +300,11 @@ impl VectorBorrowed for Rabitq8Borrowed<'_> {
     fn operator_cos(self, rhs: Self) -> Distance {
         let dim = self.dim();
         let sum = rabitq::byte::binary::accumulate(self.packed_code, rhs.packed_code);
+        // `half_process_cos` estimates `-cos`; report the cosine distance
+        // `1 - cos` like `VectBorrowed::operator_cos` and both index access
+        // methods do. Zero vectors keep their previous (shifted) estimate.
         Distance::from_f32(
-            rabitq::byte::binary::half_process_cos(
+            1.0 + rabitq::byte::binary::half_process_cos(
                 dim,
                 sum,
                 rabitq::byte::CodeMetadata {
