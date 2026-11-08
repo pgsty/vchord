@@ -47,9 +47,10 @@ SELECT id FROM interrupts WHERE interrupts_reject(id) ORDER BY v <-> '[0,0,0,0,0
 statement ok
 RESET statement_timeout;
 
-# Canceled long before all 120000 candidates were evaluated.
+# Canceled long before all 120000 candidates were evaluated. On a loaded
+# machine the timeout may fire before the first qual calls nextval.
 query T
-SELECT currval('interrupts_seq') < 60000;
+SELECT NOT is_called OR last_value < 60000 FROM interrupts_seq;
 ----
 t
 

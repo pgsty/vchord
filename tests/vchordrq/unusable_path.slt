@@ -64,8 +64,11 @@ RESET seq_page_cost;
 statement ok
 RESET cpu_tuple_cost;
 
-# vchordrq.enable_scan = off counts as disabled like the built-in settings, so
-# with both disabled the cheaper plan wins.
+# A disabled vector scan loses to an enabled sequential scan. With both
+# disabled PostgreSQL 14-17 may choose the cheaper usable path; it must run.
+statement ok
+RESET enable_seqscan;
+
 statement ok
 SET vchordrq.enable_scan = off;
 
@@ -75,12 +78,15 @@ SELECT unusable_path_plan($$SELECT id FROM unusable_path ORDER BY v <-> '[1,1,1]
 f
 
 statement ok
-RESET vchordrq.enable_scan;
+SET enable_seqscan = off;
 
 query I
 SELECT id FROM unusable_path ORDER BY v <-> '[1,1,1]' LIMIT 1;
 ----
 1
+
+statement ok
+RESET vchordrq.enable_scan;
 
 statement ok
 DROP INDEX unusable_path_rq;
@@ -97,12 +103,23 @@ SELECT count(*) FROM unusable_path;
 1000
 
 statement ok
+RESET enable_seqscan;
+
+statement ok
 SET vchordg.enable_scan = off;
 
 query T
 SELECT unusable_path_plan($$SELECT id FROM unusable_path ORDER BY v <-> '[1,1,1]' LIMIT 1$$) LIKE '%Index Scan using unusable_path_g%';
 ----
 f
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT id FROM unusable_path ORDER BY v <-> '[1,1,1]' LIMIT 1;
+----
+1
 
 statement ok
 RESET vchordg.enable_scan;
