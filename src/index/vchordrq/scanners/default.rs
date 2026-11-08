@@ -115,6 +115,11 @@ impl SearchBuilder for DefaultBuilder {
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
+        // A zero/non-finite cosine query has no direction. Cosine indexes
+        // contain only defined vectors and return no neighbours for it.
+        if !opfamily.valid_cosine_query(&vector) {
+            return Box::new(std::iter::empty());
+        }
         let search_hints = Hints::default().full(true);
         let rerank_hints = Hints::default().full(false);
         let make_h1_plain_prefetcher = MakeH1PlainPrefetcher { index };

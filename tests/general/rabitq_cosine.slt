@@ -126,10 +126,8 @@ RESET enable_seqscan;
 statement ok
 DROP TABLE rq_cos_basis, rq_cos, rq_cos_q;
 
-# Zero vectors have no direction. Their cosine distances are unchanged by #22
-# apart from the uniform shift, and still differ between the scalar operator
-# (an estimate from the mid-lattice code), vchordrq (1) and vchordg (0.5); this
-# records the current placement so that a future change is deliberate.
+# Zero vectors have no direction. Scalar sorting places NaN last; cosine
+# indexes exclude undefined vectors, and return only the six finite rows.
 statement ok
 CREATE TABLE rq_cos_zero (id int, v8 rabitq8(64), v4 rabitq4(64));
 
@@ -154,12 +152,12 @@ CREATE TABLE rq_cos_zero_q AS SELECT
 query T
 SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v8 <=> (SELECT q8 FROM rq_cos_zero_q) LIMIT 7) s;
 ----
-{1,2,3,0,4,5,6}
+{1,2,3,4,5,6,0}
 
 query T
 SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v4 <=> (SELECT q4 FROM rq_cos_zero_q) LIMIT 7) s;
 ----
-{1,2,3,0,4,5,6}
+{1,2,3,4,5,6,0}
 
 statement ok
 CREATE INDEX rq_cos_zero_rq8 ON rq_cos_zero USING vchordrq (v8 rabitq8_cosine_ops);
@@ -173,12 +171,12 @@ SET enable_seqscan = off;
 query T
 SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v8 <=> (SELECT q8 FROM rq_cos_zero_q) LIMIT 7) s;
 ----
-{1,2,3,0,4,5,6}
+{1,2,3,4,5,6}
 
 query T
 SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v4 <=> (SELECT q4 FROM rq_cos_zero_q) LIMIT 7) s;
 ----
-{1,2,3,0,4,5,6}
+{1,2,3,4,5,6}
 
 statement ok
 DROP INDEX rq_cos_zero_rq8, rq_cos_zero_rq4;
@@ -192,12 +190,12 @@ CREATE INDEX rq_cos_zero_g4 ON rq_cos_zero USING vchordg (v4 rabitq4_cosine_ops)
 query T
 SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v8 <=> (SELECT q8 FROM rq_cos_zero_q) LIMIT 7) s;
 ----
-{1,2,0,3,4,5,6}
+{1,2,3,4,5,6}
 
 query T
 SELECT array_agg(id) FROM (SELECT id FROM rq_cos_zero ORDER BY v4 <=> (SELECT q4 FROM rq_cos_zero_q) LIMIT 7) s;
 ----
-{1,2,0,3,4,5,6}
+{1,2,3,4,5,6}
 
 statement ok
 RESET enable_seqscan;

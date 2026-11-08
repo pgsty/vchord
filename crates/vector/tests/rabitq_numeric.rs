@@ -111,3 +111,82 @@ fn zero_vector() {
         assert_eq!(u4.as_borrowed().sum_of_x2(), 1.0);
     }
 }
+
+#[test]
+fn zero_cosine_is_undefined() {
+    let zero8 = rabitq8(&[0.0, 0.0]);
+    let unit8 = rabitq8(&[1.0, 0.0]);
+    let zero4 = rabitq4(&[0.0, 0.0]);
+    let unit4 = rabitq4(&[1.0, 0.0]);
+    assert!(
+        zero8
+            .as_borrowed()
+            .operator_cos(unit8.as_borrowed())
+            .to_f32()
+            .is_nan()
+    );
+    assert!(
+        unit8
+            .as_borrowed()
+            .operator_cos(zero8.as_borrowed())
+            .to_f32()
+            .is_nan()
+    );
+    assert!(
+        zero4
+            .as_borrowed()
+            .operator_cos(unit4.as_borrowed())
+            .to_f32()
+            .is_nan()
+    );
+    assert!(
+        unit4
+            .as_borrowed()
+            .operator_cos(zero4.as_borrowed())
+            .to_f32()
+            .is_nan()
+    );
+}
+
+/// The cosine operator classes store a vector only if `has_direction`, so it
+/// must agree with what `function_normalize` can scale (#22): squares that
+/// overflow or underflow f32 leave a vector without a usable norm even though
+/// some element is a finite non-zero.
+#[test]
+fn direction_matches_normalize() {
+    use vector::vect::VectBorrowed;
+    let cases: [(&[f32], bool); 5] = [
+        (&[3.0, 4.0], true),
+        (&[0.0, 0.0], false),
+        (&[1e20, 0.0], false),
+        (&[1e-23, 1e-23, 1e-23], false),
+        (&[f32::NAN, 1.0], false),
+    ];
+    for (x, expected) in cases {
+        let v = VectBorrowed::new(x);
+        assert_eq!(v.has_direction(), expected, "{x:?}");
+        let normalized = v.function_normalize();
+        let norm = f32::reduce_sum_of_x2(normalized.slice()).sqrt();
+        if expected {
+            assert!((norm - 1.0).abs() < 1e-6, "{x:?} -> {norm}");
+        } else {
+            // Left unchanged rather than filled with NaN or infinities.
+            assert_eq!(
+                normalized
+                    .slice()
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect::<Vec<_>>(),
+                x.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "{x:?}"
+            );
+        }
+    }
+    let zero = rabitq8(&[0.0, 0.0]);
+    let unit = rabitq8(&[1.0, 0.0]);
+    let huge = rabitq8(&[1e20, 0.0]);
+    assert!(!zero.as_borrowed().has_direction());
+    assert!(unit.as_borrowed().has_direction());
+    assert!(!huge.as_borrowed().has_direction());
+    assert!(!rabitq4(&[1e-23, 1e-23]).as_borrowed().has_direction());
+}
