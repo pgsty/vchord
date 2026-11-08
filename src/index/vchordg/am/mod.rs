@@ -436,6 +436,31 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
             pgrx::debug1!("vchordg index \"{name}\": reachability check skipped: {reason}");
         }
     }
+    if let Some(reason) = maintained.retained {
+        pgrx::warning!(
+            "vchordg index \"{name}\": VACUUM kept deleted vertices because {reason}; run VACUUM again with a larger maintenance_work_mem"
+        );
+    }
+    if maintained.broken > 0 {
+        // A warning, not an error: an error would fail the whole VACUUM and
+        // keep the table from being cleaned up and frozen.
+        pgrx::pg_sys::panic::ErrorReport::new(
+            pgrx::PgSqlErrorCode::ERRCODE_INDEX_CORRUPTED,
+            format!(
+                "vchordg index \"{name}\" has {} damaged vertex references; VACUUM skipped them",
+                maintained.broken
+            ),
+            "amvacuumcleanup",
+        )
+        .set_hint("REINDEX the index.")
+        .report(pgrx::PgLogLevel::WARNING);
+    }
+    if maintained.stale_edges > 0 {
+        pgrx::debug1!(
+            "vchordg index \"{name}\": VACUUM removed {} edges to freed vertices",
+            maintained.stale_edges
+        );
+    }
     unsafe {
         (*stats).num_pages = relation_pages((*info).index);
         // Each vertex page is counted when it is visited; vertices inserted

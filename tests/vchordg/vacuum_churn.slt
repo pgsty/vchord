@@ -1,0 +1,116 @@
+# Repeated delete/VACUUM/insert cycles must reuse the space of deleted
+# vertices (#21). Edge repair prunes the live boundary of a deleted region to
+# the index degree and frees the region; it must not keep tombstones just
+# because that boundary is wider than `m`, which it nearly always is.
+
+statement ok
+SELECT setseed(0.37);
+
+statement ok
+CREATE TABLE vchordg_churn (id int, v vector(16)) WITH (autovacuum_enabled = off);
+
+statement ok
+INSERT INTO vchordg_churn
+SELECT i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::vector(16)
+FROM generate_series(1, 6000) i;
+
+statement ok
+CREATE INDEX vchordg_churn_idx ON vchordg_churn USING vchordg (v vector_l2_ops) WITH (options = $$m = 16$$);
+
+statement ok
+CREATE TEMP TABLE vchordg_churn_size (round int, size bigint);
+
+statement ok
+INSERT INTO vchordg_churn_size VALUES (0, pg_relation_size('vchordg_churn_idx'));
+
+# Five rounds, each replacing 10% of the rows with new ones.
+statement ok
+DELETE FROM vchordg_churn WHERE id % 10 = 1;
+
+statement ok
+VACUUM vchordg_churn;
+
+statement ok
+INSERT INTO vchordg_churn
+SELECT 10000 + i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::vector(16)
+FROM generate_series(1, 600) i;
+
+statement ok
+INSERT INTO vchordg_churn_size VALUES (1, pg_relation_size('vchordg_churn_idx'));
+
+statement ok
+DELETE FROM vchordg_churn WHERE id % 10 = 2;
+
+statement ok
+VACUUM vchordg_churn;
+
+statement ok
+INSERT INTO vchordg_churn
+SELECT 20000 + i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::vector(16)
+FROM generate_series(1, 600) i;
+
+statement ok
+DELETE FROM vchordg_churn WHERE id % 10 = 3;
+
+statement ok
+VACUUM vchordg_churn;
+
+statement ok
+INSERT INTO vchordg_churn
+SELECT 30000 + i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::vector(16)
+FROM generate_series(1, 600) i;
+
+statement ok
+DELETE FROM vchordg_churn WHERE id % 10 = 4;
+
+statement ok
+VACUUM vchordg_churn;
+
+statement ok
+INSERT INTO vchordg_churn
+SELECT 40000 + i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::vector(16)
+FROM generate_series(1, 600) i;
+
+statement ok
+DELETE FROM vchordg_churn WHERE id % 10 = 5;
+
+statement ok
+VACUUM vchordg_churn;
+
+# Every round frees what it deleted: the index count follows the table.
+query T
+SELECT reltuples::int = (SELECT count(*) FROM vchordg_churn) FROM pg_class WHERE relname = 'vchordg_churn_idx';
+----
+t
+
+statement ok
+INSERT INTO vchordg_churn
+SELECT 50000 + i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::vector(16)
+FROM generate_series(1, 600) i;
+
+statement ok
+INSERT INTO vchordg_churn_size VALUES (5, pg_relation_size('vchordg_churn_idx'));
+
+# Four more rounds after the first one grow the index by well under 10%.
+# Keeping the tombstones instead grows it by about 10% per round.
+query T
+SELECT (SELECT size FROM vchordg_churn_size WHERE round = 5)
+     < (SELECT size FROM vchordg_churn_size WHERE round = 1) * 1.1;
+----
+t
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM vchordg_churn ORDER BY v <-> array_fill(0.5::real, ARRAY[16])::vector(16) LIMIT 10
+) s;
+----
+10
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE vchordg_churn;
