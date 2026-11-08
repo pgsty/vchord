@@ -207,6 +207,10 @@ fn floating_f16_dispatch(c: &mut Criterion) {
             .map(|_| f16::_from_f32(rng.random_range(-1.0..=1.0)))
             .collect::<Vec<_>>();
         c.bench_function(
+            &format!("floating_f16::dispatch::reduce_sum_of_d2_approx::{n}"),
+            |b| b.iter(|| f16::reduce_sum_of_d2_approx(black_box(&x), black_box(&y))),
+        );
+        c.bench_function(
             &format!("floating_f16::dispatch::reduce_sum_of_x::{n}"),
             |b| b.iter(|| f16::reduce_sum_of_x(black_box(&x))),
         );

@@ -92,7 +92,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             head,
             LAccess::new(
                 O::Vector::unpack(vector),
-                O::DistanceAccessor::default_with_dimension(dim),
+                O::RoutingAccessor::default_with_dimension(dim),
             ),
         );
         let norm = meta_tuple.centroid_norm();
@@ -108,6 +108,9 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
 
     drop(meta_guard);
     let lut = (O::Vector::block_preprocess(vector),);
+    // Insertion only routes: approximate distances may pick a different list,
+    // but the residual code is built exactly against the chosen centroid by
+    // `O::build`, and no distance computed here is stored or used as a bound.
 
     let mut step = |state: State| {
         let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
@@ -141,7 +144,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
                     head,
                     LAccess::new(
                         O::Vector::unpack(vector),
-                        O::DistanceAccessor::default_with_dimension(dim),
+                        O::RoutingAccessor::default_with_dimension(dim),
                     ),
                 );
                 cache.push((Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first)));

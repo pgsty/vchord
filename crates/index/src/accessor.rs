@@ -17,6 +17,12 @@ use vector::vect::VectOwned;
 #[derive(Debug, Clone, Copy)]
 pub struct L2S;
 
+/// L2 routing distances may trade a small rounding error for throughput.
+/// Final reranking, sphere predicates and any lower bound the reranker trusts
+/// (such as vchordrq's residual `dis_f`) must use `L2S`.
+#[derive(Debug, Clone, Copy)]
+pub struct ApproximateL2S;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Dot;
 
@@ -380,6 +386,20 @@ impl Accessor2<f16, f16, (), ()> for DistanceAccessor<VectOwned<f16>, Dot> {
     #[inline(always)]
     fn finish(self, (): (), (): ()) -> Self::Output {
         Distance::from_f32(-self.0)
+    }
+}
+
+impl Accessor2<f16, f16, (), ()> for DistanceAccessor<VectOwned<f16>, ApproximateL2S> {
+    type Output = Distance;
+
+    #[inline(always)]
+    fn push(&mut self, target: &[f16], input: &[f16]) {
+        self.0 += f16::reduce_sum_of_d2_approx(target, input);
+    }
+
+    #[inline(always)]
+    fn finish(self, (): (), (): ()) -> Self::Output {
+        Distance::from_f32(self.0)
     }
 }
 

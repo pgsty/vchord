@@ -8,8 +8,8 @@
 
 use distance::Distance;
 use index_accessor::{
-    Accessor1, Accessor2, ByteDistanceAccessor, DefaultWithDimension, DistanceAccessor, Dot,
-    HalfbyteDistanceAccessor, L2S, RAccess,
+    Accessor1, Accessor2, ApproximateL2S, ByteDistanceAccessor, DefaultWithDimension,
+    DistanceAccessor, Dot, HalfbyteDistanceAccessor, L2S, RAccess,
 };
 use rabitq::bit::CodeMetadata;
 use rabitq::bit::binary::BinaryLut;
@@ -424,6 +424,29 @@ pub trait Operator: 'static + Debug + Copy {
             Output = Distance,
         >;
 
+    /// Query-centroid distances used only to choose which centroids to probe
+    /// (and which list an inserted vector joins). It may be approximate.
+    ///
+    /// It must never become `dis_f` for `block_access` / `binary_access` at a
+    /// level whose output reaches the reranker: in residual mode `dis_f` is
+    /// added to every candidate's lower bound with no error budget (a vector
+    /// equal to its centroid has `err = 0`), and the reranker emits a result
+    /// once no unvisited lower bound is smaller.
+    type RoutingAccessor: DefaultWithDimension
+        + Accessor2<
+            <Self::Vector as Vector>::Element,
+            <Self::Vector as Vector>::Element,
+            <Self::Vector as Vector>::Metadata,
+            <Self::Vector as Vector>::Metadata,
+            Output = Distance,
+        >;
+
+    /// Whether `RoutingAccessor` returns exactly what `DistanceAccessor`
+    /// returns on this CPU. If not, residual search recomputes the selected
+    /// centroids' distances with `DistanceAccessor` before using them as
+    /// `dis_f`.
+    fn routing_is_exact() -> bool;
+
     fn block_access(
         lut: &BlockLut,
         is_residual: bool,
@@ -459,6 +482,12 @@ impl Operator for Op<VectOwned<f32>, L2S> {
     type Vector = VectOwned<f32>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f32>, L2S>;
+
+    type RoutingAccessor = Self::DistanceAccessor;
+
+    fn routing_is_exact() -> bool {
+        true
+    }
 
     fn block_access(
         lut: &BlockLut,
@@ -538,6 +567,12 @@ impl Operator for Op<VectOwned<f32>, Dot> {
     type Vector = VectOwned<f32>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f32>, Dot>;
+
+    type RoutingAccessor = Self::DistanceAccessor;
+
+    fn routing_is_exact() -> bool {
+        true
+    }
 
     fn block_access(
         lut: &BlockLut,
@@ -620,6 +655,12 @@ impl Operator for Op<VectOwned<f16>, L2S> {
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f16>, L2S>;
 
+    type RoutingAccessor = DistanceAccessor<VectOwned<f16>, ApproximateL2S>;
+
+    fn routing_is_exact() -> bool {
+        f16::reduce_sum_of_d2_approx_is_exact()
+    }
+
     fn block_access(
         lut: &BlockLut,
         is_residual: bool,
@@ -699,6 +740,12 @@ impl Operator for Op<VectOwned<f16>, Dot> {
     type Vector = VectOwned<f16>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f16>, Dot>;
+
+    type RoutingAccessor = Self::DistanceAccessor;
+
+    fn routing_is_exact() -> bool {
+        true
+    }
 
     fn block_access(
         lut: &BlockLut,
@@ -782,6 +829,12 @@ impl Operator for Op<Rabitq8Owned, L2S> {
 
     type DistanceAccessor = ByteDistanceAccessor<Rabitq8Owned, L2S>;
 
+    type RoutingAccessor = Self::DistanceAccessor;
+
+    fn routing_is_exact() -> bool {
+        true
+    }
+
     fn block_access(
         lut: &BlockLut,
         is_residual: bool,
@@ -832,6 +885,12 @@ impl Operator for Op<Rabitq8Owned, Dot> {
     type Vector = Rabitq8Owned;
 
     type DistanceAccessor = ByteDistanceAccessor<Rabitq8Owned, Dot>;
+
+    type RoutingAccessor = Self::DistanceAccessor;
+
+    fn routing_is_exact() -> bool {
+        true
+    }
 
     fn block_access(
         lut: &BlockLut,
@@ -884,6 +943,12 @@ impl Operator for Op<Rabitq4Owned, L2S> {
 
     type DistanceAccessor = HalfbyteDistanceAccessor<Rabitq4Owned, L2S>;
 
+    type RoutingAccessor = Self::DistanceAccessor;
+
+    fn routing_is_exact() -> bool {
+        true
+    }
+
     fn block_access(
         lut: &BlockLut,
         is_residual: bool,
@@ -934,6 +999,12 @@ impl Operator for Op<Rabitq4Owned, Dot> {
     type Vector = Rabitq4Owned;
 
     type DistanceAccessor = HalfbyteDistanceAccessor<Rabitq4Owned, Dot>;
+
+    type RoutingAccessor = Self::DistanceAccessor;
+
+    fn routing_is_exact() -> bool {
+        true
+    }
 
     fn block_access(
         lut: &BlockLut,

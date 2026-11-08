@@ -80,6 +80,31 @@ impl Floating for f16 {
     }
 
     #[inline(always)]
+    fn reduce_sum_of_d2_approx(lhs: &[f16], rhs: &[f16]) -> f32 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            reduce_sum_of_d2_approx::reduce_sum_of_d2_approx(lhs, rhs)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            // No additional runtime dispatch on CPUs without a fast kernel.
+            Self::reduce_sum_of_d2(lhs, rhs)
+        }
+    }
+
+    #[inline(always)]
+    fn reduce_sum_of_d2_approx_is_exact() -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            !reduce_sum_of_d2_approx::is_fast_path_detected()
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            true
+        }
+    }
+
+    #[inline(always)]
     fn reduce_sum_of_xy_sparse(lidx: &[u32], lval: &[f16], ridx: &[u32], rval: &[f16]) -> f32 {
         reduce_sum_of_xy_sparse::reduce_sum_of_xy_sparse(lidx, lval, ridx, rval)
     }
@@ -1956,6 +1981,245 @@ mod reduce_sum_of_d2 {
                 let (x, y) = (random(n, lo, hi), random(n, lo, hi));
                 for (name, f) in implementations() {
                     assert_close(name, n, unsafe { f(&x, &y) }, exact(&x, &y));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", test))]
+mod reduce_sum_of_d2_approx {
+    use crate::{Floating, f16};
+
+    /// Mirrors the dispatch condition of `reduce_sum_of_d2_approx` below.
+    #[cfg(target_arch = "aarch64")]
+    pub fn is_fast_path_detected() -> bool {
+        crate::is_cpu_detected!("a2")
+            && crate::is_feature_detected!("fp16")
+            && crate::is_feature_detected!("fhm")
+    }
+
+    #[inline]
+    #[cfg(target_arch = "aarch64")]
+    #[crate::target_cpu(enable = "a2")]
+    #[target_feature(enable = "fp16,fhm")]
+    fn reduce_sum_of_d2_approx_a2_fp16_fhm(lhs: &[f16], rhs: &[f16]) -> f32 {
+        use crate::emulate::partial_load;
+        use core::arch::aarch64::*;
+        assert_eq!(lhs.len(), rhs.len());
+        let mut n = lhs.len();
+        let mut a = lhs.as_ptr();
+        let mut b = rhs.as_ptr();
+        let mut sum = [vdupq_n_f32(0.0); 16];
+        // Only the difference is rounded to f16 (relative error <= 2^-11; a
+        // subnormal difference is exact, so a nonzero difference never becomes
+        // zero). FMLAL multiplies the f16 lanes exactly (22 significant bits
+        // fit in f32) and adds the product to an f32 accumulator with one
+        // rounding. Each squared term therefore has relative error at most
+        // (1 + 2^-11)^2 - 1 = 2^-10 + 2^-22, plus ordinary f32 summation error.
+        // This assumes the default FPCR (round to nearest, FZ16 = 0). The
+        // bound is relative to the true distance, so it is not an error budget
+        // that RaBitQ lower bounds account for: callers must not feed this
+        // value into bounds the reranker trusts.
+        while n >= 64 {
+            for i in 0..8 {
+                let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.add(8 * i).cast()) });
+                let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.add(8 * i).cast()) });
+                let d = vsubq_f16(x, y);
+                sum[2 * i] = vfmlalq_low_f16(sum[2 * i], d, d);
+                sum[2 * i + 1] = vfmlalq_high_f16(sum[2 * i + 1], d, d);
+            }
+            (n, a, b) = unsafe { (n - 64, a.add(64), b.add(64)) };
+        }
+        while n >= 8 {
+            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(a.cast()) });
+            let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(b.cast()) });
+            let d = vsubq_f16(x, y);
+            sum[0] = vfmlalq_low_f16(sum[0], d, d);
+            sum[1] = vfmlalq_high_f16(sum[1], d, d);
+            (n, a, b) = unsafe { (n - 8, a.add(8), b.add(8)) };
+        }
+        if n > 0 {
+            let (_a, _b) = unsafe { partial_load!(8, n, a, b) };
+            let x = vreinterpretq_f16_u16(unsafe { vld1q_u16(_a.as_ptr().cast()) });
+            let y = vreinterpretq_f16_u16(unsafe { vld1q_u16(_b.as_ptr().cast()) });
+            let d = vsubq_f16(x, y);
+            sum[2] = vfmlalq_low_f16(sum[2], d, d);
+            sum[3] = vfmlalq_high_f16(sum[3], d, d);
+        }
+        let result = super::aarch64::reduce_add(sum);
+        if result.is_finite() {
+            result
+        } else {
+            // Finite f16 operands can have a difference beyond the f16 range.
+            // Retry in f32 without adding a range scan to the ordinary path.
+            f16::reduce_sum_of_d2(lhs, rhs)
+        }
+    }
+
+    #[crate::multiversion(@"a2:fp16:fhm")]
+    pub fn reduce_sum_of_d2_approx(lhs: &[f16], rhs: &[f16]) -> f32 {
+        f16::reduce_sum_of_d2(lhs, rhs)
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn bounded_error_and_overflow_fallback() {
+        use super::test_util::{integers, lengths, random};
+        use crate::F16;
+        for n in lengths().chain([1536, 16000]) {
+            for (lo, hi) in [(-1.0, 1.0), (-1e-3, 1e-3), (-60000.0, 60000.0)] {
+                let (x, y) = (random(n, lo, hi), random(n, lo, hi));
+                let exact = f16::reduce_sum_of_d2(&x, &y);
+                let approx = reduce_sum_of_d2_approx(&x, &y);
+                assert!(approx.is_finite());
+                assert!((approx - exact).abs() <= 0.0011 * exact + 1e-12);
+                assert_eq!(reduce_sum_of_d2_approx(&x, &x), 0.0);
+            }
+            // Pixel differences are exact in f16, but their squares/sums
+            // would overflow an f16 accumulator.
+            let (x, y) = (integers(n, 0, 255), integers(n, 0, 255));
+            let exact = f16::reduce_sum_of_d2(&x, &y);
+            let approx = reduce_sum_of_d2_approx(&x, &y);
+            assert!((approx - exact).abs() <= 1e-5 * exact);
+            let x = vec![f16::_from_f32(65504.0); n];
+            let y = vec![f16::_from_f32(-65504.0); n];
+            assert_eq!(
+                reduce_sum_of_d2_approx(&x, &y),
+                f16::reduce_sum_of_d2(&x, &y)
+            );
+        }
+        let x = [f16::from_bits(1), f16::from_bits(2), f16::from_bits(3)];
+        let zero = [f16::_ZERO; 3];
+        assert_eq!(
+            reduce_sum_of_d2_approx(&x, &zero),
+            f16::reduce_sum_of_d2(&x, &zero)
+        );
+    }
+
+    /// Scalar model of the FHM kernel: the same lanes, accumulators and
+    /// reduction order, with the difference rounded once to f16 and each exact
+    /// square added to an f32 lane with one rounding. `None` if a difference
+    /// overflows f16, where the kernel retries the exact path.
+    #[cfg(test)]
+    fn model(x: &[f16], y: &[f16]) -> Option<f32> {
+        let mut acc = [[0.0f32; 4]; 16];
+        let mut add = |k: usize, lanes: &[f16]| -> Option<()> {
+            for (j, (a, b)) in lanes.chunks(2).map(|p| (p[0], p[1])).enumerate() {
+                // f16 differences are exact in f64; round once to f16.
+                let d = f16::from_f64(a.to_f64() - b.to_f64());
+                if !d.is_finite() {
+                    return None;
+                }
+                let d = d.to_f32();
+                acc[k + j / 4][j % 4] += d * d; // `d * d` is exact in f32
+            }
+            Some(())
+        };
+        let pairs: Vec<f16> = x.iter().zip(y).flat_map(|(&a, &b)| [a, b]).collect();
+        let (mut off, mut n) = (0, x.len());
+        while n >= 64 {
+            for i in 0..8 {
+                add(2 * i, &pairs[2 * (off + 8 * i)..2 * (off + 8 * i + 8)])?;
+            }
+            (off, n) = (off + 64, n - 64);
+        }
+        while n >= 8 {
+            add(0, &pairs[2 * off..2 * (off + 8)])?;
+            (off, n) = (off + 8, n - 8);
+        }
+        if n > 0 {
+            let mut tail = pairs[2 * off..].to_vec();
+            tail.resize(16, f16::ZERO);
+            add(2, &tail)?;
+        }
+        let mut m = 16;
+        while m > 1 {
+            let h = m / 2;
+            for i in 0..h {
+                for l in 0..4 {
+                    acc[i][l] += acc[m - h + i][l];
+                }
+            }
+            m -= h;
+        }
+        Some((acc[0][0] + acc[0][1]) + (acc[0][2] + acc[0][3]))
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn matches_model_and_rigorous_bound() {
+        use rand::{Rng, RngExt, SeedableRng};
+        #[cfg(target_arch = "aarch64")]
+        let fast = is_fast_path_detected();
+        #[cfg(not(target_arch = "aarch64"))]
+        let fast = false;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(20261105);
+        let finite = |rng: &mut rand::rngs::StdRng| loop {
+            let v = f16::from_bits(rng.next_u32() as u16);
+            if v.is_finite() {
+                break v;
+            }
+        };
+        let dims = [1, 7, 8, 31, 32, 64, 768, 784, 1536, 4095, 16000, 65535];
+        for n in dims {
+            // Ordinary f32 summation error over at most n / 64 + 7 additions
+            // per lane chain, with margin.
+            let gamma = (n as f64 / 64.0 + 16.0) * 2f64.powi(-24);
+            let unit = 2f64.powi(-11);
+            let bound = (1.0 + unit).powi(2) * (1.0 + gamma) - 1.0;
+            for case in 0..8 {
+                let (x, y): (Vec<f16>, Vec<f16>) = (0..n)
+                    .map(|_| match case {
+                        0 => (
+                            f16::from_f32(rng.random_range(0..=255) as f32),
+                            f16::from_f32(rng.random_range(0..=255) as f32),
+                        ),
+                        1 => (
+                            f16::from_f32(rng.random_range(-1.0..=1.0)),
+                            f16::from_f32(rng.random_range(-1.0..=1.0)),
+                        ),
+                        2 => (
+                            f16::from_bits(rng.random_range(0..1024)),
+                            f16::from_bits(rng.random_range(0..1024) | 0x8000),
+                        ),
+                        3 => {
+                            let a = rng.random_range(1..0x7bff_u16);
+                            (f16::from_bits(a), f16::from_bits(a + 1))
+                        }
+                        4 => (finite(&mut rng), finite(&mut rng)),
+                        5 => (f16::MAX, f16::MIN),
+                        6 => {
+                            let a = f16::from_f32(rng.random_range(-1.0..=1.0));
+                            (a, a)
+                        }
+                        _ => (
+                            f16::from_f32(rng.random_range(-60000.0..=60000.0)),
+                            f16::from_f32(rng.random_range(-1e-3..=1e-3)),
+                        ),
+                    })
+                    .unzip();
+                let reference: f64 = std::iter::zip(&x, &y)
+                    .map(|(a, b)| (a.to_f64() - b.to_f64()).powi(2))
+                    .sum();
+                let exact = f16::reduce_sum_of_d2(&x, &y);
+                let approx = reduce_sum_of_d2_approx(&x, &y);
+                let label = format!("n = {n}, case = {case}");
+                assert!(exact.is_finite() && approx.is_finite(), "{label}");
+                assert_eq!(reduce_sum_of_d2_approx(&x, &x), 0.0, "{label}");
+                assert_eq!(reduce_sum_of_d2_approx(&y, &y), 0.0, "{label}");
+                if reference == 0.0 {
+                    assert_eq!(approx, 0.0, "{label}");
+                    continue;
+                }
+                assert!(approx > 0.0, "{label}: nonzero distance collapsed");
+                let error = (approx as f64 - reference).abs() / reference;
+                assert!(error <= bound, "{label}: {error} > {bound}");
+                let error = (exact as f64 - reference).abs() / reference;
+                assert!(error <= gamma, "{label}: exact {error} > {gamma}");
+                match (fast, model(&x, &y)) {
+                    (true, Some(m)) => assert_eq!(approx.to_bits(), m.to_bits(), "{label}"),
+                    (true, None) | (false, _) => assert_eq!(approx, exact, "{label}"),
                 }
             }
         }

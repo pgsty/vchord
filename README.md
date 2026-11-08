@@ -40,6 +40,8 @@ To store vectors compactly while preserving recall, `vchord` combines **RaBitQ**
 - **Drop-In `pgvector` Compatibility**: Directly indexes [`pgvector`](https://vchord.pgsty.com/docs/vector/) data types (`vector`, `halfvec`) and supports standard distance operators (`<->`, `<#>`, `<=>`) alongside multi-vector MaxSim (`@#`) retrieval.
 - **Native Low-Bit Quantization Types**: Provides [native 4-bit (`rabitq4`) and 8-bit (`rabitq8`) vector types](https://vchord.pgsty.com/docs/vchord/usage/quantization-types/) with <1% recall loss on `rabitq8`.
 
+ANN routing can trade small distance errors for speed. On ARM CPUs with FP16 and FHM, `halfvec` L2 centroid selection and graph pruning round differences to `f16` and accumulate in `f32`, retrying in `f32` if a difference overflows. Final reranking, sphere predicates, and the residual-quantization lower bounds that decide reranking order keep `f32` differences and accumulation. Tune probes and search breadth against recall on your own data.
+
 [^2]: See [Store 400k Vectors for $1 in PostgreSQL](https://vchord.pgsty.com/blog/post/vectorchord-store-400k-vectors-for-1-in-postgresql/).
 [^3]: See [Scaling Vector Search to 1 Billion on PostgreSQL](https://vchord.pgsty.com/blog/post/scaling-vector-search-to-1-billion-on-postgresql/).
 [^4]: See [How We Made 100M Vector Indexing in 20 Minutes Possible on PostgreSQL](https://vchord.pgsty.com/blog/post/how-we-made-100m-vector-indexing-in-20-minutes-possible-on-postgresql/#hierarchical-k-means) and [Partitioning Tuning](https://vchord.pgsty.com/docs/vchord/usage/partitioning-tuning/#hierarchical-k-means).

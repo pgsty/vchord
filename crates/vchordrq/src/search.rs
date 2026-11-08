@@ -27,6 +27,41 @@ use vector::{VectorBorrowed, VectorOwned};
 
 type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
 
+/// Where a centroid's vector is stored: its head and the pages it spans.
+/// Kept so its exact distance can be recomputed after approximate routing.
+type Location<'b> = Option<(u16, BorrowedIter<'b>)>;
+
+/// The probed centroids are chosen with `O::RoutingAccessor`, which may be
+/// approximate. In residual mode their distances are then reused as `dis_f`,
+/// which the residual formulas add to every candidate's lower bound with no
+/// error budget, so recompute them with `O::DistanceAccessor` first. Pages are
+/// re-read through the IDs the routing step already holds; they were just read.
+fn exact_bounds<'b, R: RelationRead, O: Operator>(
+    index: &'b R,
+    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
+    dim: u32,
+    state: &mut [(
+        Reverse<Distance>,
+        AlwaysEqual<f32>,
+        AlwaysEqual<u32>,
+        AlwaysEqual<Location<'b>>,
+    )],
+) where
+    R::Page: Page<Opaque = Opaque>,
+{
+    for (Reverse(dis_f), _, _, AlwaysEqual(location)) in state {
+        let (head, prefetch) = location.expect("internal: residual probe without location");
+        *dis_f = centroids::read::<R, O, _>(
+            prefetch.map(|id| index.read(id)),
+            head,
+            LAccess::new(
+                O::Vector::unpack(vector),
+                O::DistanceAccessor::default_with_dimension(dim),
+            ),
+        );
+    }
+}
+
 pub fn default_search<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
@@ -59,8 +94,15 @@ where
     }
     debug_assert_eq!(cells[(height_of_root - 1) as usize], 1);
 
-    type State = Vec<(Reverse<Distance>, AlwaysEqual<f32>, AlwaysEqual<u32>)>;
-    let mut state: State = if is_residual {
+    // (distance, norm, first, location). Until `exact_bounds` runs, the
+    // distance is a routing distance and may be approximate.
+    type State<'b> = Vec<(
+        Reverse<Distance>,
+        AlwaysEqual<f32>,
+        AlwaysEqual<u32>,
+        AlwaysEqual<Location<'b>>,
+    )>;
+    let mut state: State<'b> = if is_residual {
         let prefetch =
             BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
         let head = meta_tuple.centroid_head();
@@ -69,26 +111,36 @@ where
             head,
             LAccess::new(
                 O::Vector::unpack(vector),
-                O::DistanceAccessor::default_with_dimension(dim),
+                O::RoutingAccessor::default_with_dimension(dim),
             ),
         );
         let norm = meta_tuple.centroid_norm();
         let first = meta_tuple.first();
-        vec![(Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))]
+        vec![(
+            Reverse(distance),
+            AlwaysEqual(norm),
+            AlwaysEqual(first),
+            AlwaysEqual(Some((head, prefetch))),
+        )]
     } else {
         // fast path
         let distance = Distance::ZERO;
         let norm = meta_tuple.centroid_norm();
         let first = meta_tuple.first();
-        vec![(Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))]
+        vec![(
+            Reverse(distance),
+            AlwaysEqual(norm),
+            AlwaysEqual(first),
+            AlwaysEqual(None),
+        )]
     };
 
     drop(meta_guard);
     let lut = O::Vector::preprocess(vector);
 
-    let mut step = |state: State| {
+    let mut step = |state: State<'b>| {
         let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
-        for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
+        for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
             tape::read_h1_tape::<R, _, _>(
                 by_next(index, first),
                 || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
@@ -107,9 +159,9 @@ where
             );
         }
         let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
-        let mut cache = BinaryHeap::<(_, _, _)>::new();
+        let mut cache = BinaryHeap::<(_, _, _, _)>::new();
         std::iter::from_fn(move || {
-            while let Some(((Reverse(_), AlwaysEqual(&mut (first, norm, head, ..))), prefetch)) =
+            while let Some(((Reverse(_), AlwaysEqual(&mut (first, norm, head, pages))), prefetch)) =
                 heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
             {
                 let distance = centroids::read::<R, O, _>(
@@ -117,10 +169,15 @@ where
                     head,
                     LAccess::new(
                         O::Vector::unpack(vector),
-                        O::DistanceAccessor::default_with_dimension(dim),
+                        O::RoutingAccessor::default_with_dimension(dim),
                     ),
                 );
-                cache.push((Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first)));
+                cache.push((
+                    Reverse(distance),
+                    AlwaysEqual(norm),
+                    AlwaysEqual(first),
+                    AlwaysEqual(Some((head, pages))),
+                ));
             }
             cache.pop()
         })
@@ -133,7 +190,7 @@ where
         } else {
             // fast path
             let mut results = LinkedVec::new();
-            for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first)) in state {
+            for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first), _) in state {
                 tape::read_h1_tape::<R, _, _>(
                     by_next(index, first),
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
@@ -142,6 +199,7 @@ where
                             Reverse(Distance::ZERO),
                             AlwaysEqual(norm),
                             AlwaysEqual(first),
+                            AlwaysEqual(None),
                         ));
                     },
                 );
@@ -150,8 +208,13 @@ where
         }
     }
 
+    // Non-residual formulas ignore `dis_f`; the fast path never computes it.
+    if is_residual && !O::routing_is_exact() {
+        exact_bounds::<R, O>(index, vector, dim, &mut state);
+    }
+
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
-    for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
+    for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
@@ -226,8 +289,15 @@ where
     }
     debug_assert_eq!(cells[(height_of_root - 1) as usize], 1);
 
-    type State = Vec<(Reverse<Distance>, AlwaysEqual<f32>, AlwaysEqual<u32>)>;
-    let mut state: State = if is_residual {
+    // (distance, norm, first, location). Until `exact_bounds` runs, the
+    // distance is a routing distance and may be approximate.
+    type State<'b> = Vec<(
+        Reverse<Distance>,
+        AlwaysEqual<f32>,
+        AlwaysEqual<u32>,
+        AlwaysEqual<Location<'b>>,
+    )>;
+    let mut state: State<'b> = if is_residual {
         let prefetch =
             BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
         let head = meta_tuple.centroid_head();
@@ -236,26 +306,36 @@ where
             head,
             LAccess::new(
                 O::Vector::unpack(vector),
-                O::DistanceAccessor::default_with_dimension(dim),
+                O::RoutingAccessor::default_with_dimension(dim),
             ),
         );
         let norm = meta_tuple.centroid_norm();
         let first = meta_tuple.first();
-        vec![(Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))]
+        vec![(
+            Reverse(distance),
+            AlwaysEqual(norm),
+            AlwaysEqual(first),
+            AlwaysEqual(Some((head, prefetch))),
+        )]
     } else {
         // fast path
         let distance = Distance::ZERO;
         let norm = meta_tuple.centroid_norm();
         let first = meta_tuple.first();
-        vec![(Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))]
+        vec![(
+            Reverse(distance),
+            AlwaysEqual(norm),
+            AlwaysEqual(first),
+            AlwaysEqual(None),
+        )]
     };
 
     drop(meta_guard);
     let lut = O::Vector::preprocess(vector);
 
-    let mut step = |state: State| {
+    let mut step = |state: State<'b>| {
         let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
-        for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
+        for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
             tape::read_h1_tape::<R, _, _>(
                 by_next(index, first),
                 || O::block_access(&lut.0, is_residual, dis_f.to_f32(), norm),
@@ -274,9 +354,9 @@ where
             );
         }
         let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
-        let mut cache = BinaryHeap::<(_, _, _)>::new();
+        let mut cache = BinaryHeap::<(_, _, _, _)>::new();
         std::iter::from_fn(move || {
-            while let Some(((Reverse(_), AlwaysEqual(&mut (first, norm, head, ..))), prefetch)) =
+            while let Some(((Reverse(_), AlwaysEqual(&mut (first, norm, head, pages))), prefetch)) =
                 heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
             {
                 let distance = centroids::read::<R, O, _>(
@@ -284,10 +364,15 @@ where
                     head,
                     LAccess::new(
                         O::Vector::unpack(vector),
-                        O::DistanceAccessor::default_with_dimension(dim),
+                        O::RoutingAccessor::default_with_dimension(dim),
                     ),
                 );
-                cache.push((Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first)));
+                cache.push((
+                    Reverse(distance),
+                    AlwaysEqual(norm),
+                    AlwaysEqual(first),
+                    AlwaysEqual(Some((head, pages))),
+                ));
             }
             cache.pop()
         })
@@ -303,7 +388,7 @@ where
         } else {
             // fast path
             let mut results = LinkedVec::new();
-            for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first)) in state {
+            for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first), _) in state {
                 tape::read_h1_tape::<R, _, _>(
                     by_next(index, first),
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
@@ -312,6 +397,7 @@ where
                             Reverse(Distance::ZERO),
                             AlwaysEqual(norm),
                             AlwaysEqual(first),
+                            AlwaysEqual(None),
                         ));
                     },
                 );
@@ -320,8 +406,13 @@ where
         }
     }
 
+    // Non-residual formulas ignore `dis_f`; the fast path never computes it.
+    if is_residual && !O::routing_is_exact() {
+        exact_bounds::<R, O>(index, vector, dim, &mut state);
+    }
+
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
-    for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in state {
+    for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
@@ -360,7 +451,9 @@ where
         threshold = threshold.saturating_sub(jump_tuple.tuples().min(u32::MAX as _) as _);
     }
     let mut estimation_by_threshold = Distance::NEG_INFINITY;
-    for (Reverse(distance), AlwaysEqual(_), AlwaysEqual(first)) in it.into_iter().flatten() {
+    // Remaining routing distances only estimate missing MaxSim terms; they are
+    // not lower bounds and never reach the reranker.
+    for (Reverse(distance), AlwaysEqual(_), AlwaysEqual(first), _) in it.into_iter().flatten() {
         if threshold == 0 {
             break;
         }

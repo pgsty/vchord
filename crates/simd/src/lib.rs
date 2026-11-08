@@ -119,6 +119,19 @@ pub trait Floating:
     fn reduce_min_max_of_x(this: &[Self]) -> (f32, f32);
     fn reduce_sum_of_xy(lhs: &[Self], rhs: &[Self]) -> f32;
     fn reduce_sum_of_d2(lhs: &[Self], rhs: &[Self]) -> f32;
+    /// Distance for ANN routing and graph construction; not for final reranking,
+    /// SQL predicates or any bound that the reranker trusts. Implementations
+    /// may round intermediate differences.
+    #[inline(always)]
+    fn reduce_sum_of_d2_approx(lhs: &[Self], rhs: &[Self]) -> f32 {
+        Self::reduce_sum_of_d2(lhs, rhs)
+    }
+    /// Whether `reduce_sum_of_d2_approx` returns exactly `reduce_sum_of_d2` on
+    /// this CPU, so callers can skip recomputing an exact distance.
+    #[inline(always)]
+    fn reduce_sum_of_d2_approx_is_exact() -> bool {
+        true
+    }
     fn reduce_sum_of_xy_sparse(lidx: &[u32], lval: &[Self], ridx: &[u32], rval: &[Self]) -> f32;
     fn reduce_sum_of_d2_sparse(lidx: &[u32], lval: &[Self], ridx: &[u32], rval: &[Self]) -> f32;
 

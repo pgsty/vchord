@@ -375,7 +375,8 @@ impl Operator for Op<VectOwned<f16>, L2S> {
         lhs: <Self::Vector as VectorOwned>::Borrowed<'_>,
         rhs: <Self::Vector as VectorOwned>::Borrowed<'_>,
     ) -> Distance {
-        lhs.operator_l2s(rhs)
+        // Graph pruning is approximate; search results use DistanceAccessor.
+        Distance::from_f32(f16::reduce_sum_of_d2_approx(lhs.slice(), rhs.slice()))
     }
 }
 
