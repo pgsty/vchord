@@ -1,0 +1,54 @@
+# Inserts never link a new vertex through deleted vertices other than the
+# start vertex (#26): VACUUM frees those, so the new vertex would lose the
+# edges. The start vertex is never freed and stays eligible, so a table that
+# was emptied and refilled is still reachable through it.
+
+statement ok
+CREATE TABLE insert_deleted (id int, v vector(8)) WITH (autovacuum_enabled = off);
+
+statement ok
+SELECT setseed(0.26);
+
+statement ok
+INSERT INTO insert_deleted SELECT i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 8))::vector(8) FROM generate_series(1, 2000) i;
+
+statement ok
+CREATE INDEX insert_deleted_g ON insert_deleted USING vchordg (v vector_l2_ops);
+
+statement ok
+DELETE FROM insert_deleted;
+
+statement ok
+VACUUM insert_deleted;
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT id FROM insert_deleted ORDER BY v <-> array_fill(0.5::real, ARRAY[8])::vector(8) LIMIT 10) s;
+----
+0
+
+statement ok
+INSERT INTO insert_deleted SELECT i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 8))::vector(8) FROM generate_series(2001, 3000) i;
+
+query II
+SELECT count(*), min(id) > 2000 FROM (SELECT id FROM insert_deleted ORDER BY v <-> array_fill(0.5::real, ARRAY[8])::vector(8) LIMIT 10) s;
+----
+10 t
+
+statement ok
+VACUUM insert_deleted;
+
+# Every refilled row is reachable from the entry point: a full index scan
+# returns all of them.
+query I
+SELECT count(*) FROM (SELECT id FROM insert_deleted ORDER BY v <-> array_fill(0.5::real, ARRAY[8])::vector(8) LIMIT 100000) s;
+----
+1000
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE insert_deleted;

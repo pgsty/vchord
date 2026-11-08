@@ -24,4 +24,38 @@ pub fn init() {
     hook::init();
     vchordrq::am::init();
     vchordg::am::init();
+    ::index::interrupt::set(check_for_interrupts);
+}
+
+/// Interrupt check for the algorithm crates' long loops (#28). Only the
+/// backend's main thread may call into PostgreSQL; build worker threads skip
+/// it. pgrx turns a raised error into a Rust panic that unwinds normally.
+fn check_for_interrupts() {
+    if crate::is_main() {
+        pgrx::pg_sys::check_for_interrupts!();
+    }
+}
+
+/// Cost given to index paths the access methods cannot execute (no ORDER BY
+/// vector and no index clause, or index-only scans). Finite on purpose:
+/// `inf - inf` in planner arithmetic yields NaN. This is a mitigation, not a
+/// structural exclusion (#32).
+pub const UNUSABLE_PATH_COST: f64 = 1.0e30;
+
+/// Switches `CurrentMemoryContext` and restores it when dropped, including
+/// during unwinding.
+pub struct MemoryContextSwitch(pgrx::pg_sys::MemoryContext);
+
+impl MemoryContextSwitch {
+    pub unsafe fn new(context: pgrx::pg_sys::MemoryContext) -> Self {
+        Self(unsafe { pgrx::pg_sys::MemoryContextSwitchTo(context) })
+    }
+}
+
+impl Drop for MemoryContextSwitch {
+    fn drop(&mut self) {
+        unsafe {
+            pgrx::pg_sys::MemoryContextSwitchTo(self.0);
+        }
+    }
 }

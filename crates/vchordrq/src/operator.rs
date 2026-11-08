@@ -280,20 +280,15 @@ impl Vector for Rabitq8Owned {
         let sum_of_abs_x = vector.sum_of_abs_x();
         let sum_of_x_2 = vector.sum_of_x2();
         (
-            CodeMetadata {
-                dis_u_2: sum_of_x_2,
-                factor_cnt: {
-                    let cnt_pos = vector.unpacked_code().filter(|&x| x >= 128).count();
-                    let cnt_neg = vector.unpacked_code().filter(|&x| x <= 127).count();
-                    cnt_pos as f32 - cnt_neg as f32
-                },
-                factor_ip: sum_of_x_2 / sum_of_abs_x,
-                factor_err: {
-                    let dis_u = sum_of_x_2.sqrt();
-                    let x_0 = sum_of_abs_x / dis_u / (n as f32).sqrt();
-                    dis_u * (1.0 / (x_0 * x_0) - 1.0).sqrt() / (n as f32 - 1.0).sqrt()
-                },
-            },
+            // Shares the guards of `rabitq::bit::metadata`: a zero vector
+            // (`0 / 0`) and a 1-dimensional one (`0 / 0` in the error factor)
+            // would otherwise store NaN factors, which sort every candidate
+            // with them last.
+            rabitq::bit::metadata(n as usize, sum_of_abs_x, sum_of_x_2, {
+                let cnt_pos = vector.unpacked_code().filter(|&x| x >= 128).count();
+                let cnt_neg = vector.unpacked_code().filter(|&x| x <= 127).count();
+                cnt_pos as f32 - cnt_neg as f32
+            }),
             {
                 let vector = vector.unpacked_code();
                 let mut signs = Vec::new();
@@ -382,20 +377,15 @@ impl Vector for Rabitq4Owned {
         let sum_of_abs_x = vector.sum_of_abs_x();
         let sum_of_x_2 = vector.sum_of_x2();
         (
-            CodeMetadata {
-                dis_u_2: sum_of_x_2,
-                factor_cnt: {
-                    let cnt_pos = vector.unpacked_code().filter(|&x| x >= 8).count();
-                    let cnt_neg = vector.unpacked_code().filter(|&x| x <= 7).count();
-                    cnt_pos as f32 - cnt_neg as f32
-                },
-                factor_ip: sum_of_x_2 / sum_of_abs_x,
-                factor_err: {
-                    let dis_u = sum_of_x_2.sqrt();
-                    let x_0 = sum_of_abs_x / dis_u / (n as f32).sqrt();
-                    dis_u * (1.0 / (x_0 * x_0) - 1.0).sqrt() / (n as f32 - 1.0).sqrt()
-                },
-            },
+            // Shares the guards of `rabitq::bit::metadata`: a zero vector
+            // (`0 / 0`) and a 1-dimensional one (`0 / 0` in the error factor)
+            // would otherwise store NaN factors, which sort every candidate
+            // with them last.
+            rabitq::bit::metadata(n as usize, sum_of_abs_x, sum_of_x_2, {
+                let cnt_pos = vector.unpacked_code().filter(|&x| x >= 8).count();
+                let cnt_neg = vector.unpacked_code().filter(|&x| x <= 7).count();
+                cnt_pos as f32 - cnt_neg as f32
+            }),
             {
                 let vector = vector.unpacked_code();
                 let mut signs = Vec::new();
@@ -1064,5 +1054,83 @@ impl<A, B, C, F: Fn(A, B, C) -> R, R> Call<A, B, C> for F {
     #[inline(always)]
     fn call(&mut self, a: A, b: B, c: C) -> R {
         (self)(a, b, c)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Vector;
+    use simd::Floating;
+    use vector::VectorOwned;
+    use vector::rabitq4::Rabitq4Owned;
+    use vector::rabitq8::Rabitq8Owned;
+
+    fn rabitq8(x: &[f32]) -> Rabitq8Owned {
+        let (metadata, elements) = rabitq::byte::ugly_code(x);
+        Rabitq8Owned::new(
+            x.len() as u32,
+            metadata.dis_u_2,
+            metadata.norm_of_lattice,
+            metadata.sum_of_code,
+            f32::reduce_sum_of_abs_x(x),
+            rabitq::byte::pack_code(&elements),
+        )
+    }
+
+    fn rabitq4(x: &[f32]) -> Rabitq4Owned {
+        let (metadata, elements) = rabitq::halfbyte::ugly_code(x);
+        Rabitq4Owned::new(
+            x.len() as u32,
+            metadata.dis_u_2,
+            metadata.norm_of_lattice,
+            metadata.sum_of_code,
+            f32::reduce_sum_of_abs_x(x),
+            rabitq::halfbyte::pack_code(&elements),
+        )
+    }
+
+    fn assert_finite(m: rabitq::bit::CodeMetadata, what: &str) {
+        assert!(m.dis_u_2.is_finite(), "{what}: dis_u_2 = {}", m.dis_u_2);
+        assert!(
+            m.factor_cnt.is_finite(),
+            "{what}: factor_cnt = {}",
+            m.factor_cnt
+        );
+        assert!(
+            m.factor_ip.is_finite(),
+            "{what}: factor_ip = {}",
+            m.factor_ip
+        );
+        assert!(
+            m.factor_err.is_finite(),
+            "{what}: factor_err = {}",
+            m.factor_err
+        );
+    }
+
+    // Zero and 1-dimensional vectors produced NaN factors (#23), and equal
+    // magnitudes can round `1 / x_0^2 - 1` below zero.
+    #[test]
+    fn degenerate_codes_have_finite_factors() {
+        let inputs: Vec<(&str, Vec<f32>)> = vec![
+            ("zero 1", vec![0.0]),
+            ("zero 8", vec![0.0; 8]),
+            ("zero 100", vec![0.0; 100]),
+            ("dim 1 positive", vec![3.0]),
+            ("dim 1 negative", vec![-0.25]),
+            ("equal magnitude", vec![1.0; 64]),
+            (
+                "equal magnitude signs",
+                (0..65)
+                    .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+                    .collect(),
+            ),
+        ];
+        for (what, x) in inputs {
+            let v8 = rabitq8(&x);
+            assert_finite(<Rabitq8Owned as Vector>::code(v8.as_borrowed()).0, what);
+            let v4 = rabitq4(&x);
+            assert_finite(<Rabitq4Owned as Vector>::code(v4.as_borrowed()).0, what);
+        }
     }
 }

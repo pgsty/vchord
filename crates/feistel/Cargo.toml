@@ -5,10 +5,10 @@ edition.workspace = true
 publish = false
 
 [dependencies]
+wyhash.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
-wyhash.workspace = true
 
 [lints]
 workspace = true

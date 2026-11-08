@@ -17,7 +17,7 @@ use pgrx::heap_tuple::PgHeapTuple;
 use pgrx::pg_sys::Datum;
 use std::num::NonZero;
 use vchordg::types::*;
-use vector::VectorBorrowed;
+use vector::{VectorBorrowed, VectorOwned};
 
 #[derive(Debug, Clone, Copy)]
 pub enum Opfamily {
@@ -36,6 +36,37 @@ pub enum Opfamily {
 }
 
 impl Opfamily {
+    pub fn is_cosine(self) -> bool {
+        matches!(
+            self,
+            Self::VectorCosine | Self::HalfvecCosine | Self::Rabitq8Cosine | Self::Rabitq4Cosine
+        )
+    }
+    /// Uses the same test as `function_normalize`, so every vector a cosine
+    /// index stores is normalized.
+    fn has_direction(vector: BorrowedVector<'_>) -> bool {
+        match vector {
+            BorrowedVector::Vecf32(v) => v.has_direction(),
+            BorrowedVector::Vecf16(v) => v.has_direction(),
+            BorrowedVector::Rabitq8(v) => v.has_direction(),
+            BorrowedVector::Rabitq4(v) => v.has_direction(),
+        }
+    }
+    pub fn valid_cosine_query(self, vector: &OwnedVector) -> bool {
+        if !self.is_cosine() {
+            return true;
+        }
+        match vector {
+            OwnedVector::Vecf32(v) => Self::has_direction(BorrowedVector::Vecf32(v.as_borrowed())),
+            OwnedVector::Vecf16(v) => Self::has_direction(BorrowedVector::Vecf16(v.as_borrowed())),
+            OwnedVector::Rabitq8(v) => {
+                Self::has_direction(BorrowedVector::Rabitq8(v.as_borrowed()))
+            }
+            OwnedVector::Rabitq4(v) => {
+                Self::has_direction(BorrowedVector::Rabitq4(v.as_borrowed()))
+            }
+        }
+    }
     fn input(self, vector: BorrowedVector<'_>) -> OwnedVector {
         use BorrowedVector as B;
         use OwnedVector as O;
@@ -73,24 +104,46 @@ impl Opfamily {
         let store = match self {
             Self::VectorL2 | Self::VectorCosine | Self::VectorIp => {
                 let vector = unsafe { VectorInput::from_datum(datum, false).unwrap() };
+                if matches!(self, Self::VectorCosine)
+                    && !Self::has_direction(BorrowedVector::Vecf32(vector.as_borrowed()))
+                {
+                    return None;
+                }
                 vec![(self.input(BorrowedVector::Vecf32(vector.as_borrowed())), 0)]
             }
             Self::HalfvecL2 | Self::HalfvecCosine | Self::HalfvecIp => {
                 let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
+                if matches!(self, Self::HalfvecCosine)
+                    && !Self::has_direction(BorrowedVector::Vecf16(vector.as_borrowed()))
+                {
+                    return None;
+                }
                 vec![(self.input(BorrowedVector::Vecf16(vector.as_borrowed())), 0)]
             }
             Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
                 let vector = unsafe { Rabitq8Input::from_datum(datum, false).unwrap() };
+                if matches!(self, Self::Rabitq8Cosine)
+                    && !Self::has_direction(BorrowedVector::Rabitq8(vector.as_borrowed()))
+                {
+                    return None;
+                }
                 vec![(self.input(BorrowedVector::Rabitq8(vector.as_borrowed())), 0)]
             }
             Self::Rabitq4L2 | Self::Rabitq4Cosine | Self::Rabitq4Ip => {
                 let vector = unsafe { Rabitq4Input::from_datum(datum, false).unwrap() };
+                if matches!(self, Self::Rabitq4Cosine)
+                    && !Self::has_direction(BorrowedVector::Rabitq4(vector.as_borrowed()))
+                {
+                    return None;
+                }
                 vec![(self.input(BorrowedVector::Rabitq4(vector.as_borrowed())), 0)]
             }
         };
         Some(store)
     }
     pub unsafe fn input_sphere(self, datum: Datum) -> Option<Sphere<OwnedVector>> {
+        // A NULL sphere matches nothing; PostgreSQL rechecks it. A sphere
+        // with a NULL center or radius is malformed, as for the operators.
         if datum.is_null() {
             return None;
         }
@@ -99,23 +152,38 @@ impl Opfamily {
         let tuple = unsafe { PgHeapTuple::from_composite_datum(datum) };
         let center = match self {
             Self::VectorL2 | Self::VectorCosine | Self::VectorIp => {
-                let vector = tuple.get_by_index::<VectorOutput>(attno_1).unwrap()?;
+                let vector = tuple
+                    .get_by_index::<VectorOutput>(attno_1)
+                    .unwrap()
+                    .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Vecf32(vector.as_borrowed()))
             }
             Self::HalfvecL2 | Self::HalfvecCosine | Self::HalfvecIp => {
-                let vector = tuple.get_by_index::<HalfvecOutput>(attno_1).unwrap()?;
+                let vector = tuple
+                    .get_by_index::<HalfvecOutput>(attno_1)
+                    .unwrap()
+                    .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
             }
             Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
-                let vector = tuple.get_by_index::<Rabitq8Output>(attno_1).unwrap()?;
+                let vector = tuple
+                    .get_by_index::<Rabitq8Output>(attno_1)
+                    .unwrap()
+                    .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
             }
             Self::Rabitq4L2 | Self::Rabitq4Cosine | Self::Rabitq4Ip => {
-                let vector = tuple.get_by_index::<Rabitq4Output>(attno_1).unwrap()?;
+                let vector = tuple
+                    .get_by_index::<Rabitq4Output>(attno_1)
+                    .unwrap()
+                    .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
                 self.input(BorrowedVector::Rabitq4(vector.as_borrowed()))
             }
         };
-        let radius = tuple.get_by_index::<f32>(attno_2).unwrap()?;
+        let radius = tuple
+            .get_by_index::<f32>(attno_2)
+            .unwrap()
+            .unwrap_or_else(|| pgrx::error!("Bad input: empty radius at sphere"));
         Some(Sphere { center, radius })
     }
     pub unsafe fn input_vector(self, datum: Datum) -> Option<OwnedVector> {

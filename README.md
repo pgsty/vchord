@@ -3,7 +3,7 @@
 [![Website: vchord.pgsty.com](https://img.shields.io/badge/Website-vchord.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://vchord.pgsty.com/)
 [![Docs: vchord](https://img.shields.io/badge/Docs-vchord-slategray?style=flat)](https://vchord.pgsty.com/docs/vchord/)
 [![Catalog: vchord](https://img.shields.io/badge/Catalog-vchord-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
-[![Version: v1.2.0](https://img.shields.io/badge/Version-v1.2.0-slategray?style=flat)](https://github.com/pgsty/vchord/releases)
+[![Version: v1.3.0](https://img.shields.io/badge/Version-v1.3.0-slategray?style=flat)](https://github.com/pgsty/vchord/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](https://github.com/pgsty/vchord/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/vchord?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/vchord&Date)
 [![PostgreSQL: 14-19](https://img.shields.io/badge/PostgreSQL-14--19-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
@@ -123,6 +123,17 @@ and spaces inside a value are invalid, and one trailing comma is ignored for
 compatibility with 1.1.1. An empty string is valid for `lists = []`.
 For `vchordg`, `alpha` must contain 1–8 ascending values starting with `1.0`,
 all below `2.0`.
+
+### Graph maintenance in the planned 1.3.0 release
+
+`VACUUM` repairs `vchordg` locally and reuses deleted space. It follows deleted
+bridges when a neighbour list has spare capacity, with bounded expansion and
+the existing pruning strategy. Arbitrary deletion patterns can still reduce
+ANN recall. Keep autovacuum enabled, measure recall after large deletes, and
+use `REINDEX INDEX CONCURRENTLY index_name` to rebuild from the table when
+needed. Concurrent rebuilding allows reads and writes but needs extra disk
+space and build resources; run it outside a transaction block. See
+[Graph maintenance](https://vchord.pgsty.com/docs/vchord/usage/graph-index/#maintenance).
 
 ### PostgreSQL 19 RC1 validation
 

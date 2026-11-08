@@ -37,6 +37,33 @@ where
     (left << half_width) | right
 }
 
+/// Lazily enumerates a pseudo-random permutation of `0..n` (the order in which
+/// index builds sample heap blocks).
+///
+/// The permutation runs a Feistel network over the smallest power-of-two domain
+/// of even width that contains `n`, skipping values `>= n`. The domain is
+/// computed in `u64`: for `n >= 2^30` its width is 32, and `1 << 32` overflowed
+/// a `u32` (release builds then sampled at most one block).
+pub fn sample(n: u32, key: [u8; 8]) -> impl Iterator<Item = u32> + Clone {
+    let width = if n == 0 {
+        0
+    } else {
+        (n.ilog2() + 1).next_multiple_of(2)
+    };
+    let end: u64 = if n == 0 { 0 } else { 1 << width };
+    let secret = move |round: u32, x: u64| {
+        let mut buffer = [0_u8; 20];
+        buffer[0..4].copy_from_slice(&round.to_le_bytes());
+        buffer[4..12].copy_from_slice(&x.to_le_bytes());
+        buffer[12..20].copy_from_slice(&key);
+        wyhash::wyhash(&buffer, 0)
+    };
+    (0..end)
+        .map(move |i| feistel::<u64>(width, i, 8, secret))
+        .filter(move |&x| x < u64::from(n))
+        .map(|x| x as u32)
+}
+
 pub trait Zero {
     fn zero() -> Self;
 }
@@ -93,7 +120,7 @@ fn is_a_permutation() {
 }
 
 #[test]
-fn sample() {
+fn small_u32_domain() {
     let n = if cfg!(not(miri)) { 6370_u32 } else { 637_u32 };
     let width = (n.ilog2() + 1).next_multiple_of(2);
     let key_0 = rand::RngExt::random(&mut rand::rng());
@@ -109,4 +136,41 @@ fn sample() {
         assert!(permutation.next().is_some());
     }
     assert_eq!(permutation.next(), None);
+}
+
+#[test]
+fn sample_is_a_permutation() {
+    let key = [3_u8; 8];
+    assert_eq!(sample(0, key).next(), None);
+    let check = |n: u32| {
+        let mut y = sample(n, key).collect::<Vec<_>>();
+        y.sort_unstable();
+        assert_eq!(y, (0..n).collect::<Vec<_>>(), "n = {n}");
+    };
+    let limit = if cfg!(not(miri)) { 1024 } else { 64 };
+    for n in 1..=limit {
+        check(n);
+    }
+    if cfg!(not(miri)) {
+        for n in (1025..=4096).step_by(97) {
+            check(n);
+        }
+    }
+}
+
+#[test]
+fn sample_large_domains() {
+    if cfg!(miri) {
+        return;
+    }
+    let key = [5_u8; 8];
+    for n in [(1_u32 << 30) - 1, 1 << 30, 1 << 31, u32::MAX] {
+        let y = sample(n, key).take(10_000).collect::<Vec<_>>();
+        assert_eq!(y.len(), 10_000, "n = {n}");
+        assert!(y.iter().all(|&x| x < n), "n = {n}");
+        let mut z = y.clone();
+        z.sort_unstable();
+        z.dedup();
+        assert_eq!(z.len(), y.len(), "n = {n}");
+    }
 }

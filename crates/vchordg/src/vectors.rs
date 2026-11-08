@@ -131,13 +131,31 @@ pub fn read_without_accessor<R: RelationRead, O: Operator, Output>(
     Ok((neighbours_u, payload_u, version_u))
 }
 
-pub fn update<R: RelationWrite, O: Operator>(
+/// Replaces the neighbour list of `u` with `outs` if its version is still
+/// `version` (the list read as `neighbours_u`). Returns `Ok(false)` when the
+/// list changed meanwhile, so the caller recomputes.
+pub fn update<R: RelationRead + RelationWrite, O: Operator>(
     (index, pointers_u): (&R, &[Pointer]),
     (version, neighbours_u): (Wrapping<u32>, VecDeque<((u32, u16), Distance)>),
     outs: impl Iterator<Item = ((u32, u16), Distance)> + Clone,
 ) -> Result<bool, ()> {
     if outs.clone().eq(neighbours_u) {
-        return Ok(true);
+        // Nothing to write, but only if the list is still the one that was
+        // read: an unchanged result computed from a stale list must be
+        // recomputed too (#26). A share lock suffices for the check.
+        let (id, i) = pointers_u.last().unwrap().into_inner();
+        let vector_guard = index.read(id);
+        let Some(vector_bytes) = vector_guard.get(i) else {
+            // the link is broken
+            return Err(());
+        };
+        let VectorTupleReader::_0(vector_tuple) =
+            VectorTuple::<O::Vector>::deserialize_ref(vector_bytes)
+        else {
+            // the link is broken
+            return Err(());
+        };
+        return Ok(vector_tuple.version() == version);
     }
     let mut vector_guard = index.write(pointers_u.last().unwrap().into_inner().0, false);
     let Some(vector_bytes) = vector_guard.get_mut(pointers_u.last().unwrap().into_inner().1) else {

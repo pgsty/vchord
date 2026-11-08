@@ -76,17 +76,20 @@ pub fn push(index: u32, sample: &str, max_records: u32) {
         Some(c) => c,
         None => return,
     };
+    // SQLite index names are database-wide: name each table's index after
+    // it. `rowid IN (...)` deletes every surplus row (`rowid = (...)` compares
+    // with the first row of the subquery only) (#35).
     let init_statement = format!(
         "
         CREATE TABLE IF NOT EXISTS index_{index} (sample TEXT, create_at REAL);
-        CREATE INDEX IF NOT EXISTS i ON index_{index} (create_at);
+        CREATE INDEX IF NOT EXISTS i_{index} ON index_{index} (create_at);
         "
     );
     let insert_statement =
         format!("INSERT INTO index_{index} (sample, create_at) VALUES (?1, unixepoch('subsec'))");
     let count_statement = format!("SELECT COUNT(create_at) FROM index_{index}");
     let maintain_statement = format!(
-        "DELETE FROM index_{index} WHERE rowid = (
+        "DELETE FROM index_{index} WHERE rowid IN (
         SELECT rowid FROM index_{index} ORDER BY create_at ASC LIMIT ?1);"
     );
     if let Err(err) = || -> rusqlite::Result<()> {

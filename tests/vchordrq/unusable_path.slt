@@ -1,0 +1,117 @@
+# Index paths the vector access methods cannot execute (no ORDER BY vector and
+# no index clause, or index-only scans) must not win, even when every other
+# path is disabled or expensive (#32). Before the fix, vchordrq chose an
+# index-only scan for count(*) with enable_seqscan = off and failed with
+# "vector search with no WHERE clause and no ORDER BY clause is not supported".
+
+statement ok
+CREATE TABLE unusable_path (id int, v vector(3));
+
+statement ok
+INSERT INTO unusable_path SELECT i, ARRAY[i, i, i]::real[]::vector FROM generate_series(1, 1000) i;
+
+statement ok
+CREATE INDEX unusable_path_rq ON unusable_path USING vchordrq (v vector_l2_ops);
+
+statement ok
+VACUUM ANALYZE unusable_path;
+
+statement ok
+CREATE FUNCTION unusable_path_plan(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  r text;
+  result text := '';
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+    result := result || r || E'\n';
+  END LOOP;
+  RETURN result;
+END
+$$;
+
+statement ok
+SET enable_seqscan = off;
+
+query T
+SELECT unusable_path_plan('SELECT count(*) FROM unusable_path') LIKE '%unusable_path_rq%';
+----
+f
+
+query I
+SELECT count(*) FROM unusable_path;
+----
+1000
+
+query I
+SELECT count(*) FROM unusable_path WHERE id > 10;
+----
+990
+
+statement ok
+SET seq_page_cost = 1e6;
+
+statement ok
+SET cpu_tuple_cost = 1e6;
+
+query I
+SELECT count(*) FROM unusable_path;
+----
+1000
+
+statement ok
+RESET seq_page_cost;
+
+statement ok
+RESET cpu_tuple_cost;
+
+# vchordrq.enable_scan = off counts as disabled like the built-in settings, so
+# with both disabled the cheaper plan wins.
+statement ok
+SET vchordrq.enable_scan = off;
+
+query T
+SELECT unusable_path_plan($$SELECT id FROM unusable_path ORDER BY v <-> '[1,1,1]' LIMIT 1$$) LIKE '%Index Scan using unusable_path_rq%';
+----
+f
+
+statement ok
+RESET vchordrq.enable_scan;
+
+query I
+SELECT id FROM unusable_path ORDER BY v <-> '[1,1,1]' LIMIT 1;
+----
+1
+
+statement ok
+DROP INDEX unusable_path_rq;
+
+statement ok
+CREATE INDEX unusable_path_g ON unusable_path USING vchordg (v vector_l2_ops);
+
+statement ok
+VACUUM ANALYZE unusable_path;
+
+query I
+SELECT count(*) FROM unusable_path;
+----
+1000
+
+statement ok
+SET vchordg.enable_scan = off;
+
+query T
+SELECT unusable_path_plan($$SELECT id FROM unusable_path ORDER BY v <-> '[1,1,1]' LIMIT 1$$) LIKE '%Index Scan using unusable_path_g%';
+----
+f
+
+statement ok
+RESET vchordg.enable_scan;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP FUNCTION unusable_path_plan(text);
+
+statement ok
+DROP TABLE unusable_path;

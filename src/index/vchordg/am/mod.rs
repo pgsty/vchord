@@ -75,6 +75,26 @@ const TABLE: &[pgrx::pg_sys::relopt_parse_elt] = &[
 
 static RELOPT_KIND: OnceLock<pgrx::pg_sys::relopt_kind::Type> = OnceLock::new();
 
+/// Validates the `options` reloption at `CREATE INDEX ... WITH` and
+/// `ALTER INDEX ... SET`, so a malformed value is rejected immediately instead
+/// of failing at the next REINDEX (#35). Checks that need the indexed column
+/// (dimensions, vector type) still happen when the index is built.
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn validate_options(value: *const core::ffi::c_char) {
+    if value.is_null() {
+        return;
+    }
+    let s = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+    match toml::from_str::<crate::index::vchordg::types::VchordgIndexingOptions>(&s) {
+        Ok(options) => {
+            if let Err(errors) = validator::Validate::validate(&options) {
+                pgrx::error!("error while validating options: {}", errors);
+            }
+        }
+        Err(e) => pgrx::error!("failed to parse options: {}", e),
+    }
+}
+
 pub fn init() {
     RELOPT_KIND.get_or_init(|| {
         let kind;
@@ -85,7 +105,7 @@ pub fn init() {
                 c"options".as_ptr(),
                 c"Vector index options, represented as a TOML string.".as_ptr(),
                 c"".as_ptr(),
-                None,
+                Some(validate_options),
                 pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
             );
             pgrx::pg_sys::add_int_reloption(
@@ -202,13 +222,29 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         if unusable {
             // Since PostgreSQL 18, `disable_cost` alone does not lose against
             // paths disabled by `enable_*` settings, so count the path as
-            // disabled as well.
+            // disabled as well. Before PostgreSQL 18, `disable_cost` is
+            // additive: a seq scan disabled by `enable_seqscan = off` costs
+            // more than this path at `disable_cost`, so give it a cost that
+            // dominates realistic plans (#32). It stays finite on purpose:
+            // planner arithmetic such as `inf - inf` yields NaN.
             #[cfg(any(feature = "pg18", feature = "pg19"))]
             {
                 (*path).path.disabled_nodes += 1;
             }
+            *index_startup_cost = crate::index::UNUSABLE_PATH_COST;
+            *index_total_cost = crate::index::UNUSABLE_PATH_COST;
+            *index_selectivity = 0.0;
+            *index_correlation = 0.0;
+            *index_pages = 1.0;
+            return;
         }
-        if unusable || !gucs::vchordg_enable_scan() {
+        if !gucs::vchordg_enable_scan() {
+            // `vchordg.enable_scan = off` discourages the path like the
+            // built-in `enable_*` settings do.
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
+            {
+                (*path).path.disabled_nodes += 1;
+            }
             *index_startup_cost = disable_cost;
             *index_total_cost = disable_cost;
             *index_selectivity = 0.0;
@@ -243,10 +279,51 @@ pub unsafe extern "C-unwind" fn aminsert(
         for (vector, extra) in store {
             let key = ctid_to_key(ctid);
             let payload = kv_to_pointer((key, extra));
-            crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
+            if let Err(error) =
+                crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector)
+            {
+                unsafe { report_insert_error(index_relation, error) };
+            }
         }
     }
     false
+}
+
+/// Raises the error for an insertion that could not complete (#37). The
+/// inserting transaction aborts, so its vertex is dead; the next VACUUM frees
+/// it and repairs any backlink it already placed.
+///
+/// # Safety
+///
+/// `index_relation` must be a valid, open index relation.
+pub(super) unsafe fn report_insert_error(
+    index_relation: pgrx::pg_sys::Relation,
+    error: vchordg::InsertError,
+) -> ! {
+    use pgrx::pg_sys::panic::ErrorReport;
+    let name = unsafe {
+        CStr::from_ptr((*(*index_relation).rd_rel).relname.data.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let report = match error {
+        vchordg::InsertError::RetryLimit | vchordg::InsertError::Conflict => ErrorReport::new(
+            pgrx::PgSqlErrorCode::ERRCODE_T_R_SERIALIZATION_FAILURE,
+            format!(
+                "could not insert into vchordg index \"{name}\" because of concurrent changes to the index"
+            ),
+            "aminsert",
+        )
+        .set_hint("Retry the transaction."),
+        vchordg::InsertError::Corrupted(reason) => ErrorReport::new(
+            pgrx::PgSqlErrorCode::ERRCODE_INDEX_CORRUPTED,
+            format!("vchordg index \"{name}\" is corrupted: {reason}"),
+            "aminsert",
+        )
+        .set_hint("REINDEX the index."),
+    };
+    report.report(pgrx::PgLogLevel::ERROR);
+    unreachable!()
 }
 
 #[pgrx::pg_guard]
@@ -299,6 +376,15 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     if unsafe { (*info).analyze_only } {
         return stats;
     }
+    // Without a bulk delete in this VACUUM, rewrite nothing unless an earlier
+    // VACUUM left deleted vertices or unreferenced vectors behind. Returning
+    // NULL tells PostgreSQL the index did not change (#24).
+    if stats.is_null() {
+        let index = unsafe { PostgresRelation::new((*info).index) };
+        if !vchordg::pending(&index) {
+            return stats;
+        }
+    }
     let mut stats = stats;
     if stats.is_null() {
         stats = unsafe {
@@ -313,10 +399,73 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         pgrx::pg_sys::vacuum_delay_point(false);
     };
-    let live = crate::index::vchordg::dispatch::maintain(opfamily, &index, check);
+    // maintenance_work_mem is in kilobytes
+    let memory_limit =
+        usize::try_from(unsafe { pgrx::pg_sys::maintenance_work_mem }).unwrap_or(0) * 1024;
+    let maintained =
+        crate::index::vchordg::dispatch::maintain(opfamily, &index, check, memory_limit);
+    let name = unsafe {
+        CStr::from_ptr((*(*(*info).index).rd_rel).relname.data.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    match maintained.reachability {
+        vchordg::Reachability::Checked {
+            disconnected,
+            unreachable_before,
+            live,
+        } => {
+            if disconnected > 0 {
+                let message = format!(
+                    "vchordg index \"{name}\": {disconnected} of {live} live vertices may have become unreachable from the entry point during VACUUM (concurrent inserts are not accounted for); REINDEX to restore recall"
+                );
+                // Edge repair can cut off a few vertices after ordinary
+                // deletes; warn the session only when it is a noticeable
+                // share of the index, and keep smaller counts in the log.
+                if disconnected.saturating_mul(100) >= live {
+                    pgrx::warning!("{message}");
+                } else {
+                    pgrx::log!("{message}");
+                }
+            }
+            pgrx::debug1!(
+                "vchordg index \"{name}\": reachability check: {disconnected} live vertices disconnected by VACUUM, {unreachable_before} unreachable before it, {live} live"
+            );
+        }
+        vchordg::Reachability::Skipped(reason) => {
+            pgrx::debug1!("vchordg index \"{name}\": reachability check skipped: {reason}");
+        }
+    }
+    if let Some(reason) = maintained.retained {
+        pgrx::warning!(
+            "vchordg index \"{name}\": VACUUM kept deleted vertices because {reason}; run VACUUM again with a larger maintenance_work_mem"
+        );
+    }
+    if maintained.broken > 0 {
+        // A warning, not an error: an error would fail the whole VACUUM and
+        // keep the table from being cleaned up and frozen.
+        pgrx::pg_sys::panic::ErrorReport::new(
+            pgrx::PgSqlErrorCode::ERRCODE_INDEX_CORRUPTED,
+            format!(
+                "vchordg index \"{name}\" has {} damaged vertex references; VACUUM skipped them",
+                maintained.broken
+            ),
+            "amvacuumcleanup",
+        )
+        .set_hint("REINDEX the index.")
+        .report(pgrx::PgLogLevel::WARNING);
+    }
+    if maintained.stale_edges > 0 {
+        pgrx::debug1!(
+            "vchordg index \"{name}\": VACUUM removed {} edges to freed vertices",
+            maintained.stale_edges
+        );
+    }
     unsafe {
         (*stats).num_pages = relation_pages((*info).index);
-        (*stats).num_index_tuples = live as f64;
+        // Each vertex page is counted when it is visited; vertices inserted
+        // into a page after that are not, as in btree.
+        (*stats).num_index_tuples = maintained.live as f64;
         (*stats).estimated_count = false;
     }
     stats
@@ -453,6 +602,9 @@ pub unsafe extern "C-unwind" fn amgettuple(
     if direction != pgrx::pg_sys::ScanDirection::ForwardScanDirection {
         pgrx::error!("vector search without a forward scan direction is not supported");
     }
+    // `index_getnext_slot` calls back without checking interrupts while heap
+    // tuples are invisible; no buffer lock is held here (#28).
+    pgrx::pg_sys::check_for_interrupts!();
     // https://www.postgresql.org/docs/current/index-locking.html
     // If heap entries referenced physical pointers are deleted before
     // they are consumed by PostgreSQL, PostgreSQL will received wrong

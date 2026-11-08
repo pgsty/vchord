@@ -113,6 +113,11 @@ impl SearchBuilder for DefaultBuilder {
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
+        // A zero/non-finite cosine query has no direction. Cosine indexes
+        // contain only defined vectors and return no neighbours for it.
+        if !opfamily.valid_cosine_query(&vector) {
+            return Box::new(std::iter::empty());
+        }
         let vertex_hints = Hints::default().full(true);
         let vector_hints = Hints::default().full(true);
         let make_vertex_plain_prefetcher = MakePlainPrefetcher { index };
@@ -140,7 +145,7 @@ impl SearchBuilder for DefaultBuilder {
                         let projected = RandomProject::project(unprojected);
                         VectBorrowed::new(bump.alloc_slice(projected.slice()))
                     };
-                    match (options.io_search, options.io_rerank) {
+                    match vector_and_vertex_io(&options) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
                             projected,
@@ -235,7 +240,7 @@ impl SearchBuilder for DefaultBuilder {
                         let projected = RandomProject::project(unprojected);
                         VectBorrowed::new(bump.alloc_slice(projected.slice()))
                     };
-                    match (options.io_search, options.io_rerank) {
+                    match vector_and_vertex_io(&options) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
                             projected,
@@ -330,7 +335,7 @@ impl SearchBuilder for DefaultBuilder {
                         let projected = RandomProject::project(unprojected);
                         VectBorrowed::new(bump.alloc_slice(projected.slice()))
                     };
-                    match (options.io_search, options.io_rerank) {
+                    match vector_and_vertex_io(&options) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
                             projected,
@@ -425,7 +430,7 @@ impl SearchBuilder for DefaultBuilder {
                         let projected = RandomProject::project(unprojected);
                         VectBorrowed::new(bump.alloc_slice(projected.slice()))
                     };
-                    match (options.io_search, options.io_rerank) {
+                    match vector_and_vertex_io(&options) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
                             projected,
@@ -524,7 +529,7 @@ impl SearchBuilder for DefaultBuilder {
                     } else {
                         unreachable!()
                     };
-                    match (options.io_search, options.io_rerank) {
+                    match vector_and_vertex_io(&options) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
                             unprojected,
@@ -623,7 +628,7 @@ impl SearchBuilder for DefaultBuilder {
                     } else {
                         unreachable!()
                     };
-                    match (options.io_search, options.io_rerank) {
+                    match vector_and_vertex_io(&options) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
                             unprojected,
@@ -722,7 +727,7 @@ impl SearchBuilder for DefaultBuilder {
                     } else {
                         unreachable!()
                     };
-                    match (options.io_search, options.io_rerank) {
+                    match vector_and_vertex_io(&options) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
                             unprojected,
@@ -821,7 +826,7 @@ impl SearchBuilder for DefaultBuilder {
                     } else {
                         unreachable!()
                     };
-                    match (options.io_search, options.io_rerank) {
+                    match vector_and_vertex_io(&options) {
                         (Io::Plain, Io::Plain) => search::<_, Op>(
                             index,
                             unprojected,
@@ -940,4 +945,13 @@ impl SearchBuilder for DefaultBuilder {
             (opfamily.output(distance), key, recheck)
         }))
     }
+}
+
+/// Search walks vertex pages (quantized codes) and reranking reads vector pages
+/// (full-precision vectors), so `vchordg.io_search` selects the vertex
+/// prefetcher and `vchordg.io_rerank` the vector prefetcher, as documented.
+/// Every dispatch arm below is written as `(vector io, vertex io)`; it used to
+/// be matched against `(io_search, io_rerank)`, which swapped them (#35).
+fn vector_and_vertex_io(options: &SearchOptions) -> (Io, Io) {
+    (options.io_rerank, options.io_search)
 }

@@ -9,7 +9,6 @@
 use crate::index::fetcher::*;
 use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordrq::dispatch::*;
-use crate::index::vchordrq::filter::filter;
 use crate::index::vchordrq::opclass::Opfamily;
 use crate::index::vchordrq::scanners::SearchOptions;
 use crate::recorder::Recorder;
@@ -17,6 +16,7 @@ use always_equal::AlwaysEqual;
 use dary_heap::QuaternaryHeap as Heap;
 use distance::Distance;
 use index::bump::Bump;
+use index::filter::filter;
 use index::packed::PackedRefMut8;
 use index::prefetcher::*;
 use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};

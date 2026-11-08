@@ -14,8 +14,9 @@ use vector::rabitq4::Rabitq4Borrowed;
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
 fn _vchord_rabitq4_in(input: &CStr, oid: Oid, typmod: i32) -> Rabitq4Output {
-    let _ = (oid, typmod);
+    let _ = oid;
     let (metadata, unpacked_code) = rabitq_io::parse_text(input, "rabitq4", 15);
+    rabitq_io::check_typmod("rabitq4", typmod, unpacked_code.len() as u32);
     let packed_code = rabitq::halfbyte::pack_code(&unpacked_code);
     let Some(x) = Rabitq4Borrowed::new_checked(
         unpacked_code.len() as _,

@@ -40,10 +40,13 @@ where
         let mut results = Vec::new();
         for first in state {
             tape::read_h1_tape::<R, _, _>(
-                by_next(index, first).inspect(|_| check()),
+                by_next(index, first),
                 || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                 |(), _, _, first, _| results.push(first),
             );
+            // `check` sleeps for cost-based delay and checks interrupts, which
+            // LWLocks hold off: call it only where no buffer lock is held (#30).
+            check();
         }
         results
     };
@@ -51,16 +54,16 @@ where
         state = step(state);
     }
     for first in state {
+        // The list's jump page stays share-locked while it is processed.
+        check();
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-        let mut directory = tape::read_directory_tape::<R>(
-            by_next(index, jump_tuple.directory_first()).inspect(|_| check()),
-        );
+        let mut directory =
+            tape::read_directory_tape::<R>(by_next(index, jump_tuple.directory_first()));
         {
             let mut current = directory.next().unwrap_or(u32::MAX);
             while current != u32::MAX {
-                check();
                 let read = index.read(current);
                 let flag = 'flag: {
                     for i in 1..=read.len() {
@@ -98,7 +101,6 @@ where
         {
             let mut current = jump_tuple.appendable_first();
             while current != u32::MAX {
-                check();
                 let read = index.read(current);
                 let flag = 'flag: {
                     for i in 1..=read.len() {

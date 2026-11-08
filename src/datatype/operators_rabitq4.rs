@@ -131,6 +131,11 @@ fn _vchord_rabitq4_operator_maxsim(
         for lhs in lhs.iter().flatten() {
             let lhs = lhs.as_borrowed();
             let rhs = rhs.as_borrowed();
+            // The kernels only assert equal storage lengths, which rabitq4
+            // shares between odd and even dimensions (#31).
+            if lhs.dim() != rhs.dim() {
+                pgrx::error!("dimension is not matched");
+            }
             d = d.min(Rabitq4Borrowed::operator_dot(lhs, rhs).to_f32());
         }
         maxsim += d;

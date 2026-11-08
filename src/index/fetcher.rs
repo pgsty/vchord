@@ -61,8 +61,15 @@ impl HeapFetcher {
         hack: *mut pgrx::pg_sys::IndexScanState,
     ) -> Self {
         unsafe {
-            let index_info = pgrx::pg_sys::BuildIndexInfo(index_relation);
             let estate = pgrx::pg_sys::CreateExecutorState();
+            // Build the IndexInfo (and its expression trees) in the executor
+            // state's context, so `FreeExecutorState` releases it. A fetcher is
+            // created per rescan; allocating in the caller's context retained
+            // one IndexInfo per rescan until the statement ended (#35).
+            let index_info = {
+                let _switch = crate::index::MemoryContextSwitch::new((*estate).es_query_cxt);
+                pgrx::pg_sys::BuildIndexInfo(index_relation)
+            };
             let econtext = pgrx::pg_sys::MakePerTupleExprContext(estate);
             Self {
                 index_info,

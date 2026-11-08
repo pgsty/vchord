@@ -490,7 +490,11 @@ unsafe fn parallel_build(
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
-                    crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
+                    if let Err(error) =
+                        crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector)
+                    {
+                        unsafe { super::report_insert_error(index_relation, error) };
+                    }
                     index_tuples += 1;
                 }
                 unsafe {
@@ -560,7 +564,11 @@ unsafe fn sequential_build(
                 for (vector, extra) in store {
                     let key = ctid_to_key(ctid);
                     let payload = kv_to_pointer((key, extra));
-                    crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
+                    if let Err(error) =
+                        crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector)
+                    {
+                        unsafe { super::report_insert_error(index_relation, error) };
+                    }
                     index_tuples += 1;
                 }
                 indtuples += 1;

@@ -131,6 +131,26 @@ const TABLE: &[pgrx::pg_sys::relopt_parse_elt] = &[
 
 static RELOPT_KIND: OnceLock<pgrx::pg_sys::relopt_kind::Type> = OnceLock::new();
 
+/// Validates the `options` reloption at `CREATE INDEX ... WITH` and
+/// `ALTER INDEX ... SET`, so a malformed value is rejected immediately instead
+/// of failing at the next REINDEX (#35). Checks that need the indexed column
+/// (dimensions, vector type) still happen when the index is built.
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn validate_options(value: *const core::ffi::c_char) {
+    if value.is_null() {
+        return;
+    }
+    let s = unsafe { CStr::from_ptr(value) }.to_string_lossy();
+    match toml::from_str::<crate::index::vchordrq::types::VchordrqIndexingOptions>(&s) {
+        Ok(options) => {
+            if let Err(errors) = validator::Validate::validate(&options) {
+                pgrx::error!("error while validating options: {}", errors);
+            }
+        }
+        Err(e) => pgrx::error!("failed to parse options: {}", e),
+    }
+}
+
 pub fn init() {
     RELOPT_KIND.get_or_init(|| {
         let kind;
@@ -141,7 +161,7 @@ pub fn init() {
                 c"options".as_ptr(),
                 c"Vector index options, represented as a TOML string.".as_ptr(),
                 c"".as_ptr(),
-                None,
+                Some(validate_options),
                 pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
             );
             pgrx::pg_sys::add_string_reloption(
@@ -276,10 +296,30 @@ pub unsafe extern "C-unwind" fn amcostestimate(
     unsafe {
         use pgrx::pg_sys::disable_cost;
         let index_opt_info = (*path).indexinfo;
-        // do not use index, if there are no orderbys or clauses
-        if ((*path).indexorderbys.is_null() && (*path).indexclauses.is_null())
-            || !gucs::vchordrq_enable_scan()
-        {
+        // Without ORDER BY or vector clauses `amrescan` rejects the scan, and
+        // this index cannot return tuple data for index-only scans. Make such
+        // paths lose to any usable plan: count them as disabled (PostgreSQL
+        // 18 compares disabled nodes first) and give them a dominating finite
+        // cost (before PostgreSQL 18, `disable_cost` is additive) (#32).
+        let unusable = ((*path).indexorderbys.is_null() && (*path).indexclauses.is_null())
+            || (*path).path.pathtype == pgrx::pg_sys::NodeTag::T_IndexOnlyScan;
+        if unusable {
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
+            {
+                (*path).path.disabled_nodes += 1;
+            }
+            *index_startup_cost = crate::index::UNUSABLE_PATH_COST;
+            *index_total_cost = crate::index::UNUSABLE_PATH_COST;
+            *index_selectivity = 0.0;
+            *index_correlation = 0.0;
+            *index_pages = 1.0;
+            return;
+        }
+        if !gucs::vchordrq_enable_scan() {
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
+            {
+                (*path).path.disabled_nodes += 1;
+            }
             *index_startup_cost = disable_cost;
             *index_total_cost = disable_cost;
             *index_selectivity = 0.0;
@@ -531,6 +571,24 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     scan
 }
 
+/// Prefiltering evaluates the executor's qual inside the index scan, and the
+/// executor evaluates it again on returned rows. Keep quals with volatile
+/// functions or SubPlans (whose plans `contain_volatile_functions` does not
+/// inspect) in the executor only (#34).
+unsafe fn prefilter_safe(hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>) -> bool {
+    let Some(hack) = hack else {
+        return true;
+    };
+    unsafe {
+        let plan = (*hack.as_ptr()).ss.ps.plan;
+        if plan.is_null() {
+            return true;
+        }
+        let qual = (*plan).qual.cast::<pgrx::pg_sys::Node>();
+        !(pgrx::pg_sys::contain_volatile_functions(qual) || pgrx::pg_sys::contain_subplans(qual))
+    }
+}
+
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn amrescan(
     scan: pgrx::pg_sys::IndexScanDesc,
@@ -578,7 +636,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             maxsim_threshold: gucs::vchordrq_maxsim_threshold((*scan).indexRelation),
             io_search: gucs::vchordrq_io_search(),
             io_rerank: gucs::vchordrq_io_rerank(),
-            prefilter: gucs::vchordrq_prefilter(),
+            prefilter: gucs::vchordrq_prefilter() && prefilter_safe(scanner.hack),
         };
         let fetcher = {
             let hack = scanner.hack;
@@ -675,6 +733,9 @@ pub unsafe extern "C-unwind" fn amgettuple(
     if direction != pgrx::pg_sys::ScanDirection::ForwardScanDirection {
         pgrx::error!("vector search without a forward scan direction is not supported");
     }
+    // `index_getnext_slot` calls back without checking interrupts while heap
+    // tuples are invisible; no buffer lock is held here (#28).
+    pgrx::pg_sys::check_for_interrupts!();
     // https://www.postgresql.org/docs/current/index-locking.html
     // If heap entries referenced physical pointers are deleted before
     // they are consumed by PostgreSQL, PostgreSQL will received wrong

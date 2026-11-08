@@ -1,0 +1,115 @@
+# vchordrq.prefilter evaluates the executor's qual inside the index scan.
+# Volatile quals and SubPlans must stay in the executor (their side effects
+# and results would otherwise be produced more than once), and non-volatile
+# quals must give the same rows as without prefiltering (#34).
+
+statement ok
+CREATE TABLE pf (id int, v vector(3), flag bool);
+
+statement ok
+INSERT INTO pf SELECT i, ARRAY[i, i, i]::real[]::vector, i % 3 = 0 FROM generate_series(1, 1000) i;
+
+statement ok
+CREATE TABLE pf_side (id int, flag bool);
+
+statement ok
+INSERT INTO pf_side SELECT i, i % 5 = 0 FROM generate_series(1, 1000) i;
+
+statement ok
+CREATE INDEX pf_rq ON pf USING vchordrq (v vector_l2_ops);
+
+statement ok
+CREATE SEQUENCE pf_seq;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.prefilter = on;
+
+# A volatile qual is evaluated once per returned row, by the executor only.
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM pf WHERE nextval('pf_seq') > 0 ORDER BY v <-> '[1,1,1]' LIMIT 5
+) s;
+----
+{1,2,3,4,5}
+
+query I
+SELECT currval('pf_seq');
+----
+5
+
+# A correlated SubPlan with a volatile function.
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM pf WHERE id IN (SELECT s.id FROM pf_side s WHERE s.id = pf.id AND random() < 2)
+  ORDER BY v <-> '[1,1,1]' LIMIT 3
+) s;
+----
+{1,2,3}
+
+# Non-volatile quals: the same rows with and without prefiltering, including
+# a correlated SubPlan and parameterized rescans through LATERAL.
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM pf WHERE flag ORDER BY v <-> '[500,500,500]' LIMIT 4
+) s;
+----
+{501,498,504,495}
+
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM pf WHERE EXISTS (SELECT 1 FROM pf_side s WHERE s.id = pf.id AND s.flag)
+  ORDER BY v <-> '[501,501,501]' LIMIT 3
+) s;
+----
+{500,505,495}
+
+query I
+SELECT array_agg(t.id ORDER BY q.k) FROM (VALUES (1, 10), (2, 300), (3, 700)) q(k, c),
+  LATERAL (
+    SELECT id FROM pf WHERE flag AND EXISTS (SELECT 1 FROM pf_side s WHERE s.id = pf.id AND s.id % 2 = 0)
+    ORDER BY v <-> ARRAY[q.c, q.c, q.c]::real[]::vector LIMIT 1
+  ) t;
+----
+{12,300,702}
+
+statement ok
+SET vchordrq.prefilter = off;
+
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM pf WHERE flag ORDER BY v <-> '[500,500,500]' LIMIT 4
+) s;
+----
+{501,498,504,495}
+
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM pf WHERE EXISTS (SELECT 1 FROM pf_side s WHERE s.id = pf.id AND s.flag)
+  ORDER BY v <-> '[501,501,501]' LIMIT 3
+) s;
+----
+{500,505,495}
+
+query I
+SELECT array_agg(t.id ORDER BY q.k) FROM (VALUES (1, 10), (2, 300), (3, 700)) q(k, c),
+  LATERAL (
+    SELECT id FROM pf WHERE flag AND EXISTS (SELECT 1 FROM pf_side s WHERE s.id = pf.id AND s.id % 2 = 0)
+    ORDER BY v <-> ARRAY[q.c, q.c, q.c]::real[]::vector LIMIT 1
+  ) t;
+----
+{12,300,702}
+
+statement ok
+RESET vchordrq.prefilter;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE pf, pf_side;
+
+statement ok
+DROP SEQUENCE pf_seq;

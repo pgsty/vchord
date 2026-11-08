@@ -21,6 +21,12 @@ use std::cell::RefCell;
 
 pub trait MaintainChooser {
     fn choose(&mut self, i: usize) -> bool;
+    /// Whether a chosen list whose compaction would reproduce its tapes
+    /// unchanged may be skipped (VACUUM); parallel build compaction always
+    /// rewrites.
+    fn skip_unchanged(&self) -> bool {
+        false
+    }
 }
 
 pub struct Maintain {
@@ -56,10 +62,13 @@ where
         let mut results = Vec::new();
         for first in state {
             tape::read_h1_tape::<R, _, _>(
-                tape::by_next(index, first).inspect(|_| check()),
+                tape::by_next(index, first),
                 || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                 |(), _, _, first, _| results.push(first),
             );
+            // `check` sleeps for cost-based delay and checks interrupts, which
+            // LWLocks hold off: call it only where no buffer lock is held (#30).
+            check();
         }
         results
     };
@@ -81,9 +90,18 @@ where
     });
 
     let mut number_of_tuples = 0_u64;
+    let mut number_of_freed_pages = 0_usize;
 
     for (idx, first) in state.into_iter().enumerate() {
         if !chooser.choose(idx) {
+            continue;
+        }
+
+        if chooser.skip_unchanged()
+            && let Some(tuples) = inspect_unchanged::<R>(index, first)
+        {
+            number_of_tuples += tuples;
+            check();
             continue;
         }
 
@@ -136,12 +154,10 @@ where
         });
         let directory = tape::read_directory_tape::<R>(
             tape::by_next(index, *jump_tuple.directory_first())
-                .inspect(|_| check())
                 .inspect(|guard| trace_directory.push(guard.id())),
         );
         tape::read_frozen_tape::<R, _, _>(
             tape::by_directory(&mut prefetch_h0_tuples, directory)
-                .inspect(|_| check())
                 .inspect(|guard| trace_forzen.push(guard.id())),
             || {
                 FunctionalAccessor::new(
@@ -174,7 +190,6 @@ where
         );
         tape::read_appendable_tape::<R, _>(
             tape::by_next(index, *jump_tuple.appendable_first())
-                .inspect(|_| check())
                 .inspect(|guard| trace_appendable.push(guard.id())),
             |metadata, elements, delta| {
                 let signs = elements
@@ -221,7 +236,6 @@ where
         let frozen_first = { frozen_tape }.first();
 
         let directory = tape::by_next(index, frozen_first)
-            .inspect(|_| check())
             .map(|guard| guard.id())
             .collect::<Vec<_>>();
 
@@ -235,25 +249,82 @@ where
         *jump_tuple.tuples() = tuples;
         number_of_tuples += tuples;
 
+        // Publish the new tapes (dropping the guard WAL-logs the jump page),
+        // then free this list's retired pages right away instead of keeping
+        // them in memory until every list is done, so a cancellation at the
+        // `check` below cannot lose them (#30). Later lists allocate them
+        // back from the free list.
         drop(jump_guard);
 
-        let mut buffers = buffers.borrow_mut();
-        buffers.pages.extend_from_slice(&trace_directory);
-        buffers.pages.extend_from_slice(&trace_forzen);
-        buffers.pages.extend_from_slice(&trace_appendable);
+        for id in trace_directory
+            .into_iter()
+            .chain(trace_forzen)
+            .chain(trace_appendable)
+        {
+            freepages::free(index, freepages_first, id);
+            number_of_freed_pages += 1;
+        }
+        check();
     }
 
     let buffers = RefCell::into_inner(buffers);
     for id in buffers.pages.iter().copied() {
         freepages::free(index, freepages_first, id);
+        number_of_freed_pages += 1;
+        check();
     }
 
     Maintain {
         number_of_formerly_allocated_pages: buffers.number_of_formerly_allocated_pages,
         number_of_freshly_allocated_pages: buffers.number_of_freshly_allocated_pages,
-        number_of_freed_pages: buffers.pages.len(),
+        number_of_freed_pages,
         number_of_tuples,
     }
+}
+
+/// Decides, under the list's jump page share lock, whether compacting the
+/// list would reproduce its tapes unchanged: no frozen or appendable entry is
+/// deleted (raw payload slots are inspected; the tape readers skip deleted
+/// entries) and the appendable tape holds fewer tuples than one frozen block,
+/// so compaction would write the same frozen blocks and the same remainder.
+/// Returns the live tuple count of an unchanged list (#24).
+fn inspect_unchanged<R: RelationRead>(index: &R, first: u32) -> Option<u64>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let jump_guard = index.read(first);
+    let jump_bytes = jump_guard.get(1).expect("data corruption");
+    let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+    let mut frozen = 0_u64;
+    let directory =
+        tape::read_directory_tape::<R>(tape::by_next(index, jump_tuple.directory_first()))
+            .collect::<Vec<_>>();
+    for id in directory {
+        let guard = index.read(id);
+        for i in 1..=guard.len() {
+            let bytes = guard.get(i).expect("data corruption");
+            if let FrozenTupleReader::_0(tuple) = FrozenTuple::deserialize_ref(bytes) {
+                if tuple.payload().iter().any(Option::is_none) {
+                    return None;
+                }
+                frozen += 32;
+            }
+        }
+    }
+    let mut appendable = 0_u64;
+    for guard in tape::by_next(index, jump_tuple.appendable_first()) {
+        for i in 1..=guard.len() {
+            let bytes = guard.get(i).expect("data corruption");
+            // a deleted entry: the list needs compacting
+            AppendableTuple::deserialize_ref(bytes).payload()?;
+            appendable += 1;
+        }
+        if appendable >= 32 {
+            return None;
+        }
+    }
+    drop(jump_guard);
+    Some(frozen + appendable)
 }
 
 #[derive(Clone)]

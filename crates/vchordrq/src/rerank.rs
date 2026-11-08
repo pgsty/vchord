@@ -53,10 +53,15 @@ where
     type Item = (Distance, NonZero<u64>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(((_, AlwaysEqual(mut w)), prefetch)) = self
-            .prefetcher
-            .next_if(|((d, _), ..)| Some(*d) > self.cache.peek().map(|(d, ..)| *d))
-        {
+        loop {
+            // The previous candidate's guards are released here (#28).
+            index::interrupt::check();
+            let Some(((_, AlwaysEqual(mut w)), prefetch)) = self
+                .prefetcher
+                .next_if(|((d, _), ..)| Some(*d) > self.cache.peek().map(|(d, ..)| *d))
+            else {
+                break;
+            };
             let &mut (payload, head, ..) = w.get_mut();
             if let Some(distance) = (self.f)(payload, prefetch, head) {
                 self.cache.push((Reverse(distance), AlwaysEqual(payload)));

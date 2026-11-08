@@ -215,6 +215,8 @@ where
 
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
     for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
+        // Between lists nothing is locked (#28).
+        index::interrupt::check();
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
@@ -413,6 +415,8 @@ where
 
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
     for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in state {
+        // Between lists nothing is locked (#28).
+        index::interrupt::check();
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
@@ -457,6 +461,7 @@ where
         if threshold == 0 {
             break;
         }
+        index::interrupt::check();
         let jump_guard = index.read(first);
         let jump_bytes = jump_guard.get(1).expect("data corruption");
         let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);

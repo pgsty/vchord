@@ -297,11 +297,97 @@ mod mul_add_round {
     }
 }
 
+/// Quantizes `lut` to codes in `0..=n` with `x ~= b + code * k`; returns
+/// `(k, b, codes)`.
+///
+/// The span is computed in f64 (`max - min` can overflow f32 for finite
+/// inputs), values are shifted by `b` before scaling (computing
+/// `x / k - b / k` cancels badly when `|b|` is much larger than the span, and
+/// produced codes such as 64 for `n = 63`), and codes are clamped to `n`. A
+/// zero, subnormal or non-finite span gives `k = 0` and all-zero codes (#35).
 #[inline(always)]
 pub fn quantize(lut: &[f32], n: f32) -> (f32, f32, Vec<u8>) {
     use crate::Floating;
     let (min, max) = f32::reduce_min_max_of_x(lut);
-    let k = 0.0f32.max((max - min) / n);
     let b = min;
-    (k, b, mul_add_round::mul_add_round(lut, 1.0 / k, -b / k))
+    let k = (0.0f64.max((f64::from(max) - f64::from(min)) / f64::from(n)) as f32).min(f32::MAX);
+    if !(k > 0.0 && (1.0 / k).is_finite() && b.is_finite()) {
+        return (0.0, b, vec![0; lut.len()]);
+    }
+    let mut codes = if (max - min).is_finite() {
+        let shifted = lut.iter().map(|&x| x - b).collect::<Vec<_>>();
+        mul_add_round::mul_add_round(&shifted, 1.0 / k, 0.0)
+    } else {
+        // `x - b` itself overflows f32: shift and scale in f64. If even the
+        // scale exceeds f32::MAX (only for tiny `n` and spans near 2 * f32::MAX)
+        // it saturates, and reconstruction is approximate.
+        let k = f64::from(k);
+        lut.iter()
+            .map(|&x| {
+                ((f64::from(x) - f64::from(b)) / k)
+                    .round_ties_even()
+                    .clamp(0.0, f64::from(n)) as u8
+            })
+            .collect()
+    };
+    let top = n as u8;
+    for code in codes.iter_mut() {
+        if *code > top {
+            *code = top;
+        }
+    }
+    (k, b, codes)
+}
+
+#[cfg(test)]
+mod quantize_tests {
+    use super::quantize;
+
+    fn check(lut: &[f32], n: f32) {
+        let (k, b, codes) = quantize(lut, n);
+        assert!(k.is_finite() && k >= 0.0, "k = {k}");
+        assert_eq!(codes.len(), lut.len());
+        for (&x, &c) in lut.iter().zip(codes.iter()) {
+            assert!(f32::from(c) <= n, "code {c} > {n}");
+            let y = f64::from(b) + f64::from(c) * f64::from(k);
+            assert!(
+                (y - f64::from(x)).abs() <= f64::from(k) * 0.5 + f64::from(x).abs() * 1e-6,
+                "x = {x}, reconstructed {y}, k = {k}, b = {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn extremes() {
+        let near = (0..64)
+            .map(|i| 1000.0 + i as f32 * 1.0e-4)
+            .collect::<Vec<_>>();
+        check(&near, 63.0);
+        check(&near, 15.0);
+        check(&near, 255.0);
+        let wide = [-3.0e38f32, 0.0, 3.0e38];
+        check(&wide, 63.0);
+        // With n = 1 the scale saturates at f32::MAX: codes stay in range.
+        let (k, _, codes) = quantize(&wide, 1.0);
+        assert!(k.is_finite() && codes.iter().all(|&c| c <= 1));
+        let random = (0..1000)
+            .map(|i| ((i * 7919) % 1000) as f32 / 37.0 - 13.0)
+            .collect::<Vec<_>>();
+        check(&random, 63.0);
+        check(&random, 255.0);
+    }
+
+    #[test]
+    fn degenerate_spans() {
+        for lut in [
+            vec![5.0f32; 10],
+            vec![0.0, f32::MIN_POSITIVE * 1.0e-3],
+            vec![1.0e-40, 2.0e-40],
+        ] {
+            let (k, b, codes) = quantize(&lut, 63.0);
+            assert_eq!(k, 0.0);
+            assert_eq!(b, lut.iter().copied().fold(f32::INFINITY, f32::min));
+            assert!(codes.iter().all(|&c| c == 0));
+        }
+    }
 }

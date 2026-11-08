@@ -199,6 +199,13 @@ impl<'a> Rabitq8Borrowed<'a> {
         self.sum_of_x2
     }
 
+    /// Whether the encoded vector has a direction: its squared norm is
+    /// positive and finite. See `VectBorrowed::direction_norm`.
+    #[inline(always)]
+    pub fn has_direction(&self) -> bool {
+        self.sum_of_x2 > 0.0 && self.sum_of_x2.is_finite()
+    }
+
     #[inline(always)]
     pub fn norm_of_lattice(&self) -> f32 {
         self.norm_of_lattice
@@ -298,10 +305,17 @@ impl VectorBorrowed for Rabitq8Borrowed<'_> {
 
     #[inline(always)]
     fn operator_cos(self, rhs: Self) -> Distance {
+        if !(self.has_direction() && rhs.has_direction()) {
+            return Distance::from_f32(f32::NAN);
+        }
+
         let dim = self.dim();
         let sum = rabitq::byte::binary::accumulate(self.packed_code, rhs.packed_code);
+        // `half_process_cos` estimates `-cos`; report the cosine distance
+        // `1 - cos` like `VectBorrowed::operator_cos` and both index access
+        // methods do. Zero and non-finite norms are undefined.
         Distance::from_f32(
-            rabitq::byte::binary::half_process_cos(
+            1.0 + rabitq::byte::binary::half_process_cos(
                 dim,
                 sum,
                 rabitq::byte::CodeMetadata {
@@ -333,7 +347,7 @@ impl VectorBorrowed for Rabitq8Borrowed<'_> {
     fn function_normalize(&self) -> Rabitq8Owned {
         // See `VectBorrowed::function_normalize`: a zero vector stays zero
         // instead of pretending to be the unit vector its middle code encodes.
-        if !(self.sum_of_x2 > 0.0 && self.sum_of_x2.is_finite()) {
+        if !self.has_direction() {
             return self.own();
         }
         Rabitq8Owned {

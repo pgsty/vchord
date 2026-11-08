@@ -1,0 +1,102 @@
+# rabitq8/rabitq4 output, typmod and MaxSim checks (#31).
+
+# Dequantized values must be readable by pgvector: at most 16000 dimensions,
+# finite coordinates (halfvec: after narrowing to f16).
+query T
+SELECT vector_dims(dequantize_to_vector(format('(1,1,0,1)[%s]', array_to_string(array_fill(127, ARRAY[16000]), ','))::rabitq8)) = 16000;
+----
+t
+
+statement error cannot have more than 16000 dimensions
+SELECT dequantize_to_vector(format('(1,1,0,1)[%s]', array_to_string(array_fill(127, ARRAY[16001]), ','))::rabitq8);
+
+statement error cannot have more than 16000 dimensions
+SELECT dequantize_to_halfvec(format('(1,1,0,1)[%s]', array_to_string(array_fill(7, ARRAY[16001]), ','))::rabitq4);
+
+statement error out of range for type vector
+SELECT dequantize_to_vector('(NaN,1,0,1)[1]'::rabitq8);
+
+statement error out of range for type vector
+SELECT dequantize_to_vector('(NaN,1,0,1)[1]'::rabitq4);
+
+statement error out of range for type halfvec
+SELECT dequantize_to_halfvec(quantize_to_rabitq8('[100000,1]'::vector));
+
+statement error out of range for type halfvec
+SELECT dequantize_to_halfvec(quantize_to_rabitq4('[100000,1]'::vector));
+
+query T
+SELECT dequantize_to_halfvec(quantize_to_rabitq8('[1000,1]'::vector)) IS NOT NULL;
+----
+t
+
+# The declared dimension is enforced by the input functions, which PostgreSQL
+# calls with the column's typmod in COPY (text and binary). Literals in INSERT
+# are converted with typmod -1 and need a length-coercion cast, which is a new
+# SQL object and still missing (#31 stays open for it).
+statement ok
+CREATE TABLE rq_types (v8 rabitq8(3), v4 rabitq4(3));
+
+statement ok
+INSERT INTO rq_types VALUES ('(1,1,1,1)[1,2,3]', '(1,1,1,1)[1,2,3]');
+
+statement ok
+CREATE TABLE rq_types_src (v8 rabitq8, v4 rabitq4);
+
+statement ok
+INSERT INTO rq_types_src VALUES ('(1,1,1,1)[1,2,3,4]', '(1,1,1,1)[1,2,3,4]');
+
+statement ok
+COPY rq_types_src TO '/tmp/vchord_rq_types.txt';
+
+statement error expected 3 dimensions, not 4
+COPY rq_types FROM '/tmp/vchord_rq_types.txt';
+
+statement ok
+COPY rq_types_src TO '/tmp/vchord_rq_types.bin' (FORMAT binary);
+
+statement error expected 3 dimensions, not 4
+COPY rq_types FROM '/tmp/vchord_rq_types.bin' (FORMAT binary);
+
+statement ok
+CREATE TABLE rq_types_4 (v8 rabitq8(4), v4 rabitq4(4));
+
+statement ok
+COPY rq_types_4 FROM '/tmp/vchord_rq_types.bin' (FORMAT binary);
+
+statement ok
+COPY rq_types_4 FROM '/tmp/vchord_rq_types.txt';
+
+query T
+SELECT bool_and(v8::text = '(1, 1, 1, 1)[1, 2, 3, 4]' AND v4::text = '(1, 1, 1, 1)[1, 2, 3, 4]') FROM rq_types_4;
+----
+t
+
+# MaxSim compares the dimensions of every pair.
+statement error dimension is not matched
+SELECT ARRAY[quantize_to_rabitq4('[1,2,3]'::vector)] @# ARRAY[quantize_to_rabitq4('[1,2,3,4]'::vector)];
+
+statement error dimension is not matched
+SELECT ARRAY[quantize_to_rabitq8('[1,2,3]'::vector)] @# ARRAY[quantize_to_rabitq8('[1,2,3,4]'::vector)];
+
+statement error dimension is not matched
+SELECT ARRAY['[1,2,3]'::vector] @# ARRAY['[1,2,3,4]'::vector];
+
+statement error dimension is not matched
+SELECT ARRAY['[1,2,3]'::halfvec] @# ARRAY['[1,2,3,4]'::halfvec];
+
+statement error dimension is not matched
+SELECT ARRAY[quantize_to_rabitq4('[1,2,3]'::vector), NULL] @# ARRAY[NULL, quantize_to_rabitq4('[1,2,3,4]'::vector)];
+
+query R
+SELECT ARRAY[quantize_to_rabitq4('[1,2,3]'::vector)] @# ARRAY[]::rabitq4[];
+----
+0
+
+query R
+SELECT ARRAY['[1,0,0]'::vector, NULL] @# ARRAY[NULL, '[1,0,0]'::vector];
+----
+-1
+
+statement ok
+DROP TABLE rq_types, rq_types_src, rq_types_4;

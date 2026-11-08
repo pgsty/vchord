@@ -55,6 +55,13 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                 if Some(true) == dirty_check_vchordg(index_relation) {
                     use crate::index::vchordg::am::Scanner;
 
+                    // `standard_ExecutorStart` has switched back to the caller's
+                    // context. Begin the scan in the query's context, as
+                    // `IndexNext` would; otherwise the Scanner lives as long as
+                    // the caller's context (for an SQL function on PG14-17, the
+                    // whole outer query) (#25).
+                    let _switch =
+                        crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
                     (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
@@ -83,6 +90,13 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                 if Some(true) == dirty_check_vchordrq(index_relation) {
                     use crate::index::vchordrq::am::Scanner;
 
+                    // `standard_ExecutorStart` has switched back to the caller's
+                    // context. Begin the scan in the query's context, as
+                    // `IndexNext` would; otherwise the Scanner lives as long as
+                    // the caller's context (for an SQL function on PG14-17, the
+                    // whole outer query) (#25).
+                    let _switch =
+                        crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
                     (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,

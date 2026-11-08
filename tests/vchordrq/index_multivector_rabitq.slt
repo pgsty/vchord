@@ -78,9 +78,9 @@ LIMIT 10;
 537
 174
 79
-194
 1920
 239
+194
 
 statement ok
 DROP INDEX pg_temp.ti;

@@ -76,7 +76,12 @@ where
         candidates.push((Reverse(score_s), AlwaysEqual((pointers_s, payload_s))));
     }
     let mut iter = std::iter::from_fn(move || {
-        while let Some(((_, AlwaysEqual((pointers_u, payload_u))), guards)) = candidates.pop() {
+        loop {
+            // Nothing is locked here: the previous candidate's guards are gone.
+            index::interrupt::check();
+            let Some(((_, AlwaysEqual((pointers_u, payload_u))), guards)) = candidates.pop() else {
+                break;
+            };
             let Ok((dis_u, outs_u, _, _)) = crate::vectors::read::<R, O, _, _>(
                 by_prefetch::<R>(guards, pointers_u.iter().copied()),
                 LAccess::new(

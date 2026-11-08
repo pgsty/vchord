@@ -98,6 +98,22 @@ impl<'a, S: Floating> VectBorrowed<'a, S> {
     pub fn slice(&self) -> &'a [S] {
         self.0
     }
+
+    /// The norm, if the vector has a direction: positive and finite.
+    ///
+    /// Cosine is undefined without one. `function_normalize` and the cosine
+    /// operator classes use this same test, so a vector a cosine index
+    /// stores is always one that normalization can scale to unit length.
+    #[inline(always)]
+    pub fn direction_norm(&self) -> Option<f32> {
+        let l = S::reduce_sum_of_x2(self.0).sqrt();
+        (l > 0.0 && l.is_finite()).then_some(l)
+    }
+
+    #[inline(always)]
+    pub fn has_direction(&self) -> bool {
+        self.direction_norm().is_some()
+    }
 }
 
 impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
@@ -133,7 +149,17 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
         let xy = S::reduce_sum_of_xy(self.slice(), rhs.slice());
         let x2 = S::reduce_sum_of_x2(self.0);
         let y2 = S::reduce_sum_of_x2(rhs.0);
-        Distance::from(1.0 - xy / (x2 * y2).sqrt())
+        Distance::from(crate::cosine_distance(xy, x2, y2, || {
+            let x = S::vector_to_f32_borrowed(self.0);
+            let y = S::vector_to_f32_borrowed(rhs.0);
+            let (x, y) = (x.as_ref(), y.as_ref());
+            let mut sums = (0.0f64, 0.0f64, 0.0f64);
+            for (&a, &b) in x.iter().zip(y.iter()) {
+                let (a, b) = (f64::from(a), f64::from(b));
+                sums = (sums.0 + a * b, sums.1 + a * a, sums.2 + b * b);
+            }
+            sums
+        }))
     }
 
     #[inline(always)]
@@ -155,8 +181,7 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
     #[inline(always)]
     fn function_normalize(&self) -> VectOwned<S> {
         let mut data = self.0.to_vec();
-        let l = S::reduce_sum_of_x2(&data).sqrt();
-        if l > 0.0 && l.is_finite() {
+        if let Some(l) = self.direction_norm() {
             S::vector_mul_scalar_inplace(&mut data, 1.0 / l);
         }
         VectOwned(data)

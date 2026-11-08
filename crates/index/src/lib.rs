@@ -9,6 +9,8 @@
 // pub mod accessor;
 pub mod bump;
 pub mod fetch;
+pub mod filter;
+pub mod interrupt;
 pub mod packed;
 pub mod prefetcher;
 pub mod relation;

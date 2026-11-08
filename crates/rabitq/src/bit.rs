@@ -57,6 +57,21 @@ impl CodeMetadata {
     }
 }
 
+/// `sqrt(|q|^2 + |c|^2 - 2 <q, c>)`, the norm of the query's residual against a
+/// centroid. The three terms are rounded separately, so when the query nearly
+/// equals the centroid the radicand can come out slightly negative; clamp such
+/// finite roundoff to zero instead of producing a NaN lower bound (#35). NaN
+/// and negative infinity from invalid inputs are left alone.
+#[inline(always)]
+fn residual_norm(dis_v_2: f32, norm: f32, dis_f: f32) -> f32 {
+    let r = dis_v_2 + norm * norm + 2.0 * dis_f;
+    if r.is_finite() && r < 0.0 {
+        0.0
+    } else {
+        r.sqrt()
+    }
+}
+
 pub type Code = (CodeMetadata, Vec<bool>);
 
 /// Computes the RaBitQ factors of a vector.
@@ -72,7 +87,7 @@ pub type Code = (CodeMetadata, Vec<bool>);
 ///
 /// Rounding can also make `1 / x_0^2 - 1` slightly negative for vectors whose
 /// elements all have the same magnitude; it is clamped to zero.
-fn metadata(n: usize, sum_of_abs_x: f32, sum_of_x_2: f32, factor_cnt: f32) -> CodeMetadata {
+pub fn metadata(n: usize, sum_of_abs_x: f32, sum_of_x_2: f32, factor_cnt: f32) -> CodeMetadata {
     if sum_of_abs_x == 0.0 {
         return CodeMetadata {
             dis_u_2: sum_of_x_2,
@@ -283,7 +298,7 @@ pub mod binary {
     ) -> (f32, f32) {
         let e = k * ((2.0 * sum as f32) - qvector_sum) + b * factor_cnt;
         let rough = -e * factor_ip + dis_f + delta;
-        let err = factor_err * (dis_v_2 + norm * norm + 2.0 * dis_f).sqrt();
+        let err = factor_err * super::residual_norm(dis_v_2, norm, dis_f);
         (rough, err)
     }
 
@@ -464,7 +479,7 @@ pub mod block {
     ) -> (f32, f32) {
         let e = k * (sum as f32) + c;
         let rough = -e * factor_ip + dis_f + delta;
-        let err = factor_err * (dis_v_2 + norm * norm + 2.0 * dis_f).sqrt();
+        let err = factor_err * super::residual_norm(dis_v_2, norm, dis_f);
         (rough, err)
     }
 
@@ -661,4 +676,12 @@ mod tests {
             assert_eq!((rough, err), (dis_f, 0.0));
         }
     }
+}
+
+#[test]
+fn residual_norm_clamps_finite_roundoff_only() {
+    assert_eq!(residual_norm(1.0, 1.0, -1.0000001), 0.0);
+    assert_eq!(residual_norm(3.0, 1.0, 0.0), 2.0);
+    assert!(residual_norm(f32::NAN, 1.0, 0.0).is_nan());
+    assert!(residual_norm(f32::NEG_INFINITY, 1.0, 0.0).is_nan());
 }

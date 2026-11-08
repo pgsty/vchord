@@ -1,0 +1,253 @@
+# Cosine is undefined for zero norms. Both operand orders and sphere use it.
+
+query T
+SELECT (quantize_to_rabitq8('[0,0]'::vector) <=> quantize_to_rabitq8('[1,0]'::vector))::text;
+----
+NaN
+
+query T
+SELECT (quantize_to_rabitq8('[1,0]'::vector) <=> quantize_to_rabitq8('[0,0]'::vector))::text;
+----
+NaN
+
+query T
+SELECT (quantize_to_rabitq8('[0,0]'::vector) <=> quantize_to_rabitq8('[0,0]'::vector))::text;
+----
+NaN
+
+query T
+SELECT quantize_to_rabitq8('[0,0]'::vector) <<=>> sphere(quantize_to_rabitq8('[1,0]'::vector), 2);
+----
+f
+
+query T
+SELECT (quantize_to_rabitq4('[0,0]'::vector) <=> quantize_to_rabitq4('[1,0]'::vector))::text;
+----
+NaN
+
+query T
+SELECT (quantize_to_rabitq4('[1,0]'::vector) <=> quantize_to_rabitq4('[0,0]'::vector))::text;
+----
+NaN
+
+query T
+SELECT (quantize_to_rabitq4('[0,0]'::vector) <=> quantize_to_rabitq4('[0,0]'::vector))::text;
+----
+NaN
+
+query T
+SELECT quantize_to_rabitq4('[0,0]'::vector) <<=>> sphere(quantize_to_rabitq4('[1,0]'::vector), 2);
+----
+f
+
+statement ok
+CREATE TABLE cz_v AS SELECT id, v AS v FROM (VALUES (0,'[0,0]'::vector),(1,'[1,0]'::vector),(2,'[0,1]'::vector)) q(id,v);
+
+statement ok
+ALTER TABLE cz_v ALTER v TYPE vector(2);
+
+statement ok
+CREATE INDEX cz_v_idx ON cz_v USING vchordrq (v vector_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT * FROM cz_v ORDER BY v <=> '[0,0]'::vector LIMIT 5) q;
+----
+0
+
+query I
+SELECT count(*) FROM cz_v WHERE v <<=>> sphere('[0,0]'::vector, 2);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP INDEX cz_v_idx;
+
+statement ok
+CREATE INDEX cz_v_idx ON cz_v USING vchordg (v vector_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT * FROM cz_v ORDER BY v <=> '[0,0]'::vector LIMIT 5) q;
+----
+0
+
+query I
+SELECT count(*) FROM cz_v WHERE v <<=>> sphere('[0,0]'::vector, 2);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP INDEX cz_v_idx;
+
+statement ok
+DROP TABLE cz_v;
+
+statement ok
+CREATE TABLE cz_h AS SELECT id, v::halfvec AS v FROM (VALUES (0,'[0,0]'::vector),(1,'[1,0]'::vector),(2,'[0,1]'::vector)) q(id,v);
+
+statement ok
+ALTER TABLE cz_h ALTER v TYPE halfvec(2);
+
+statement ok
+CREATE INDEX cz_h_idx ON cz_h USING vchordrq (v halfvec_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT * FROM cz_h ORDER BY v <=> '[0,0]'::halfvec LIMIT 5) q;
+----
+0
+
+query I
+SELECT count(*) FROM cz_h WHERE v <<=>> sphere('[0,0]'::halfvec, 2);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP INDEX cz_h_idx;
+
+statement ok
+CREATE INDEX cz_h_idx ON cz_h USING vchordg (v halfvec_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT * FROM cz_h ORDER BY v <=> '[0,0]'::halfvec LIMIT 5) q;
+----
+0
+
+query I
+SELECT count(*) FROM cz_h WHERE v <<=>> sphere('[0,0]'::halfvec, 2);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP INDEX cz_h_idx;
+
+statement ok
+DROP TABLE cz_h;
+
+statement ok
+CREATE TABLE cz_r8 AS SELECT id, quantize_to_rabitq8(v) AS v FROM (VALUES (0,'[0,0]'::vector),(1,'[1,0]'::vector),(2,'[0,1]'::vector)) q(id,v);
+
+statement ok
+ALTER TABLE cz_r8 ALTER v TYPE rabitq8(2);
+
+statement ok
+CREATE INDEX cz_r8_idx ON cz_r8 USING vchordrq (v rabitq8_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT * FROM cz_r8 ORDER BY v <=> quantize_to_rabitq8('[0,0]'::vector) LIMIT 5) q;
+----
+0
+
+query I
+SELECT count(*) FROM cz_r8 WHERE v <<=>> sphere(quantize_to_rabitq8('[0,0]'::vector), 2);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP INDEX cz_r8_idx;
+
+statement ok
+CREATE INDEX cz_r8_idx ON cz_r8 USING vchordg (v rabitq8_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT * FROM cz_r8 ORDER BY v <=> quantize_to_rabitq8('[0,0]'::vector) LIMIT 5) q;
+----
+0
+
+query I
+SELECT count(*) FROM cz_r8 WHERE v <<=>> sphere(quantize_to_rabitq8('[0,0]'::vector), 2);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP INDEX cz_r8_idx;
+
+statement ok
+DROP TABLE cz_r8;
+
+statement ok
+CREATE TABLE cz_r4 AS SELECT id, quantize_to_rabitq4(v) AS v FROM (VALUES (0,'[0,0]'::vector),(1,'[1,0]'::vector),(2,'[0,1]'::vector)) q(id,v);
+
+statement ok
+ALTER TABLE cz_r4 ALTER v TYPE rabitq4(2);
+
+statement ok
+CREATE INDEX cz_r4_idx ON cz_r4 USING vchordrq (v rabitq4_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT * FROM cz_r4 ORDER BY v <=> quantize_to_rabitq4('[0,0]'::vector) LIMIT 5) q;
+----
+0
+
+query I
+SELECT count(*) FROM cz_r4 WHERE v <<=>> sphere(quantize_to_rabitq4('[0,0]'::vector), 2);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP INDEX cz_r4_idx;
+
+statement ok
+CREATE INDEX cz_r4_idx ON cz_r4 USING vchordg (v rabitq4_cosine_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT count(*) FROM (SELECT * FROM cz_r4 ORDER BY v <=> quantize_to_rabitq4('[0,0]'::vector) LIMIT 5) q;
+----
+0
+
+query I
+SELECT count(*) FROM cz_r4 WHERE v <<=>> sphere(quantize_to_rabitq4('[0,0]'::vector), 2);
+----
+0
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP INDEX cz_r4_idx;
+
+statement ok
+DROP TABLE cz_r4;

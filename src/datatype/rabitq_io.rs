@@ -260,3 +260,38 @@ impl<'a> Reader<'a> {
         }
     }
 }
+
+/// Enforces a declared dimension (`rabitq8(n)` / `rabitq4(n)`) in the input
+/// functions. `-1` means no type modifier.
+pub fn check_typmod(type_name: &str, typmod: i32, dim: u32) {
+    if typmod != -1 && i64::from(typmod) != i64::from(dim) {
+        pgrx::ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_DATA_EXCEPTION,
+            format!("expected {typmod} dimensions, not {dim}"),
+            format!("The value does not match the declared dimension of type {type_name}.")
+        );
+    }
+}
+
+/// pgvector's `vector` and `halfvec` accept at most this many dimensions.
+pub const PGVECTOR_MAX_DIM: u32 = 16000;
+
+/// Rejects dequantized values that pgvector would refuse to read back:
+/// more than 16000 dimensions or non-finite coordinates.
+pub fn check_dequantized(target: &str, dim: u32, finite: bool) {
+    if dim > PGVECTOR_MAX_DIM {
+        pgrx::ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+            format!("{target} cannot have more than {PGVECTOR_MAX_DIM} dimensions")
+        );
+    }
+    if !finite {
+        pgrx::ereport!(
+            ERROR,
+            PgSqlErrorCode::ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE,
+            format!("dequantized value is out of range for type {target}")
+        );
+    }
+}

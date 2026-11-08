@@ -10,13 +10,13 @@ use crate::index::fetcher::*;
 use crate::index::opclass::Sphere;
 use crate::index::scanners::{Io, SearchBuilder};
 use crate::index::vchordrq::dispatch::*;
-use crate::index::vchordrq::filter::filter;
 use crate::index::vchordrq::opclass::Opfamily;
 use crate::index::vchordrq::scanners::SearchOptions;
 use crate::recorder::{Recorder, text};
 use always_equal::AlwaysEqual;
 use dary_heap::QuaternaryHeap as Heap;
 use index::bump::Bump;
+use index::filter::filter;
 use index::packed::PackedRefMut4;
 use index::prefetcher::*;
 use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};
@@ -94,7 +94,11 @@ impl SearchBuilder for DefaultBuilder {
     {
         let mut vector = None;
         let mut threshold = None;
-        let mut recheck = false;
+        // Let PostgreSQL recheck every sphere qual against the heap tuple, as
+        // vchordg does. Only the first non-null sphere (when there is no ORDER
+        // BY vector) bounds the search; other spheres, including null ones,
+        // are filtered entirely by the recheck.
+        let recheck = !self.spheres.is_empty();
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
                 vector = Some(orderby_vector);
@@ -105,14 +109,17 @@ impl SearchBuilder for DefaultBuilder {
         for Sphere { center, radius } in self.spheres.into_iter().flatten() {
             if vector.is_none() {
                 (vector, threshold) = (Some(center), Some(radius));
-            } else {
-                recheck = true;
             }
         }
         let opfamily = self.opfamily;
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
+        // A zero/non-finite cosine query has no direction. Cosine indexes
+        // contain only defined vectors and return no neighbours for it.
+        if !opfamily.valid_cosine_query(&vector) {
+            return Box::new(std::iter::empty());
+        }
         let search_hints = Hints::default().full(true);
         let rerank_hints = Hints::default().full(false);
         let make_h1_plain_prefetcher = MakeH1PlainPrefetcher { index };

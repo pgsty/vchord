@@ -76,8 +76,11 @@ fn is_main() -> bool {
 #[cfg(not(panic = "unwind"))]
 compile_error!("This crate must be compiled with `-Cpanic=unwind`.");
 
+// mimalloc v3 keeps its per-thread heap in fixed TSD slots on macOS, so two
+// statically linked copies in one backend (e.g. vchord and vchord_bm25) corrupt
+// each other's heaps there. Use it only on Linux, where it is thread-local.
 #[cfg(not(miri))]
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
