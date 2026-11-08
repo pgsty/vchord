@@ -5,6 +5,12 @@
 
 # Clustered delete: the start vertex lies in a deleted cluster. Before the
 # fix its list became empty and the index returned no rows at all.
+# Build in insertion order and verify that the surviving cluster is reachable
+# before VACUUM. An extremely tight, distant cluster can already be disconnected
+# by ANN pruning at build time, which does not exercise edge repair.
+statement ok
+SET max_parallel_maintenance_workers = 0;
+
 statement ok
 CREATE TABLE sv_cluster (id int, tenant text, v vector(16)) WITH (autovacuum_enabled = off);
 
@@ -12,7 +18,7 @@ statement ok
 SELECT setseed(0.21);
 
 statement ok
-INSERT INTO sv_cluster SELECT i, 'X', ARRAY(SELECT 100 + random() * 0.01 + 0 * i FROM generate_series(1, 16))::vector(16) FROM generate_series(1, 8000) i;
+INSERT INTO sv_cluster SELECT i, 'X', ARRAY(SELECT 2 + random() + 0 * i FROM generate_series(1, 16))::vector(16) FROM generate_series(1, 8000) i;
 
 statement ok
 INSERT INTO sv_cluster SELECT i, 'Y', ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::vector(16) FROM generate_series(8001, 13000) i;
@@ -21,13 +27,23 @@ statement ok
 CREATE INDEX sv_cluster_g ON sv_cluster USING vchordg (v vector_l2_ops) WITH (options = 'm = 8');
 
 statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
 DELETE FROM sv_cluster WHERE tenant = 'X';
 
 statement ok
-VACUUM sv_cluster;
+SET enable_seqscan = off;
+
+query II
+SELECT count(*), count(*) FILTER (WHERE tenant = 'Y') FROM (
+  SELECT id, tenant FROM sv_cluster ORDER BY v <-> array_fill(0.5::real, ARRAY[16])::vector(16) LIMIT 10
+) s;
+----
+10 10
 
 statement ok
-SET enable_seqscan = off;
+VACUUM sv_cluster;
 
 query II
 SELECT count(*), count(*) FILTER (WHERE tenant = 'Y') FROM (
