@@ -24,7 +24,7 @@ pub mod types;
 
 pub use build::build;
 pub use bulkdelete::bulkdelete;
-pub use insert::insert;
+pub use insert::{InsertError, insert};
 pub use maintain::{Maintained, Reachability, maintain, pending};
 pub use prewarm::prewarm;
 pub use search::search;
@@ -48,3 +48,6 @@ impl index::fetch::Fetch1 for tuples::Pointer {
         self.into_inner().0
     }
 }
+
+#[cfg(test)]
+mod test_support;

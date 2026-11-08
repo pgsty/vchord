@@ -164,7 +164,12 @@ where
     }
 }
 
-pub fn insert<R>(opfamily: Opfamily, index: &R, payload: NonZero<u64>, vector: OwnedVector)
+pub fn insert<R>(
+    opfamily: Opfamily,
+    index: &R,
+    payload: NonZero<u64>,
+    vector: OwnedVector,
+) -> Result<(), vchordg::InsertError>
 where
     R: RelationRead + RelationWrite + RelationReadStream,
     R::Page: Page<Opaque = vchordg::Opaque>,

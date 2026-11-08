@@ -19,5 +19,8 @@ serde.workspace = true
 validator.workspace = true
 zerocopy.workspace = true
 
+[dev-dependencies]
+bumpalo.workspace = true
+
 [lints]
 workspace = true

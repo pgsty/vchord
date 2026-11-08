@@ -33,7 +33,8 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     bump: &'b impl Bump,
     mut prefetch_vertices: impl PrefetcherSequenceFamily<'b, R> + 'b,
     prefetch_vectors: impl PrefetcherSequenceFamily<'b, R> + 'b,
-) where
+) -> Result<(), InsertError>
+where
     R::Page: Page<Opaque = Opaque>,
 {
     let meta_guard = index.read(0);
@@ -120,7 +121,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         let dst = meta_tuple.start();
         if dst.into_inner().is_none() {
             *dst = OptionPointer::some(t);
-            return;
+            return Ok(());
         } else {
             *dst
         }
@@ -131,14 +132,14 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     let mut visited = Visited::new();
     let mut candidates = Candidates::new(beam as usize, prefetch_vectors);
     let Some(s) = start.into_inner() else {
-        return;
+        return Err(InsertError::Corrupted("the index has no start vertex"));
     };
     {
         visited.insert(s);
         let vertex_guard = index.read(s.0);
         let Some(vertex_bytes) = vertex_guard.get(s.1) else {
-            // the link is broken
-            return;
+            // The start vertex is never freed.
+            return Err(InsertError::Corrupted("the start vertex is missing"));
         };
         let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
         let pointers_s: &[_] = bump.alloc_slice(vertex_tuple.pointers());
@@ -152,6 +153,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         candidates.push((Reverse(score_s), AlwaysEqual((pointers_s, (s, payload_s)))));
     }
     let mut iter = std::iter::from_fn(|| {
+        index::interrupt::check();
         while let Some(((_, AlwaysEqual((pointers_u, (u, payload_u)))), guards)) = candidates.pop()
         {
             let Ok((dis_u, outs_u, _, _)) = crate::vectors::read::<R, O, _, _>(
@@ -207,6 +209,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     // eligible, deleted or not.
     let mut results = Results::new(ef as _);
     let mut passed = 0_usize;
+    let mut start_distance = None;
     for element @ (Reverse(dis_c), AlwaysEqual((_, (u, payload_u)))) in iter.by_ref() {
         if payload_u.is_none() && u != s {
             passed += 1;
@@ -214,6 +217,9 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
                 break;
             }
             continue;
+        }
+        if u == s {
+            start_distance = Some(dis_c);
         }
         results.push(element);
         if results
@@ -246,12 +252,6 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             })
             .collect::<Vec<_>>()
     };
-    // The start vertex is popped first, so it is in the trace unless its
-    // vectors could not be read.
-    let start_distance = trace
-        .iter()
-        .find(|((_, AlwaysEqual((_, u, _))), _)| *u == s)
-        .map(|((Reverse(dis_s), _), _)| *dis_s);
     let outs = crate::prune::prune(
         |x, y| O::distance(x.as_borrowed(), y.as_borrowed()),
         (bump.alloc_slice(&pointers_t) as &[_], t, Some(payload)),
@@ -261,22 +261,28 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         |(_, u, _)| *u,
         O::DISTANCE == DistanceKind::L2S,
     );
-    let _ = update::<R, O>(
+    let published = update::<R, O>(
         (index, pointers_t.as_slice()),
         (version_t, VecDeque::new()),
         outs.iter()
             .map(|&(Reverse(dis_u), AlwaysEqual((_, u, _)))| (u, dis_u)),
     );
+    match published {
+        Ok(true) => {}
+        Ok(false) => return Err(InsertError::RetryLimit),
+        Err(()) => return Err(InsertError::Corrupted("the inserted vertex is missing")),
+    }
     let mut stale = Vec::new();
     for &(Reverse(dis_t), AlwaysEqual((pointers_u, u, payload_u))) in outs.iter() {
-        if backlink::<R, O>(
+        match backlink::<R, O>(
             index,
             (dim, m, &alpha),
             (pointers_u, u, payload_u),
             (t, dis_t),
-        ) == Backlink::Stale
-        {
-            stale.push(u);
+        ) {
+            Backlink::Done => {}
+            Backlink::Stale => stale.push(u),
+            Backlink::RetryLimit => return Err(InsertError::RetryLimit),
         }
     }
     // A neighbour validated by its backlink was live after this list was
@@ -284,7 +290,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     // complete edge-repair pass before freeing anything; that pass visits
     // this vertex and repairs the edge. So only the stale ones need care.
     if stale.is_empty() {
-        return;
+        return Ok(());
     }
     // Some selected neighbours were marked deleted, freed or replaced by a
     // concurrent VACUUM before their backlinks were placed: take them out of
@@ -293,17 +299,29 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     // (Matching by slot can also drop an edge to a vertex that reused a
     // freed slot meanwhile; that edge was never chosen, so nothing is lost.)
     let mut fallback = None;
-    if stale.len() == outs.len()
-        && let Some(dis_s) = start_distance
-        && let Some((pointers_s, payload_s)) = read_vertex(index, s)
-        && backlink::<R, O>(
+    if stale.len() == outs.len() {
+        let Some((pointers_s, payload_s)) = read_vertex(index, s) else {
+            return Err(InsertError::Corrupted("the start vertex is missing"));
+        };
+        // The start vertex is popped first; it has no distance only if its
+        // vectors could not be read.
+        let Some(dis_s) = start_distance else {
+            return Err(InsertError::Corrupted(
+                "the start vertex's vectors could not be read",
+            ));
+        };
+        match backlink::<R, O>(
             index,
             (dim, m, &alpha),
             (&pointers_s, s, payload_s),
             (t, dis_s),
-        ) == Backlink::Done
-    {
-        fallback = Some((s, dis_s));
+        ) {
+            Backlink::Done => fallback = Some((s, dis_s)),
+            // A concurrent DELETE marked the start vertex between reading it
+            // and linking it; it is never freed, so a retry can link it.
+            Backlink::Stale => return Err(InsertError::Conflict),
+            Backlink::RetryLimit => return Err(InsertError::RetryLimit),
+        }
     }
     // Retried while the list changes under us, a bounded number of times;
     // stops if its tuple is gone.
@@ -311,7 +329,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         let Ok((neighbours_t, _, version)) =
             crate::vectors::read_without_accessor::<R, O, _>((index, &pointers_t), copy_all)
         else {
-            break;
+            return Err(InsertError::Corrupted("the inserted vertex is missing"));
         };
         let mut list = neighbours_t
             .iter()
@@ -323,25 +341,26 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         {
             list.insert(0, (s, dis_s));
         }
-        if update::<R, O>(
+        match update::<R, O>(
             (index, &pointers_t),
             (version, neighbours_t),
             list.into_iter(),
-        ) != Ok(false)
-        {
-            break;
+        ) {
+            Ok(true) => return Ok(()),
+            Ok(false) => continue,
+            Err(()) => return Err(InsertError::Corrupted("the inserted vertex is missing")),
         }
     }
+    Err(InsertError::RetryLimit)
 }
 
 /// An insertion may pass through `DELETED_TRAVERSAL_FACTOR * ef` deleted
-/// vertices besides the `ef` live ones it collects (#26). This also bounds
-/// the candidates and visited vertices those passes add.
+/// vertices (#26). This is not a bound on live candidates or working memory.
 const DELETED_TRAVERSAL_FACTOR: usize = 4;
 
 /// Recomputations of one neighbour list after concurrent changes before an
-/// insertion gives up on it (the edge is then left out, or left in for
-/// edge repair to handle).
+/// insertion returns an error. PostgreSQL must abort the inserting transaction;
+/// a later VACUUM can reclaim its now-invisible physical tuples.
 const MAX_RETRIES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +369,30 @@ enum Backlink {
     Done,
     /// The target is no longer the vertex that was selected.
     Stale,
+    /// Every update lost its version check; no update was acknowledged.
+    RetryLimit,
+}
+
+/// Why an insertion could not complete. The caller must abort the inserting
+/// transaction; its vertex is then dead, and a later VACUUM reclaims it and
+/// repairs any backlinks it already placed (#37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertError {
+    /// Concurrent changes kept invalidating a neighbour list for
+    /// `MAX_RETRIES` attempts. Retrying the transaction can succeed.
+    RetryLimit,
+    /// A concurrent change invalidated the vertices the new vertex would be
+    /// linked through. Retrying the transaction can succeed.
+    Conflict,
+    /// The index structure is inconsistent. Retrying cannot help; the index
+    /// must be rebuilt.
+    Corrupted(&'static str),
+}
+
+impl InsertError {
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::RetryLimit | Self::Conflict)
+    }
 }
 
 fn read_vertex<R: RelationRead>(
@@ -449,9 +492,7 @@ where
             Err(()) => return Backlink::Stale,
         }
     }
-    // The list kept changing; `u` is live, so the edge from the new vertex
-    // stays and only the backlink is skipped.
-    Backlink::Done
+    Backlink::RetryLimit
 }
 
 fn append_vertex_tuple<'b, R: RelationRead + RelationWrite>(
@@ -555,5 +596,84 @@ where
         } else {
             current = read.get_opaque().next
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{TestOp, fixture};
+
+    #[test]
+    fn backlink_conflicts_must_not_report_success() {
+        let r = fixture(true);
+        let result = backlink::<_, TestOp>(
+            &r,
+            (2, 4, &[1.2]),
+            (&[Pointer::new((2, 1))], (1, 1), NonZero::new(1)),
+            ((1, 2), Distance::from_f32(1.0)),
+        );
+        assert_eq!(r.conflicts.get(), MAX_RETRIES);
+        assert_eq!(result, Backlink::RetryLimit);
+        // The caller rejects this INSERT; model PostgreSQL's subsequent dead
+        // heap-TID callback, then exercise real maintenance recovery.
+        r.inject.set(false);
+        crate::bulkdelete::<_, TestOp>(&r, || {}, |p| p.get() == 2);
+        let maintained = crate::maintain::<_, TestOp>(&r, || {}, 1024 * 1024);
+        assert_eq!(maintained.live, 1);
+        assert!(r.read(1).get(2).is_none());
+        let (outs, _, _) = crate::vectors::read_without_accessor::<_, TestOp, _>(
+            (&r, &[Pointer::new((2, 1))]),
+            copy_outs,
+        )
+        .unwrap();
+        assert!(outs.is_empty());
+    }
+    #[test]
+    fn full_insertion_conflicts_return_error_then_vacuum_recovers() {
+        use crate::test_support::MakePlainPrefetcher;
+        use vector::vect::VectBorrowed;
+        let r = crate::test_support::graph(&[(true, &[])], 4);
+        r.inject.set(true);
+        let bump = bumpalo::Bump::new();
+        let query = [1.0, 1.0];
+        let result = insert::<_, TestOp>(
+            &r,
+            VectBorrowed::new(&query),
+            NonZero::new(2).unwrap(),
+            &bump,
+            MakePlainPrefetcher { index: &r },
+            MakePlainPrefetcher { index: &r },
+        );
+        assert_eq!(result, Err(InsertError::RetryLimit));
+        assert!(result.unwrap_err().is_retryable());
+        assert!(r.conflicts.get() >= MAX_RETRIES);
+        r.inject.set(false);
+        crate::bulkdelete::<_, TestOp>(&r, || {}, |p| p.get() == 2);
+        assert_eq!(crate::maintain::<_, TestOp>(&r, || {}, 1024 * 1024).live, 1);
+        assert!(!crate::pending(&r));
+    }
+    #[test]
+    fn missing_start_vertex_is_corruption_not_a_conflict() {
+        use crate::test_support::MakePlainPrefetcher;
+        use vector::vect::VectBorrowed;
+        let r = crate::test_support::graph(&[(true, &[])], 4);
+        // The start vertex is never freed; its slot disappearing is damage.
+        r.write(1, false).free(1);
+        let bump = bumpalo::Bump::new();
+        let query = [1.0, 1.0];
+        let result = insert::<_, TestOp>(
+            &r,
+            VectBorrowed::new(&query),
+            NonZero::new(2).unwrap(),
+            &bump,
+            MakePlainPrefetcher { index: &r },
+            MakePlainPrefetcher { index: &r },
+        );
+        assert_eq!(
+            result,
+            Err(InsertError::Corrupted("the start vertex is missing"))
+        );
+        assert!(!result.unwrap_err().is_retryable());
     }
 }

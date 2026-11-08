@@ -279,10 +279,51 @@ pub unsafe extern "C-unwind" fn aminsert(
         for (vector, extra) in store {
             let key = ctid_to_key(ctid);
             let payload = kv_to_pointer((key, extra));
-            crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector);
+            if let Err(error) =
+                crate::index::vchordg::dispatch::insert(opfamily, &index, payload, vector)
+            {
+                unsafe { report_insert_error(index_relation, error) };
+            }
         }
     }
     false
+}
+
+/// Raises the error for an insertion that could not complete (#37). The
+/// inserting transaction aborts, so its vertex is dead; the next VACUUM frees
+/// it and repairs any backlink it already placed.
+///
+/// # Safety
+///
+/// `index_relation` must be a valid, open index relation.
+pub(super) unsafe fn report_insert_error(
+    index_relation: pgrx::pg_sys::Relation,
+    error: vchordg::InsertError,
+) -> ! {
+    use pgrx::pg_sys::panic::ErrorReport;
+    let name = unsafe {
+        CStr::from_ptr((*(*index_relation).rd_rel).relname.data.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+    let report = match error {
+        vchordg::InsertError::RetryLimit | vchordg::InsertError::Conflict => ErrorReport::new(
+            pgrx::PgSqlErrorCode::ERRCODE_T_R_SERIALIZATION_FAILURE,
+            format!(
+                "could not insert into vchordg index \"{name}\" because of concurrent changes to the index"
+            ),
+            "aminsert",
+        )
+        .set_hint("Retry the transaction."),
+        vchordg::InsertError::Corrupted(reason) => ErrorReport::new(
+            pgrx::PgSqlErrorCode::ERRCODE_INDEX_CORRUPTED,
+            format!("vchordg index \"{name}\" is corrupted: {reason}"),
+            "aminsert",
+        )
+        .set_hint("REINDEX the index."),
+    };
+    report.report(pgrx::PgLogLevel::ERROR);
+    unreachable!()
 }
 
 #[pgrx::pg_guard]
