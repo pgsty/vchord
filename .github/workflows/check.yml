@@ -20,9 +20,14 @@ jobs:
     steps:
       - name: Set up Environment
         run: |
-          curl -fsSL https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-$(uname -m).gz | gzip -d - | install -m 755 /dev/stdin /usr/local/bin/taplo
+          d=$(mktemp -d)
+          curl -fsSL --retry 3 --retry-all-errors -o "$d/taplo.gz" "https://github.com/tamasfe/taplo/releases/download/0.10.0/taplo-linux-$(uname -m).gz"
+          gzip -d "$d/taplo.gz"
+          install -m 755 "$d/taplo" /usr/local/bin/taplo
 
-          curl -fsSL https://github.com/EmbarkStudios/cargo-deny/releases/download/0.18.9/cargo-deny-0.18.9-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - cargo-deny-0.18.9-$(uname -m)-unknown-linux-musl/cargo-deny | install -m 755 /dev/stdin /usr/local/bin/cargo-deny
+          curl -fsSL --retry 3 --retry-all-errors -o "$d/cargo-deny.tar.gz" "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.18.9/cargo-deny-0.18.9-$(uname -m)-unknown-linux-musl.tar.gz"
+          tar -xzf "$d/cargo-deny.tar.gz" -C "$d"
+          install -m 755 "$d/cargo-deny-0.18.9-$(uname -m)-unknown-linux-musl/cargo-deny" /usr/local/bin/cargo-deny
 
       - name: Install Rust
         run: rustup update
@@ -116,7 +121,9 @@ jobs:
 
       - name: Install Clang
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          d=$(mktemp -d)
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
+          sudo bash "$d/llvm.sh" 18
           echo CC=clang-18 >> $GITHUB_ENV
 
       - name: Checkout
@@ -170,7 +177,9 @@ jobs:
 
       - name: Install Clang
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          d=$(mktemp -d)
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
+          sudo bash "$d/llvm.sh" 18
           echo CC=clang-18 >> $GITHUB_ENV
 
       - name: Set up Sccache
@@ -229,14 +238,19 @@ jobs:
         run: |
           sudo apt-get update
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
+          d=$(mktemp -d)
+          curl -fsSL --retry 3 --retry-all-errors -o "$d/sqllogictest.tar.gz" "https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-$(uname -m)-unknown-linux-musl.tar.gz"
+          tar -xzf "$d/sqllogictest.tar.gz" -C "$d" ./sqllogictest
+          install -m 755 "$d/sqllogictest" /usr/local/bin/sqllogictest
 
       - name: Install Rust
         run: rustup update
 
       - name: Install Clang
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          d=$(mktemp -d)
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
+          sudo bash "$d/llvm.sh" 18
           echo CC=clang-18 >> $GITHUB_ENV
 
       - name: Set up Sccache
@@ -357,7 +371,10 @@ jobs:
         run: |
           brew update
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-${{ matrix.arch }}-apple-darwin.tar.gz | tar -xOzf - ./sqllogictest | tee /usr/local/bin/sqllogictest > /dev/null && chmod 755 /usr/local/bin/sqllogictest
+          d=$(mktemp -d)
+          curl -fsSL --retry 3 --retry-all-errors -o "$d/sqllogictest.tar.gz" "https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-${{ matrix.arch }}-apple-darwin.tar.gz"
+          tar -xzf "$d/sqllogictest.tar.gz" -C "$d" ./sqllogictest
+          install -m 755 "$d/sqllogictest" /usr/local/bin/sqllogictest
 
       - name: Install Rust
         run: rustup update
@@ -589,11 +606,16 @@ jobs:
           mkdir /opt/bin
           ln -s /usr/bin/node /opt/bin/node
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
+          d=$(mktemp -d)
+          curl -fsSL --retry 3 --retry-all-errors -o "$d/sqllogictest.tar.gz" "https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-$(uname -m)-unknown-linux-musl.tar.gz"
+          tar -xzf "$d/sqllogictest.tar.gz" -C "$d" ./sqllogictest
+          install -m 755 "$d/sqllogictest" /usr/local/bin/sqllogictest
 
       - name: Install Rust
         run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain beta
+          d=$(mktemp -d)
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/rustup-init.sh" "https://sh.rustup.rs"
+          sh "$d/rustup-init.sh" -y --default-toolchain beta
           echo $HOME/.cargo/bin >> $GITHUB_PATH
           echo RUSTC_BOOTSTRAP=1 >> $GITHUB_ENV
 
@@ -780,7 +802,10 @@ jobs:
           echo QEMU_LD_PREFIX=$QEMU_LD_PREFIX >> $GITHUB_ENV
           echo QEMU_CPU=$QEMU_CPU >> $GITHUB_ENV
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | install -m 755 /dev/stdin /usr/local/bin/sqllogictest
+          d=$(mktemp -d)
+          curl -fsSL --retry 3 --retry-all-errors -o "$d/sqllogictest.tar.gz" "https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-$(uname -m)-unknown-linux-musl.tar.gz"
+          tar -xzf "$d/sqllogictest.tar.gz" -C "$d" ./sqllogictest
+          install -m 755 "$d/sqllogictest" /usr/local/bin/sqllogictest
 
       - name: Install Rust
         run: |
@@ -791,7 +816,9 @@ jobs:
 
       - name: Install Clang
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://apt.llvm.org/llvm.sh | sudo bash -s -- 18
+          d=$(mktemp -d)
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
+          sudo bash "$d/llvm.sh" 18
           echo CC=clang-18 >> $GITHUB_ENV
 
       - name: Set up Sccache
@@ -940,11 +967,16 @@ jobs:
 
           sudo pacman -S --noconfirm liburing numactl python valgrind
 
-          curl -fsSL https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-$(uname -m)-unknown-linux-musl.tar.gz | tar -xOzf - ./sqllogictest | sudo install -m 755 /dev/stdin /usr/local/bin/sqllogictest
+          d=$(mktemp -d)
+          curl -fsSL --retry 3 --retry-all-errors -o "$d/sqllogictest.tar.gz" "https://github.com/risinglightdb/sqllogictest-rs/releases/download/v0.29.0/sqllogictest-bin-v0.29.0-$(uname -m)-unknown-linux-musl.tar.gz"
+          tar -xzf "$d/sqllogictest.tar.gz" -C "$d" ./sqllogictest
+          sudo install -m 755 "$d/sqllogictest" /usr/local/bin/sqllogictest
 
       - name: Install Rust
         run: |
-          curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain beta
+          d=$(mktemp -d)
+          curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/rustup-init.sh" "https://sh.rustup.rs"
+          sh "$d/rustup-init.sh" -y --default-toolchain beta
           echo $HOME/.cargo/bin >> $GITHUB_PATH
           echo RUSTC_BOOTSTRAP=1 >> $GITHUB_ENV
 
