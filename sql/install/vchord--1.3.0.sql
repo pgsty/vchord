@@ -1425,4 +1425,3 @@ FROM
     ) AS index_oids
 CROSS JOIN LATERAL vchordrq_sampled_queries(index_oids.oid::regclass) AS record;
 /* </end connected objects> */
-

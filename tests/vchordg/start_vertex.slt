@@ -75,9 +75,59 @@ RESET vchordg.ef_search;
 statement ok
 RESET enable_seqscan;
 
-# Scattered deletes do not trigger the expansion; recall stays where it was
-# (on this data the graph is approximate even when fresh: the average top-10
-# overlap with the exact answer is 9.33 fresh and 9.05 after this VACUUM).
+# A live neighbour on the near side must not hide a deleted bridge when
+# the list has spare degree. This is a local ANN repair, not an arbitrary
+# graph-connectivity guarantee.
+statement ok
+CREATE TABLE sv_bridge (id int, v vector(4)) WITH (autovacuum_enabled = off);
+
+statement ok
+CREATE INDEX sv_bridge_g ON sv_bridge USING vchordg (v vector_l2_ops) WITH (options = 'alpha = [1.0]');
+
+statement ok
+INSERT INTO sv_bridge SELECT i, ARRAY[i / 100.0, sin(i / 50.0) * 0.01, cos(i / 50.0) * 0.01, 0]::real[]::vector FROM generate_series(1, 3000) i;
+
+statement ok
+DELETE FROM sv_bridge WHERE id BETWEEN 1000 AND 2000;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordg.ef_search = 200;
+
+query I
+SELECT id FROM sv_bridge ORDER BY v <-> ARRAY[25, sin(50.0) * 0.01, cos(50.0) * 0.01, 0]::real[]::vector LIMIT 1;
+----
+2500
+
+statement ok
+VACUUM sv_bridge;
+
+query I
+SELECT id FROM sv_bridge ORDER BY v <-> ARRAY[25, sin(50.0) * 0.01, cos(50.0) * 0.01, 0]::real[]::vector LIMIT 1;
+----
+2500
+
+statement ok
+REINDEX INDEX CONCURRENTLY sv_bridge_g;
+
+query I
+SELECT id FROM sv_bridge ORDER BY v <-> ARRAY[25, sin(50.0) * 0.01, cos(50.0) * 0.01, 0]::real[]::vector LIMIT 1;
+----
+2500
+
+statement ok
+RESET vchordg.ef_search;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE sv_bridge;
+
+# Scattered deletes retain useful ANN recall. Compare against an exact scan
+# with a tolerance, since graph pruning does not preserve every neighbour.
 statement ok
 CREATE TABLE sv_scatter (id int, v vector(8)) WITH (autovacuum_enabled = off);
 

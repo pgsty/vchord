@@ -223,12 +223,14 @@ where
                             let dis_v = O::distance(vector_u.as_borrowed(), vector_v.as_borrowed());
                             trace.push(((Reverse(dis_v), AlwaysEqual((pointers_v, v))), vector_v));
                         }
-                        // Two levels found no live vertex, so the list would
-                        // become empty and cut `u` off: keep expanding through
-                        // deleted vertices until a live one turns up (#21).
-                        // Non-empty results are left exactly as before.
+                        // Fill spare degree through deleted paths even when a
+                        // nearby live neighbour was found: it need not lead to
+                        // the live vertices beyond a deleted bridge (#21).
+                        // Keep the bounded, first-exit search and usual pruning;
+                        // a full candidate list needs no extra expansion. This
+                        // is local ANN repair, not a connectivity guarantee.
                         let mut cut_off = false;
-                        if trace.is_empty() {
+                        if trace.len() < m as usize && !deleted.is_empty() {
                             let cap = if u == s {
                                 None
                             } else {
@@ -264,7 +266,7 @@ where
                             // memory. Other vertices keep the capped
                             // behaviour: their in-edges, not their own list,
                             // keep them reachable.
-                            cut_off = u == s && found.is_empty() && !exhausted;
+                            cut_off = u == s && trace.is_empty() && found.is_empty() && !exhausted;
                             for (v, pointers_v) in found {
                                 let Ok((vector_v, _, _, _)) = crate::vectors::read::<R, O, _, _>(
                                     by_read::<R>(index, pointers_v.iter().copied()),
@@ -941,6 +943,61 @@ mod tests {
             )
             .unwrap();
         Vec::from(outs)
+    }
+
+    #[test]
+    fn spare_degree_reconnects_a_bridge_beside_a_live_neighbour() {
+        use crate::test_support::{TestOp, graph};
+        // 1 -> live 2 and deleted 3 -> deleted 4 -> live 5.
+        // Keeping only the nearby vertex 2 loses the far side of the bridge.
+        let r = graph(
+            &[
+                (true, &[2, 3]),
+                (true, &[1]),
+                (false, &[4]),
+                (false, &[5]),
+                (true, &[]),
+            ],
+            4,
+        );
+        let maintained = maintain::<_, TestOp>(&r, || {}, 1024 * 1024);
+        let mut outs = outs_of(&r, 0);
+        outs.sort_unstable();
+        assert_eq!(outs, vec![(1, 2), (1, 5)]);
+        assert!(matches!(
+            maintained.reachability,
+            Reachability::Checked {
+                disconnected: 0,
+                ..
+            }
+        ));
+        assert!(maintained.retained.is_none());
+        assert!(r.read(1).get(3).is_none());
+        assert!(r.read(1).get(4).is_none());
+        assert!(!pending(&r));
+    }
+
+    #[test]
+    fn optional_bridge_expansion_does_not_prevent_reclamation() {
+        use crate::test_support::{TestOp, graph};
+        let r = graph(
+            &[
+                (true, &[2, 3]),
+                (true, &[1]),
+                (false, &[4]),
+                (false, &[5]),
+                (true, &[]),
+            ],
+            4,
+        );
+        // A bounded ANN repair may miss this exit; an existing live route
+        // must not make the optional expansion retain every tombstone.
+        let maintained = maintain::<_, TestOp>(&r, || {}, 2 * 2 * EXPANSION_BYTES_PER_VERTEX);
+        assert!(maintained.retained.is_none());
+        assert_eq!(outs_of(&r, 0), vec![(1, 2)]);
+        assert!(r.read(1).get(3).is_none());
+        assert!(r.read(1).get(4).is_none());
+        assert!(!pending(&r));
     }
 
     #[test]

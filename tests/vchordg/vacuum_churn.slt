@@ -25,7 +25,7 @@ INSERT INTO vchordg_churn_size VALUES (0, pg_relation_size('vchordg_churn_idx'))
 
 # Five rounds, each replacing 10% of the rows with new ones.
 statement ok
-DELETE FROM vchordg_churn WHERE id % 10 = 1;
+DELETE FROM vchordg_churn WHERE id IN (SELECT id FROM vchordg_churn ORDER BY hashint4(id + 1), id LIMIT 600);
 
 statement ok
 VACUUM vchordg_churn;
@@ -39,7 +39,7 @@ statement ok
 INSERT INTO vchordg_churn_size VALUES (1, pg_relation_size('vchordg_churn_idx'));
 
 statement ok
-DELETE FROM vchordg_churn WHERE id % 10 = 2;
+DELETE FROM vchordg_churn WHERE id IN (SELECT id FROM vchordg_churn ORDER BY hashint4(id + 2), id LIMIT 600);
 
 statement ok
 VACUUM vchordg_churn;
@@ -50,7 +50,7 @@ SELECT 20000 + i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::ve
 FROM generate_series(1, 600) i;
 
 statement ok
-DELETE FROM vchordg_churn WHERE id % 10 = 3;
+DELETE FROM vchordg_churn WHERE id IN (SELECT id FROM vchordg_churn ORDER BY hashint4(id + 3), id LIMIT 600);
 
 statement ok
 VACUUM vchordg_churn;
@@ -61,7 +61,7 @@ SELECT 30000 + i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::ve
 FROM generate_series(1, 600) i;
 
 statement ok
-DELETE FROM vchordg_churn WHERE id % 10 = 4;
+DELETE FROM vchordg_churn WHERE id IN (SELECT id FROM vchordg_churn ORDER BY hashint4(id + 4), id LIMIT 600);
 
 statement ok
 VACUUM vchordg_churn;
@@ -72,7 +72,7 @@ SELECT 40000 + i, ARRAY(SELECT random() + 0 * i FROM generate_series(1, 16))::ve
 FROM generate_series(1, 600) i;
 
 statement ok
-DELETE FROM vchordg_churn WHERE id % 10 = 5;
+DELETE FROM vchordg_churn WHERE id IN (SELECT id FROM vchordg_churn ORDER BY hashint4(id + 5), id LIMIT 600);
 
 statement ok
 VACUUM vchordg_churn;
@@ -90,6 +90,11 @@ FROM generate_series(1, 600) i;
 
 statement ok
 INSERT INTO vchordg_churn_size VALUES (5, pg_relation_size('vchordg_churn_idx'));
+
+query I
+SELECT count(*) FROM vchordg_churn;
+----
+6000
 
 # Four more rounds after the first one grow the index by well under 10%.
 # Keeping the tombstones instead grows it by about 10% per round.
