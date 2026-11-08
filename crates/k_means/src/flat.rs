@@ -18,6 +18,7 @@ struct Flat<'a> {
     samples: SquareMut<'a>,
     centroids: Square,
     targets: Vec<usize>,
+    finite_samples: Option<Vec<bool>>,
 }
 
 impl<'a> KMeans for Flat<'a> {
@@ -42,10 +43,21 @@ impl<'a> KMeans for Flat<'a> {
     }
 
     fn update(&mut self) {
+        // Samples stay fixed. Cache once, and skip the scan entirely when the
+        // caller requests zero Lloyd iterations.
+        let finite_samples = self.finite_samples.get_or_insert_with(|| {
+            self.this.pool.install(|| {
+                (0..self.samples.len())
+                    .into_par_iter()
+                    .map(|i| crate::is_finite(&self.samples[i]))
+                    .collect()
+            })
+        });
         crate::index::update(
             &mut self.this,
             &self.samples,
             &self.targets,
+            finite_samples,
             &mut self.centroids,
         );
     }
@@ -100,5 +112,6 @@ pub fn new<'a>(
         samples,
         centroids,
         targets,
+        finite_samples: None,
     })
 }

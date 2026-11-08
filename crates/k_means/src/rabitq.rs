@@ -18,6 +18,7 @@ struct RaBitQ<'a> {
     samples: SquareMut<'a>,
     centroids: Square,
     targets: Vec<usize>,
+    finite_samples: Option<Vec<bool>>,
 }
 
 impl<'a> KMeans for RaBitQ<'a> {
@@ -56,10 +57,21 @@ impl<'a> KMeans for RaBitQ<'a> {
     }
 
     fn update(&mut self) {
+        // Validate after rotation, which can turn a finite extreme input
+        // non-finite. No scan is needed for a build with zero Lloyd iterations.
+        let finite_samples = self.finite_samples.get_or_insert_with(|| {
+            self.this.pool.install(|| {
+                (0..self.samples.len())
+                    .into_par_iter()
+                    .map(|i| crate::is_finite(&self.samples[i]))
+                    .collect()
+            })
+        });
         crate::index::update(
             &mut self.this,
             &self.samples,
             &self.targets,
+            finite_samples,
             &mut self.centroids,
         );
     }
@@ -125,5 +137,6 @@ pub fn new<'a>(
         samples,
         centroids,
         targets,
+        finite_samples: None,
     })
 }

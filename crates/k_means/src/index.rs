@@ -73,6 +73,7 @@ pub fn update(
     this: &mut This<'_>,
     samples: &SquareMut<'_>,
     targets: &[usize],
+    finite_samples: &[bool],
     centroids: &mut Square,
 ) {
     this.pool.install(|| {
@@ -91,7 +92,7 @@ pub fn update(
                     let sample = &samples[i];
                     // A non-finite sample is "assigned" to the first centroid
                     // (no distance compares less than NaN) and would poison it.
-                    if !crate::is_finite(sample) {
+                    if !finite_samples[i] {
                         continue;
                     }
                     f32::vector_add_inplace(&mut sum[target], sample);
@@ -124,6 +125,9 @@ pub fn update(
 
         *centroids = sum;
 
+        // Track donors as clusters are split. Scanning all counts for each
+        // empty cluster adds quadratic work on duplicate or degenerate data.
+        let mut donors = count.iter().filter(|&&count| count > 1.0).count();
         for i in 0..c {
             if count[i] != 0.0f32 {
                 continue;
@@ -131,7 +135,7 @@ pub fn update(
             // Reseeding splits a cluster with more than one sample. One always
             // exists when every sample is finite (`n > c`); if non-finite
             // samples were skipped, the loop below might never end without one.
-            if !count.iter().any(|&count| count > 1.0) {
+            if donors == 0 {
                 break;
             }
             let mut o = 0;
@@ -148,6 +152,8 @@ pub fn update(
             vector_mul_scalars_inplace(&mut centroids[o], [1.0 - DELTA, 1.0 + DELTA]);
             count[i] = count[o] / 2.0;
             count[o] -= count[i];
+            donors -= 1;
+            donors += usize::from(count[i] > 1.0) + usize::from(count[o] > 1.0);
         }
 
         if this.is_spherical {
