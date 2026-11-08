@@ -10,8 +10,10 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.ref }}-${{ github.workflow }}
-  cancel-in-progress: true
+  # Uploads may already have published immutable assets. Let a publishing run
+  # finish, and serialize later runs for the same release tag.
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || github.event.release.tag_name || github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
