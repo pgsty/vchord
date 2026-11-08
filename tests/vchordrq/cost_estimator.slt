@@ -349,9 +349,8 @@ SELECT top_total_cost(
 t
 
 # ---------------------------------------------------------------------------
-# Case 10: partial vchord index. The filter-selectivity estimate reflects
-# baserestrictinfo, including clauses that overlap the partial-index
-# predicate. We verify that this builds, plans, and runs.
+# Case 10: a partial index has already applied its predicate. Retrieving five
+# candidates must not be priced as hundreds of heap-filtered candidates.
 # ---------------------------------------------------------------------------
 
 statement ok
@@ -359,8 +358,8 @@ CREATE TABLE cost_test_partial (id int, kind int, v vector(3));
 
 statement ok
 INSERT INTO cost_test_partial
-SELECT i, (i % 3), ARRAY[(i%7)/7.0, (i%11)/11.0, (i%13)/13.0]::real[]::vector
-FROM generate_series(1, 2000) i;
+SELECT i, (i % 100), ARRAY[(i%7)/7.0, (i%11)/11.0, (i%13)/13.0]::real[]::vector
+FROM generate_series(1, 20000) i;
 
 statement ok
 CREATE INDEX cost_test_partial_v ON cost_test_partial USING vchordrq (v vector_l2_ops)
@@ -376,6 +375,26 @@ SELECT plan_top_index(
 );
 ----
 cost_test_partial_v
+
+query B
+SELECT top_total_cost(
+  'SELECT id FROM cost_test_partial WHERE kind = 0
+     ORDER BY v <-> ''[0,0,0]''::vector LIMIT 5'
+) < 30.0;
+----
+t
+
+# Additional filters still increase the candidate budget within that index.
+query B
+SELECT top_total_cost(
+  'SELECT id FROM cost_test_partial WHERE kind = 0 AND id < 10000
+     ORDER BY v <-> ''[0,0,0]''::vector LIMIT 5'
+) > top_total_cost(
+  'SELECT id FROM cost_test_partial WHERE kind = 0
+     ORDER BY v <-> ''[0,0,0]''::vector LIMIT 5'
+);
+----
+t
 
 # ---------------------------------------------------------------------------
 # Case 11: vchordrq.enable_scan = off must still disable the path

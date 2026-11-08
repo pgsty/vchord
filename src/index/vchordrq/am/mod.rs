@@ -156,7 +156,7 @@ pub fn init() {
                 kind as _,
                 c"epsilon".as_ptr(),
                 c"Search parameter `vchordrq.epsilon`".as_ptr(),
-                1.9,
+                2.5,
                 0.0,
                 4.0,
                 pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,
@@ -298,8 +298,17 @@ pub unsafe extern "C-unwind" fn amcostestimate(
             } else {
                 (*baserel).rows
             };
-            let filter_selectivity = if total_rows > 0.0 {
-                (filtered_rows / total_rows).clamp(1e-9, 1.0)
+            // A partial index already enforces its predicate. Its candidates
+            // come from the indexed population, so charging the predicate's
+            // selectivity again can overprice a tenant/category index by 100x.
+            let indexed_rows =
+                if !(*index_opt_info).indpred.is_null() && (*index_opt_info).tuples > 0.0 {
+                    (*index_opt_info).tuples
+                } else {
+                    total_rows
+                };
+            let filter_selectivity = if indexed_rows > 0.0 {
+                (filtered_rows / indexed_rows).clamp(1e-9, 1.0)
             } else {
                 1.0
             };
