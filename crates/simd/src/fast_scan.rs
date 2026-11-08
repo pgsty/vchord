@@ -424,7 +424,7 @@ mod scan {
                 let code = &code[..n];
                 let lut = &lut[..n];
                 unsafe {
-                    assert_eq!(scan_a2(&code, &lut), fallback(&code, &lut));
+                    assert_eq!(scan_a2(code, lut), fallback(code, lut));
                 }
             }
         }
