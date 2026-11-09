@@ -77,7 +77,8 @@ s = s.replace(anchor, '''            if std::fs::read_to_string(''' + json.dumps
                 == Some(format!("stale:{}", std::process::id()).as_str()) {
                 // Model an FSM hint surviving ahead of page/link WAL. The real
                 // page is still zero; the controller persists just the FSM.
-                second.record_freespace(second_space);
+                pgrx::pg_sys::RecordPageWithFreeSpace(second.raw, second.id, second_space as _);
+                pgrx::pg_sys::FreeSpaceMapVacuumRange(second.raw, second.id, second.id + 1);
                 recovery_probe("stale", first.id, second.id);
             }
             recovery_probe("before", first.id, second.id);
@@ -164,6 +165,30 @@ def vector_ctids(c, idx, blocks=None):
             if tag == 0 and payload:
                 ctids.append(f'({payload >> 32},{(payload >> 16) & 65535})')
     return sorted(ctids)
+
+
+def graph_chain(c, idx):
+    """Return the vchordg vertex-page chain starting at the meta page."""
+    raw = page(c, idx, 0)
+    special = struct.unpack_from('<H', raw, 16)[0]
+    current = struct.unpack_from('<II', raw, special)[1]
+    pages = []
+    while current != 2**32 - 1:
+        assert current not in pages, 'cycle in graph vertex chain'
+        pages.append(current)
+        raw = page(c, idx, current)
+        special = struct.unpack_from('<H', raw, 16)[0]
+        current = struct.unpack_from('<II', raw, special)[0]
+    return pages
+
+
+def graph_query(c, table):
+    c.execute('SET enable_seqscan=off')
+    c.execute('SET vchordg.ef_search=200')
+    return c.execute(
+        f'SELECT id FROM {table} '
+        'ORDER BY v <-> array_fill(0.9::real, ARRAY[128])::vector LIMIT 10'
+    ).fetchall()
 
 
 def ids(c, table):
@@ -273,6 +298,108 @@ try:
                                 recovered_ids_match=True, vacuum_and_reindex=True))
             (root / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
             print(stage, mode, 'passed', flush=True)
+
+    # Cover both durable paired WAL and an FSM hint surviving without it.
+    for graph_stage in ['after', 'stale']:
+        graph_table, graph_idx = 'graph_recovery', 'graph_recovery_idx'
+        with connect() as c:
+            c.execute(f'DROP TABLE IF EXISTS {graph_table}')
+            c.execute(f'CREATE TABLE {graph_table}(id int, v vector(128))')
+            c.execute(f'CREATE INDEX {graph_idx} ON {graph_table} USING vchordg(v vector_l2_ops)')
+            c.execute(
+                f'INSERT INTO {graph_table} '
+                "SELECT i, array_fill((i::real / 1000), ARRAY[128])::vector "
+                'FROM generate_series(1, 400) i'
+            )
+            before = graph_chain(c, graph_idx)
+            c.execute('CHECKPOINT')
+            wal_start = c.execute('SELECT pg_current_wal_insert_lsn()::text').fetchone()[0]
+
+        marker.unlink(missing_ok=True)
+        with connect() as a, ThreadPoolExecutor() as pool:
+            control.write_text(f'{graph_stage}:{a.info.backend_pid}')
+            af = pool.submit(
+                execute, a, f'INSERT INTO {graph_table} '
+                "SELECT i, array_fill((i::real / 1000), ARRAY[128])::vector "
+                'FROM generate_series(401, 3000) i',
+            )
+            deadline = time.monotonic() + 30
+            while not marker.exists():
+                assert not af.done(), 'vchordg pair publication hook did not fire'
+                assert time.monotonic() < deadline, 'vchordg pair publication hook timeout'
+                time.sleep(.02)
+            tail, fresh = map(int, marker.read_text().split(','))
+            assert tail in before, (tail, before)
+            saved_fsm = None
+            with connect() as c:
+                if graph_stage == 'after':
+                    c.execute('SELECT pg_switch_wal()')
+                else:
+                    assert c.execute('SELECT pg_freespace(%s,%s)', (graph_idx, fresh)).fetchone()[0] > 0
+                    path = c.execute('SELECT pg_relation_filepath(%s::regclass)', (graph_idx,)).fetchone()[0]
+                    count = c.execute("SELECT pg_relation_size(%s::regclass,'fsm')/8192", (graph_idx,)).fetchone()[0]
+                    images = []
+                    for block in range(count):
+                        image = bytearray(c.execute("SELECT get_raw_page(%s,'fsm',%s)", (graph_idx, block)).fetchone()[0])
+                        checksum = c.execute('SELECT page_checksum(%s,%s)', (bytes(image), block)).fetchone()[0]
+                        struct.pack_into('<H', image, 8, checksum & 0xffff)
+                        images.append(image)
+                    saved_fsm = (data / (path + '_fsm'), images)
+            stop('immediate')
+            assert not af.result(timeout=30), 'crashed publisher unexpectedly committed'
+            if saved_fsm:
+                path, images = saved_fsm
+                with path.open('r+b') as f:
+                    for image in images:
+                        f.write(image)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+        start()
+        with connect() as c:
+            assert sorted(row[0] for row in c.execute(f'SELECT id FROM {graph_table}')) == list(range(1, 401))
+            chain = graph_chain(c, graph_idx)
+            assert (fresh in chain) == (graph_stage == 'after'), (fresh, before, chain)
+            paired_wal = []
+            if graph_stage == 'after':
+                records = c.execute("SELECT block_ref FROM pg_get_wal_records_info(%s,pg_current_wal_lsn()) WHERE resource_manager='Generic'", (wal_start,)).fetchall()
+                paired_wal = [r[0] for r in records if re.search(rf'blk {tail}\b', r[0] or '') and re.search(rf'blk {fresh}\b', r[0] or '')]
+                assert paired_wal, 'graph initialization/link not found in one WAL record'
+            else:
+                assert page(c, graph_idx, fresh) == bytes(8192), 'unpublished graph page was initialized'
+
+            c.execute(
+                f'INSERT INTO {graph_table} '
+                "SELECT i, array_fill(0.9::real, ARRAY[128])::vector "
+                'FROM generate_series(10001, 10060) i'
+            )
+            old_ctids = {r[0] for r in c.execute(f'SELECT ctid::text FROM {graph_table} WHERE id >= 10001')}
+            c.execute(f'DELETE FROM {graph_table} WHERE id BETWEEN 10001 AND 10060')
+            c.execute(f'VACUUM (INDEX_CLEANUP ON) {graph_table}')
+            c.execute(
+                f'INSERT INTO {graph_table} '
+                "SELECT i, array_fill((-0.9)::real, ARRAY[128])::vector "
+                'FROM generate_series(20001, 20060) i'
+            )
+            new_ctids = {r[0] for r in c.execute(f'SELECT ctid::text FROM {graph_table} WHERE id >= 20001')}
+            reused = len(old_ctids & new_ctids)
+            assert reused > 0, 'heap-TID reuse was not exercised'
+            c.execute('SET enable_seqscan=off')
+            plan = c.execute(f'EXPLAIN SELECT id FROM {graph_table} ORDER BY v <-> array_fill(0.9::real, ARRAY[128])::vector LIMIT 10').fetchall()
+            assert any('Index Scan' in r[0] for r in plan), plan
+            got = graph_query(c, graph_table)
+            assert len(got) == 10 and not any(row[0] >= 20001 for row in got), got
+            if graph_stage == 'stale':
+                assert c.execute('SELECT pg_freespace(%s,%s)', (graph_idx, fresh)).fetchone()[0] == 0
+            results.append(dict(
+                stage='vchordg-' + graph_stage, tail=tail, fresh=fresh,
+                vertex_pages_before=before, vertex_pages_after=chain,
+                recovered_rows=400, recovered_ids_match=True, paired_wal=paired_wal,
+                reused_heap_tids=reused, impostors_in_top10=0,
+            ))
+            (root / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+            print('vchordg', graph_stage, 'passed', flush=True)
+
 finally:
     control.unlink(missing_ok=True)
     stop()
