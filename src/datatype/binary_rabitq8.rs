@@ -30,13 +30,14 @@ fn _vchord_rabitq8_send(vector: Rabitq8Input<'_>) -> Vec<u8> {
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
 fn _vchord_rabitq8_recv(mut internal: Internal, oid: Oid, typmod: i32) -> Rabitq8Output {
-    let _ = oid;
+    // Typmod stays unenforced until #31: INSERT passes -1, so checking only
+    // COPY/receive would make dumps of accepted rows unrestorable.
+    let _ = (oid, typmod);
     let buf = unsafe { internal.get_mut::<pgrx::pg_sys::StringInfoData>().unwrap() };
     let mut reader = rabitq_io::Reader::new(buf);
 
     let dim = reader.u32();
     rabitq_io::check_dim("rabitq8", dim);
-    rabitq_io::check_typmod("rabitq8", typmod, dim);
     let metadata = reader.metadata();
     let packed_code = reader.bytes(dim.div_ceil(1) as usize);
 

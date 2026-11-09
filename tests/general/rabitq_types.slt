@@ -30,10 +30,9 @@ SELECT dequantize_to_halfvec(quantize_to_rabitq8('[1000,1]'::vector)) IS NOT NUL
 ----
 t
 
-# The declared dimension is enforced by the input functions, which PostgreSQL
-# calls with the column's typmod in COPY (text and binary). Literals in INSERT
-# are converted with typmod -1 and need a length-coercion cast, which is a new
-# SQL object and still missing (#31 stays open for it).
+# The declared dimension is not enforced yet (#31). INSERT literals reach the
+# input functions with typmod -1, so COPY (text and binary) must accept the same
+# values: otherwise a dump of accepted rows could not be restored.
 statement ok
 CREATE TABLE rq_types (v8 rabitq8(3), v4 rabitq4(3));
 
@@ -49,14 +48,19 @@ INSERT INTO rq_types_src VALUES ('(1,1,1,1)[1,2,3,4]', '(1,1,1,1)[1,2,3,4]');
 statement ok
 COPY rq_types_src TO '/tmp/vchord_rq_types.txt';
 
-statement error expected 3 dimensions, not 4
+statement ok
 COPY rq_types FROM '/tmp/vchord_rq_types.txt';
 
 statement ok
 COPY rq_types_src TO '/tmp/vchord_rq_types.bin' (FORMAT binary);
 
-statement error expected 3 dimensions, not 4
+statement ok
 COPY rq_types FROM '/tmp/vchord_rq_types.bin' (FORMAT binary);
+
+query I
+SELECT count(*) FROM rq_types WHERE v8::text = '(1, 1, 1, 1)[1, 2, 3, 4]' AND v4::text = '(1, 1, 1, 1)[1, 2, 3, 4]';
+----
+2
 
 statement ok
 CREATE TABLE rq_types_4 (v8 rabitq8(4), v4 rabitq4(4));

@@ -14,9 +14,10 @@ use vector::rabitq8::Rabitq8Borrowed;
 
 #[pgrx::pg_extern(immutable, strict, parallel_safe)]
 fn _vchord_rabitq8_in(input: &CStr, oid: Oid, typmod: i32) -> Rabitq8Output {
-    let _ = oid;
+    // Typmod stays unenforced until #31: INSERT passes -1, so checking only
+    // COPY/receive would make dumps of accepted rows unrestorable.
+    let _ = (oid, typmod);
     let (metadata, unpacked_code) = rabitq_io::parse_text(input, "rabitq8", 255);
-    rabitq_io::check_typmod("rabitq8", typmod, unpacked_code.len() as u32);
     let packed_code = rabitq::byte::pack_code(&unpacked_code);
     let Some(x) = Rabitq8Borrowed::new_checked(
         unpacked_code.len() as _,

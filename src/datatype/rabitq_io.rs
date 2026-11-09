@@ -261,19 +261,6 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Enforces a declared dimension (`rabitq8(n)` / `rabitq4(n)`) in the input
-/// functions. `-1` means no type modifier.
-pub fn check_typmod(type_name: &str, typmod: i32, dim: u32) {
-    if typmod != -1 && i64::from(typmod) != i64::from(dim) {
-        pgrx::ereport!(
-            ERROR,
-            PgSqlErrorCode::ERRCODE_DATA_EXCEPTION,
-            format!("expected {typmod} dimensions, not {dim}"),
-            format!("The value does not match the declared dimension of type {type_name}.")
-        );
-    }
-}
-
 /// pgvector's `vector` and `halfvec` accept at most this many dimensions.
 pub const PGVECTOR_MAX_DIM: u32 = 16000;
 
