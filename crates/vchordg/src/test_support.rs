@@ -24,6 +24,7 @@ pub(crate) type TestOp = Op<VectOwned<f32>, L2S>;
 pub(crate) struct TestPage {
     opaque: Opaque,
     items: Vec<Option<Vec<u8>>>,
+    freespace: u16,
 }
 impl Page for TestPage {
     type Opaque = Opaque;
@@ -50,7 +51,7 @@ impl Page for TestPage {
         self.items[i as usize - 1] = None;
     }
     fn freespace(&self) -> u16 {
-        7000
+        self.freespace
     }
     fn clear(&mut self, opaque: Opaque) {
         self.items.clear();
@@ -96,6 +97,29 @@ pub(crate) struct TestRelation {
     pages: Vec<RefCell<TestPage>>,
     pub inject: Cell<bool>,
     pub conflicts: Cell<usize>,
+    /// Pages from this index on are handed out by `extend`.
+    spare: Cell<usize>,
+    /// `(first, second)` of every `commit_pair`, in call order.
+    pub pairs: RefCell<Vec<(u32, u32)>>,
+}
+impl TestRelation {
+    fn new(pages: Vec<RefCell<TestPage>>, inject: bool) -> Self {
+        Self {
+            spare: Cell::new(pages.len()),
+            pages,
+            inject: Cell::new(inject),
+            conflicts: Cell::new(0),
+            pairs: RefCell::new(Vec::new()),
+        }
+    }
+    /// Marks page `id` as full and adds `spare` pages for `extend`.
+    pub(crate) fn with_full_page(mut self, id: u32, spare: usize) -> Self {
+        self.pages[id as usize].get_mut().freespace = 0;
+        for _ in 0..spare {
+            self.pages.push(page(u32::MAX, u32::MAX, Vec::new()));
+        }
+        self
+    }
 }
 impl Relation for TestRelation {
     type Page = TestPage;
@@ -115,8 +139,8 @@ impl RelationWriteTypes for TestRelation {
     type WriteGuard<'b> = Write<'b>;
 }
 impl RelationWrite for TestRelation {
-    fn commit_pair(&self, _: Write<'_>, _: Write<'_>) {
-        panic!("unexpected commit_pair")
+    fn commit_pair(&self, first: Write<'_>, second: Write<'_>) {
+        self.pairs.borrow_mut().push((first.id, second.id));
     }
 
     fn write(&self, id: u32, _: bool) -> Write<'_> {
@@ -134,8 +158,16 @@ impl RelationWrite for TestRelation {
         }
         Write { id, page }
     }
-    fn extend(&self, _: Opaque, _: bool) -> Write<'_> {
-        panic!("unexpected extend")
+    fn extend(&self, opaque: Opaque, _: bool) -> Write<'_> {
+        let id = self.spare.get();
+        assert!(id < self.pages.len(), "unexpected extend");
+        self.spare.set(id + 1);
+        let mut page = self.pages[id].borrow_mut();
+        page.clear(opaque);
+        Write {
+            id: id as u32,
+            page,
+        }
     }
     fn search(&self, _: usize) -> Option<Write<'_>> {
         None
@@ -145,6 +177,7 @@ fn page(link: u32, next: u32, items: Vec<Vec<u8>>) -> RefCell<TestPage> {
     RefCell::new(TestPage {
         opaque: Opaque { link, next },
         items: items.into_iter().map(Some).collect(),
+        freespace: 7000,
     })
 }
 pub(crate) fn fixture(inject: bool) -> TestRelation {
@@ -191,16 +224,15 @@ pub(crate) fn fixture(inject: bool) -> TestRelation {
         version: Wrapping(0),
     }
     .serialize();
-    TestRelation {
-        pages: vec![
+    TestRelation::new(
+        vec![
             page(1, u32::MAX, vec![meta]),
             page(2, u32::MAX, vertices),
             page(u32::MAX, 3, vec![u]),
             page(u32::MAX, u32::MAX, vec![t]),
         ],
-        inject: Cell::new(inject),
-        conflicts: Cell::new(0),
-    }
+        inject,
+    )
 }
 
 /// One real vector page per vertex; IDs are (1, position + 1).
@@ -263,11 +295,7 @@ pub(crate) fn graph(vertices: &[(bool, &[u16])], m: u32) -> TestRelation {
         page(2, u32::MAX, vertex_tuples),
     ];
     pages.extend(vector_pages);
-    TestRelation {
-        pages,
-        inject: Cell::new(false),
-        conflicts: Cell::new(0),
-    }
+    TestRelation::new(pages, false)
 }
 
 pub(crate) struct MakePlainPrefetcher<'b, R> {

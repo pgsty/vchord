@@ -514,11 +514,11 @@ where
                 return write;
             }
             if write.get_opaque().next == u32::MAX {
-                // Initialize and WAL-log the new pages before the predecessor
-                // links to them, so neither an error nor a crash can leave the
-                // chain pointing at an uninitialized page. The new vertex page
-                // does not track free space yet: the free space map must not
-                // hand it out before it is reachable from the chain.
+                // Log the new vector page first: only the vertex page links to
+                // it. Then publish the vertex page and the predecessor's link in
+                // one WAL record. The vertex page does not track free space yet;
+                // a later hint can reach disk ahead of WAL, but cannot expose an
+                // initialized page that recovery left unlinked (#35).
                 let link = index
                     .extend(
                         Opaque {
@@ -539,9 +539,8 @@ where
                     panic!("implementation: a clear page cannot accommodate a single tuple");
                 }
                 let id = extend.id();
-                drop(extend);
                 write.get_opaque_mut().next = id;
-                drop(write);
+                index.commit_pair(write, extend);
                 // Take the new page through the ordinary path. Another backend
                 // may have used its space in the meantime.
                 current = id;
@@ -604,6 +603,18 @@ mod tests {
     use super::*;
     use crate::test_support::{TestOp, fixture};
 
+    #[test]
+    fn new_vertex_page_is_published_with_its_link() {
+        let r = fixture(false).with_full_page(1, 2);
+        let guard = append_vertex_tuple(&r, 1, 64);
+        let vertex = guard.id();
+        drop(guard);
+        // The vertex page and the predecessor's link form one WAL record.
+        assert_eq!(*r.pairs.borrow(), vec![(1, vertex)]);
+        assert_eq!(r.read(1).get_opaque().next, vertex);
+        let link = r.read(vertex).get_opaque().link;
+        assert!(link != u32::MAX && link != vertex);
+    }
     #[test]
     fn backlink_conflicts_must_not_report_success() {
         let r = fixture(true);

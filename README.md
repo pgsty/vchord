@@ -142,12 +142,12 @@ space and build resources; run it outside a transaction block. See
 
 ### Recovery and diagnostic data in 1.3.0
 
-New `vchordrq` vector pages and their incoming links are published in one WAL
-record before entering the free-space map. This closes a concurrent insertion
-and recovery window without changing the disk format or adding a WAL flush per
-page. Full crash-safe reclamation of maintenance pages is deferred: interrupted
-maintenance can still leave unused pages, recoverable with `REINDEX INDEX
-CONCURRENTLY`.
+New `vchordrq` vector pages and `vchordg` vertex pages are published with
+their incoming links in one WAL record before entering the free-space map. This
+closes concurrent insertion and recovery windows without changing the disk
+format or adding a WAL flush per page. Full crash-safe reclamation of
+maintenance pages is deferred: interrupted maintenance can still leave unused
+pages, recoverable with `REINDEX INDEX CONCURRENTLY`.
 
 Query sampling stays disabled by default. Reading samples requires superuser or
 `pg_read_all_stats`; table ownership/SELECT cannot authorize other tenants’ query
