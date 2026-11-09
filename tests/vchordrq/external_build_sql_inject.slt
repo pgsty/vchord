@@ -18,4 +18,21 @@ statement error external build table must be schema-qualified
 ALTER INDEX qualified_idx SET (options = 'build.external.table = "centroids"');
 
 statement ok
+DO $$
+DECLARE
+    hint text;
+BEGIN
+    BEGIN
+        ALTER INDEX qualified_idx SET (options = 'build.external.table = "centroids"');
+        RAISE EXCEPTION 'unqualified external-build table was accepted';
+    EXCEPTION WHEN invalid_parameter_value THEN
+        GET STACKED DIAGNOSTICS hint = PG_EXCEPTION_HINT;
+        IF hint NOT LIKE '%schema.table%' THEN
+            RAISE EXCEPTION 'missing schema qualification hint: %', hint;
+        END IF;
+    END;
+END
+$$;
+
+statement ok
 DROP TABLE t;

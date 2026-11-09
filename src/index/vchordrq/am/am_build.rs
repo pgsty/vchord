@@ -198,6 +198,23 @@ impl PostgresReporter {
     }
 }
 
+/// Reports reloption failures as invalid user input. This path is also used
+/// when an index created by an older release is rebuilt, so the error must
+/// explain how to repair the stored option instead of looking like an internal
+/// extension failure.
+pub(super) fn report_invalid_options(errors: impl std::fmt::Display) -> ! {
+    use pgrx::pg_sys::panic::ErrorReport;
+
+    ErrorReport::new(
+        pgrx::PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+        format!("error while validating options: {errors}"),
+        "ambuild",
+    )
+    .set_hint("Correct the index options and retry; build.external.table must use schema.table. Update legacy options with ALTER INDEX before rebuilding.")
+    .report(pgrx::PgLogLevel::ERROR);
+    unreachable!()
+}
+
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn ambuild(
     heap_relation: pgrx::pg_sys::Relation,
@@ -207,18 +224,18 @@ pub unsafe extern "C-unwind" fn ambuild(
     use validator::Validate;
     let (vector_options, vchordrq_options) = unsafe { options(index_relation) };
     if let Err(errors) = Validate::validate(&vector_options) {
-        pgrx::error!("error while validating options: {}", errors);
+        report_invalid_options(errors);
     }
     if let Err(errors) = Validate::validate(&vchordrq_options) {
-        pgrx::error!("error while validating options: {}", errors);
+        report_invalid_options(errors);
     }
     if vector_options.v == VectorKind::Rabitq8 && vchordrq_options.index.residual_quantization {
         let errors = "residual_quantization is not supported for rabitq8 type";
-        pgrx::error!("error while validating options: {errors}");
+        report_invalid_options(errors);
     }
     if vector_options.v == VectorKind::Rabitq4 && vchordrq_options.index.residual_quantization {
         let errors = "residual_quantization is not supported for rabitq4 type";
-        pgrx::error!("error while validating options: {errors}");
+        report_invalid_options(errors);
     }
     let opfamily = unsafe { opfamily(index_relation) };
     let reporter = PostgresReporter {
@@ -1760,13 +1777,7 @@ fn make_external_build(
     // Also check stored options during REINDEX: old releases accepted an
     // unqualified name, but index builds run with a restricted search_path.
     let Some((schema, name)) = table.split_once('.') else {
-        pgrx::ereport!(
-            pgrx::PgLogLevel::ERROR,
-            pgrx::PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
-            "external build table must be schema-qualified (schema.table)",
-            "Set build.external.table to a qualified name before rebuilding."
-        );
-        unreachable!();
+        report_invalid_options("external build table must be schema-qualified (schema.table)");
     };
     let table = format!(
         "{}.{}",

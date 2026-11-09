@@ -155,11 +155,27 @@ vectors. Prewarm retains its table privilege checks. Samples are local,
 nontransactional diagnostics. Index/database deletion cleans them up only after
 ordinary transaction commit; rollback preserves them. Cleanup is best effort,
 so a crash after commit or `COMMIT PREPARED` can leave unreachable samples.
+`DROP INDEX CONCURRENTLY` can remove samples at an internal commit even if later cancelled.
 Concurrent reindexing changes the index OID and resets its sample history.
 
 External builds require `build.external.table = 'schema.table'`. Update legacy
-unqualified options before rebuilding; existing queries remain usable. See
-[Query sampling](https://vchord.pgsty.com/docs/vchord/usage/measure-recall/#query-sampling)
+unqualified options before any operation that rebuilds or replaces the index,
+including `REINDEX` (with or without `CONCURRENTLY`), `TRUNCATE`, `VACUUM FULL`,
+`CLUSTER`, column-type changes that rebuild indexes, and dump restore. Existing
+queries remain usable until such an operation. Find external-build options with:
+
+```sql
+SELECT c.oid::regclass AS index_name, o.option_value
+FROM pg_class AS c
+JOIN pg_am AS am ON am.oid = c.relam
+CROSS JOIN LATERAL pg_options_to_table(c.reloptions) AS o
+WHERE am.amname = 'vchordrq'
+  AND o.option_name = 'options'
+  AND o.option_value LIKE '%external%';
+```
+
+Review both dotted keys and `[build.external]` sections. Every external table must contain a schema and table
+name, such as `public.centroids`. See [Query sampling](https://vchord.pgsty.com/docs/vchord/usage/measure-recall/#query-sampling)
 and [External builds](https://vchord.pgsty.com/docs/vchord/usage/external-build/).
 
 ### PostgreSQL 19 RC1 validation

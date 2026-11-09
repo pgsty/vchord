@@ -144,10 +144,10 @@ unsafe extern "C-unwind" fn validate_options(value: *const core::ffi::c_char) {
     match toml::from_str::<crate::index::vchordrq::types::VchordrqIndexingOptions>(&s) {
         Ok(options) => {
             if let Err(errors) = validator::Validate::validate(&options) {
-                pgrx::error!("error while validating options: {}", errors);
+                am_build::report_invalid_options(errors);
             }
         }
-        Err(e) => pgrx::error!("failed to parse options: {}", e),
+        Err(e) => am_build::report_invalid_options(format!("failed to parse options: {e}")),
     }
 }
 
