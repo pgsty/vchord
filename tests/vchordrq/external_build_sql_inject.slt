@@ -7,5 +7,15 @@ WITH (options = $$
 build.external.table = "s; SELECT s"
 $$);
 
+statement error external build table must be schema-qualified
+CREATE INDEX ON t USING vchordrq (val vector_l2_ops)
+WITH (options = 'build.external.table = "centroids"');
+
+statement ok
+CREATE INDEX qualified_idx ON t USING vchordrq (val vector_l2_ops);
+
+statement error external build table must be schema-qualified
+ALTER INDEX qualified_idx SET (options = 'build.external.table = "centroids"');
+
 statement ok
 DROP TABLE t;

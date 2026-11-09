@@ -136,6 +136,11 @@ impl VchordrqExternalBuildOptions {
         if !check(table_name) {
             return Err(ValidationError::new("table name is not well-formed"));
         }
+        if schema_name.is_none() {
+            return Err(ValidationError::new(
+                "external build table must be schema-qualified (schema.table)",
+            ));
+        }
         Ok(())
     }
 }

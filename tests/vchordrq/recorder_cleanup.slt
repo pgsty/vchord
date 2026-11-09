@@ -1,0 +1,112 @@
+# Query samples are diagnostic, but aborted DDL must not delete them.
+statement ok
+CREATE TABLE recorder_cleanup (v vector(3));
+
+statement ok
+INSERT INTO recorder_cleanup VALUES ('[1,2,3]');
+
+statement ok
+CREATE INDEX recorder_cleanup_idx ON recorder_cleanup USING vchordrq (v vector_l2_ops);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.query_sampling_enable = on;
+
+statement ok
+SET vchordrq.query_sampling_rate = 1;
+
+statement ok
+SET vchordrq.query_sampling_max_records = 10;
+
+statement ok
+SELECT * FROM recorder_cleanup ORDER BY v <-> '[4,5,6]' LIMIT 1;
+
+statement ok
+SET vchordrq.query_sampling_enable = off;
+
+statement ok
+BEGIN;
+
+statement ok
+DROP INDEX recorder_cleanup_idx;
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT * FROM vchordrq_sampled_values('recorder_cleanup_idx');
+----
+[4,5,6]
+
+# A released inner SAVEPOINT still belongs to its parent transaction.
+statement ok
+BEGIN;
+
+statement ok
+SAVEPOINT outer_save;
+
+statement ok
+SAVEPOINT inner_save;
+
+statement ok
+DROP INDEX recorder_cleanup_idx;
+
+statement ok
+RELEASE inner_save;
+
+statement ok
+ROLLBACK TO outer_save;
+
+statement ok
+COMMIT;
+
+query T
+SELECT * FROM vchordrq_sampled_values('recorder_cleanup_idx');
+----
+[4,5,6]
+
+statement ok
+BEGIN;
+
+statement ok
+SAVEPOINT released;
+
+statement ok
+DROP TABLE recorder_cleanup;
+
+statement ok
+RELEASE released;
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT * FROM vchordrq_sampled_values('recorder_cleanup_idx');
+----
+[4,5,6]
+
+# Concurrent rebuild creates a new index identity and starts new samples.
+statement ok
+REINDEX INDEX CONCURRENTLY recorder_cleanup_idx;
+
+query I
+SELECT count(*) FROM vchordrq_sampled_values('recorder_cleanup_idx');
+----
+0
+
+statement ok
+DROP TABLE recorder_cleanup;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET vchordrq.query_sampling_enable;
+
+statement ok
+RESET vchordrq.query_sampling_rate;
+
+statement ok
+RESET vchordrq.query_sampling_max_records;

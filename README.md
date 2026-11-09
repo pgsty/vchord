@@ -140,6 +140,28 @@ needed. Concurrent rebuilding allows reads and writes but needs extra disk
 space and build resources; run it outside a transaction block. See
 [Graph maintenance](https://vchord.pgsty.com/docs/vchord/usage/graph-index/#maintenance).
 
+### Recovery and diagnostic data in 1.3.0
+
+New `vchordrq` vector pages and their incoming links are published in one WAL
+record before entering the free-space map. This closes a concurrent insertion
+and recovery window without changing the disk format or adding a WAL flush per
+page. Full crash-safe reclamation of maintenance pages is deferred: interrupted
+maintenance can still leave unused pages, recoverable with `REINDEX INDEX
+CONCURRENTLY`.
+
+Query sampling stays disabled by default. Reading samples requires superuser or
+`pg_read_all_stats`; table ownership/SELECT cannot authorize other tenants’ query
+vectors. Prewarm retains its table privilege checks. Samples are local,
+nontransactional diagnostics. Index/database deletion cleans them up only after
+ordinary transaction commit; rollback preserves them. Cleanup is best effort,
+so a crash after commit or `COMMIT PREPARED` can leave unreachable samples.
+Concurrent reindexing changes the index OID and resets its sample history.
+
+External builds require `build.external.table = 'schema.table'`. Update legacy
+unqualified options before rebuilding; existing queries remain usable. See
+[Query sampling](https://vchord.pgsty.com/docs/vchord/usage/measure-recall/#query-sampling)
+and [External builds](https://vchord.pgsty.com/docs/vchord/usage/external-build/).
+
 ### PostgreSQL 19 RC1 validation
 
 PostgreSQL 19 is a prerelease. The `pg19` feature and C API compatibility

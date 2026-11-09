@@ -83,6 +83,10 @@ pub trait RelationWrite: RelationWriteTypes {
         tracking_freespace: bool,
     ) -> Self::WriteGuard<'_>;
     fn search(&self, freespace: usize) -> Option<Self::WriteGuard<'_>>;
+    /// Publishes both page images atomically, then releases their guards.
+    /// Pass the guards in lock acquisition order. Free-space hints must not
+    /// expose either image before publication; the second page may be new.
+    fn commit_pair(&self, first: Self::WriteGuard<'_>, second: Self::WriteGuard<'_>);
 }
 
 pub trait RelationPrefetch: Relation {

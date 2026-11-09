@@ -115,6 +115,10 @@ impl RelationWriteTypes for TestRelation {
     type WriteGuard<'b> = Write<'b>;
 }
 impl RelationWrite for TestRelation {
+    fn commit_pair(&self, _: Write<'_>, _: Write<'_>) {
+        panic!("unexpected commit_pair")
+    }
+
     fn write(&self, id: u32, _: bool) -> Write<'_> {
         let mut page = self.pages[id as usize].borrow_mut();
         // Emulate intervening successful list writes before taking the write

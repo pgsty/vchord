@@ -369,6 +369,10 @@ where
     R: RelationWrite,
     E: Clone + for<'a> Fn(&'a R, <Self::Page as Page>::Opaque, bool) -> R::WriteGuard<'a>,
 {
+    fn commit_pair(&self, first: Self::WriteGuard<'_>, second: Self::WriteGuard<'_>) {
+        self.0.commit_pair(first, second);
+    }
+
     fn write(&self, id: u32, tracking_freespace: bool) -> Self::WriteGuard<'_> {
         self.0.write(id, tracking_freespace)
     }

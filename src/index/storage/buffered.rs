@@ -65,6 +65,10 @@ impl<O: Opaque> RelationRead for BufferedPostgresRelation<O> {
 }
 
 impl<O: Opaque> RelationWrite for BufferedPostgresRelation<O> {
+    fn commit_pair(&self, first: Self::WriteGuard<'_>, second: Self::WriteGuard<'_>) {
+        self.postgres.commit_pair(first, second);
+    }
+
     fn write(&self, id: u32, tracking_freespace: bool) -> Self::WriteGuard<'_> {
         self.postgres.write(id, tracking_freespace)
     }

@@ -378,21 +378,23 @@ where
                         )
                     }
                 };
-                // Each guard is a separate WAL record, written when it is
-                // dropped. The new page must be initialized, filled and logged
-                // before the tail links to it: otherwise crash recovery (WAL
-                // ending between the two records) or a hot standby (replaying
-                // them one at a time) exposes a `next` pointer to a page that
-                // is uninitialized or still holds recycled contents. We keep
-                // the tail locked meanwhile, so concurrent appenders wait and
-                // readers cannot reach the page before it is linked.
                 let fresh = extend.id();
                 let Some(i) = extend.alloc(bytes) else {
                     panic!("implementation: a clear page cannot accommodate a single tuple");
                 };
-                drop(extend);
-                write.get_opaque_mut().next = fresh;
-                drop(write);
+                if tracking_freespace {
+                    // FSM allocation bypasses the tail lock. Publish the new
+                    // vector page and its incoming link in one WAL record,
+                    // before making its free space available to other writers.
+                    write.get_opaque_mut().next = fresh;
+                    index.commit_pair(write, extend);
+                } else {
+                    // These pages are not allocated through the FSM. Log the
+                    // new page before exposing it through the locked tail.
+                    drop(extend);
+                    write.get_opaque_mut().next = fresh;
+                    drop(write);
+                }
                 let mut past = index.write(first, tracking_freespace);
                 past.get_opaque_mut().skip = fresh.max(past.get_opaque().skip);
                 return (fresh, i);

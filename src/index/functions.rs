@@ -92,14 +92,12 @@ fn validate_index(indexrelid: Oid, amname: &CStr, am_label: &str) {
 enum IndexAccess {
     /// Loading index pages, like `pg_prewarm`: requires `SELECT` on the table.
     Prewarm,
-    /// Reading recorded query vectors: requires `SELECT` on the table or
-    /// membership in `pg_read_all_stats`.
+    /// Reading other users' query vectors requires `pg_read_all_stats`.
     SampledValues,
 }
 
-/// Raises the standard "permission denied for table" error unless the current
-/// user owns the table of the index, has `SELECT` on it, or (for sampled
-/// values only) has the privileges of `pg_read_all_stats`.
+/// Checks table access for prewarm and statistics privileges for query samples.
+/// Table ownership/SELECT cannot authorize samples from other users or tenants.
 ///
 /// The check is performed before any lock is taken on the index, so an
 /// unprivileged user cannot queue locks on another user's relations.
@@ -113,19 +111,30 @@ fn check_index_access(indexrelid: Oid, access: IndexAccess) -> Oid {
     };
     let userid = unsafe { pgrx::pg_sys::GetUserId() };
     let allowed = unsafe {
-        pgrx::pg_sys::has_privs_of_role(userid, heap.relowner)
-            || pgrx::pg_sys::pg_class_aclcheck(
-                heaprelid,
+        match access {
+            IndexAccess::SampledValues => pgrx::pg_sys::has_privs_of_role(
                 userid,
-                pgrx::pg_sys::ACL_SELECT as pgrx::pg_sys::AclMode,
-            ) == pgrx::pg_sys::AclResult::ACLCHECK_OK
-            || (access == IndexAccess::SampledValues
-                && pgrx::pg_sys::has_privs_of_role(
-                    userid,
-                    Oid::from(pgrx::pg_sys::ROLE_PG_READ_ALL_STATS),
-                ))
+                Oid::from(pgrx::pg_sys::ROLE_PG_READ_ALL_STATS),
+            ),
+            IndexAccess::Prewarm => {
+                pgrx::pg_sys::has_privs_of_role(userid, heap.relowner)
+                    || pgrx::pg_sys::pg_class_aclcheck(
+                        heaprelid,
+                        userid,
+                        pgrx::pg_sys::ACL_SELECT as pgrx::pg_sys::AclMode,
+                    ) == pgrx::pg_sys::AclResult::ACLCHECK_OK
+            }
+        }
     };
     if !allowed {
+        if access == IndexAccess::SampledValues {
+            pgrx::ereport!(
+                pgrx::PgLogLevel::ERROR,
+                pgrx::PgSqlErrorCode::ERRCODE_INSUFFICIENT_PRIVILEGE,
+                "permission denied to read sampled queries",
+                "Membership in pg_read_all_stats is required."
+            );
+        }
         let relname = CString::new(heap.relname).unwrap_or_default();
         unsafe {
             pgrx::pg_sys::aclcheck_error(
@@ -196,8 +205,8 @@ impl Drop for Index {
 #[pgrx::pg_extern(sql = "")]
 fn _vchordrq_sampled_values(indexrelid: Oid) -> SetOfIterator<'static, String> {
     validate_index(indexrelid, c"vchordrq", "vchordrq");
-    // Sampled values are query vectors issued against the table, so they are
-    // only shown to users who may read the table or all statistics.
+    // Samples may include queries issued by other users under different RLS
+    // policies. Enforce this in C as well as in the SQL view, including upgrades.
     let _relation = open_checked(indexrelid, IndexAccess::SampledValues);
     let queries = dump(indexrelid.to_u32());
     SetOfIterator::new(queries)

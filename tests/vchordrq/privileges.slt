@@ -1,6 +1,5 @@
-# Sampled query vectors and prewarm follow table privileges: a role needs to
-# own the table, have SELECT on it, or (sampled values only) be a member of
-# pg_read_all_stats.
+# Query samples can cross RLS/tenant boundaries: only pg_read_all_stats (or
+# superuser) may read them. Prewarm still follows table ownership/SELECT.
 statement ok
 DROP ROLE IF EXISTS vchord_priv_none;
 
@@ -57,18 +56,15 @@ statement ok
 ALTER TABLE vchord_priv_owned OWNER TO vchord_priv_owner;
 
 statement ok
-ALTER SYSTEM SET vchordrq.query_sampling_max_records = 1;
+SET vchordrq.query_sampling_max_records = 1;
 
 statement ok
-ALTER SYSTEM SET vchordrq.query_sampling_rate = 1;
+SET vchordrq.query_sampling_rate = 1;
 
 statement ok
-ALTER SYSTEM SET vchordrq.query_sampling_enable = on;
+SET vchordrq.query_sampling_enable = on;
 
-statement ok
-SELECT pg_reload_conf();
-
-query I retry 5 backoff 1s
+query I
 SHOW vchordrq.query_sampling_enable;
 ----
 on
@@ -96,10 +92,10 @@ CREATE INDEX vchord_priv_secret_gidx ON vchord_priv_secret USING vchordg (val ve
 statement ok
 SET ROLE vchord_priv_none;
 
-statement error permission denied for table vchord_priv_secret
+statement error permission denied to read sampled queries
 SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
 
-statement error permission denied for table vchord_priv_secret
+statement error permission denied to read sampled queries
 SELECT * FROM vchordrq_sampled_queries('vchord_priv_secret_idx');
 
 statement error permission denied for table vchord_priv_secret
@@ -116,19 +112,28 @@ SELECT count(*) FROM vchordrq_sampled_queries WHERE index_name = 'vchord_priv_se
 statement ok
 RESET ROLE;
 
-# SELECT on the table allows both.
+# SELECT on an RLS-protected table authorizes prewarm but not samples.
+statement ok
+ALTER TABLE vchord_priv_secret ENABLE ROW LEVEL SECURITY;
+
+statement ok
+CREATE POLICY own_rows ON vchord_priv_secret USING (id = 42);
+
 statement ok
 SET ROLE vchord_priv_select;
 
-query T
-SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
+query I
+SELECT count(*) FROM vchord_priv_secret;
 ----
-[42,4242,424242]
+1
 
-query T
-SELECT value FROM vchordrq_sampled_queries WHERE index_name = 'vchord_priv_secret_idx';
+statement error permission denied to read sampled queries
+SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
+
+query I
+SELECT count(*) FROM vchordrq_sampled_queries WHERE index_name = 'vchord_priv_secret_idx';
 ----
-[42,4242,424242]
+0
 
 query I
 SELECT vchordrq_prewarm('vchord_priv_secret_idx') <> '';
@@ -163,40 +168,53 @@ SELECT vchordrq_prewarm('vchord_priv_secret_idx');
 statement ok
 RESET ROLE;
 
-# The table owner needs no grant, even after revoking its own SELECT.
+# Revoking membership takes effect for both the C function and the view.
+statement ok
+REVOKE pg_read_all_stats FROM vchord_priv_stats;
+
+statement ok
+SET ROLE vchord_priv_stats;
+
+statement error permission denied to read sampled queries
+SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
+
+query I
+SELECT count(*) FROM vchordrq_sampled_queries WHERE index_name = 'vchord_priv_secret_idx';
+----
+0
+
+statement ok
+RESET ROLE;
+
+# The table owner can prewarm but cannot read samples without stats rights.
 statement ok
 REVOKE SELECT ON vchord_priv_owned FROM vchord_priv_owner;
 
 statement ok
 SET ROLE vchord_priv_owner;
 
-query T
+statement error permission denied to read sampled queries
 SELECT * FROM vchordrq_sampled_values('vchord_priv_owned_idx');
-----
-[7,7,7]
 
 query I
 SELECT vchordrq_prewarm('vchord_priv_owned_idx') <> '';
 ----
 t
 
-statement error permission denied for table vchord_priv_secret
+statement error permission denied to read sampled queries
 SELECT * FROM vchordrq_sampled_values('vchord_priv_secret_idx');
 
 statement ok
 RESET ROLE;
 
 statement ok
-ALTER SYSTEM RESET vchordrq.query_sampling_enable;
+RESET vchordrq.query_sampling_enable;
 
 statement ok
-ALTER SYSTEM RESET vchordrq.query_sampling_max_records;
+RESET vchordrq.query_sampling_max_records;
 
 statement ok
-ALTER SYSTEM RESET vchordrq.query_sampling_rate;
-
-statement ok
-SELECT pg_reload_conf();
+RESET vchordrq.query_sampling_rate;
 
 statement ok
 RESET enable_seqscan;

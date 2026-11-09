@@ -1757,6 +1757,22 @@ fn make_external_build(
 ) -> Vec<Structure<Normalized>> {
     use std::collections::BTreeMap;
     let VchordrqExternalBuildOptions { table } = external_build;
+    // Also check stored options during REINDEX: old releases accepted an
+    // unqualified name, but index builds run with a restricted search_path.
+    let Some((schema, name)) = table.split_once('.') else {
+        pgrx::ereport!(
+            pgrx::PgLogLevel::ERROR,
+            pgrx::PgSqlErrorCode::ERRCODE_INVALID_PARAMETER_VALUE,
+            "external build table must be schema-qualified (schema.table)",
+            "Set build.external.table to a qualified name before rebuilding."
+        );
+        unreachable!();
+    };
+    let table = format!(
+        "{}.{}",
+        quote_identifier(&schema.to_ascii_lowercase()),
+        quote_identifier(&name.to_ascii_lowercase())
+    );
     let mut parents = BTreeMap::new();
     let mut vectors = BTreeMap::new();
     pgrx::spi::Spi::connect(|client| {
@@ -1774,17 +1790,6 @@ fn make_external_build(
             .get_by_name("nspname")
             .expect("external build: cannot get schema of pgvector")
             .expect("external build: cannot get schema of pgvector");
-        // `table` passed `validate_table`: an optional schema and a table name,
-        // each an unquoted identifier. Quote them after case folding so the
-        // lookup matches the unquoted spelling and reserved words still parse.
-        let table = match table.split_once('.') {
-            Some((schema, name)) => format!(
-                "{}.{}",
-                quote_identifier(&schema.to_ascii_lowercase()),
-                quote_identifier(&name.to_ascii_lowercase())
-            ),
-            None => quote_identifier(&table.to_ascii_lowercase()),
-        };
         let pgvector_schema = quote_identifier(&pgvector_schema);
         let dump_query =
             format!("SELECT id, parent, vector::{pgvector_schema}.vector FROM {table};");
@@ -2007,6 +2012,10 @@ impl<R: RelationWrite<Page = PostgresPage<vchordrq::Opaque>>> RelationWriteTypes
 impl<R: RelationWrite<Page = PostgresPage<vchordrq::Opaque>>> RelationWrite
     for CachingRelation<'_, R>
 {
+    fn commit_pair(&self, first: Self::WriteGuard<'_>, second: Self::WriteGuard<'_>) {
+        self.relation.commit_pair(first, second);
+    }
+
     fn write(&self, id: u32, tracking_freespace: bool) -> Self::WriteGuard<'_> {
         self.relation.write(id, tracking_freespace)
     }

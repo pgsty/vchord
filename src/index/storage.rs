@@ -241,17 +241,63 @@ impl<O: Opaque> DerefMut for PostgresBufferWriteGuard<O> {
 impl<O: Opaque> Drop for PostgresBufferWriteGuard<O> {
     fn drop(&mut self) {
         unsafe {
-            if std::thread::panicking() {
-                pgrx::pg_sys::GenericXLogAbort(self.state);
-            } else {
-                if self.tracking_freespace {
-                    pgrx::pg_sys::RecordPageWithFreeSpace(self.raw, self.id, self.freespace() as _);
-                    pgrx::pg_sys::FreeSpaceMapVacuumRange(self.raw, self.id, self.id + 1);
+            let state = std::mem::replace(&mut self.state, std::ptr::null_mut());
+            if !state.is_null() {
+                if std::thread::panicking() {
+                    pgrx::pg_sys::GenericXLogAbort(state);
+                } else {
+                    let freespace = self.freespace();
+                    pgrx::pg_sys::GenericXLogFinish(state);
+                    self.record_freespace(freespace);
                 }
-                pgrx::pg_sys::GenericXLogFinish(self.state);
             }
             pgrx::pg_sys::UnlockReleaseBuffer(self.buf);
         }
+    }
+}
+
+impl<O: Opaque> PostgresBufferWriteGuard<O> {
+    unsafe fn record_freespace(&self, freespace: u16) {
+        if self.tracking_freespace {
+            unsafe {
+                pgrx::pg_sys::RecordPageWithFreeSpace(self.raw, self.id, freespace as _);
+                pgrx::pg_sys::FreeSpaceMapVacuumRange(self.raw, self.id, self.id + 1);
+            }
+        }
+    }
+
+    fn commit_pair(mut first: Self, mut second: Self) {
+        assert_eq!(first.raw, second.raw);
+        assert_ne!(first.id, second.id);
+        let first_space = first.freespace();
+        let second_space = second.freespace();
+        unsafe {
+            // Register in the same order as the locks were acquired. The new
+            // page and its incoming link must replay together even if an FSM
+            // hint reaches disk before this WAL record does (#35).
+            let image = pgrx::pg_sys::GenericXLogRegisterBuffer(
+                first.state,
+                second.buf,
+                pgrx::pg_sys::GENERIC_XLOG_FULL_IMAGE as _,
+            );
+            std::ptr::copy_nonoverlapping(
+                second.page.as_ptr().cast::<u8>(),
+                image.cast::<u8>(),
+                pgrx::pg_sys::BLCKSZ as usize,
+            );
+            pgrx::pg_sys::GenericXLogAbort(std::mem::replace(
+                &mut second.state,
+                std::ptr::null_mut(),
+            ));
+            let state = std::mem::replace(&mut first.state, std::ptr::null_mut());
+            pgrx::pg_sys::GenericXLogFinish(state);
+            // The images above are freed by Finish/Abort. Use the saved sizes;
+            // null states also prevent unwinding from finishing either twice.
+            first.record_freespace(first_space);
+            second.record_freespace(second_space);
+        }
+        drop(second);
+        drop(first);
     }
 }
 
@@ -352,6 +398,10 @@ impl<O: Opaque> PostgresRelation<O> {
 }
 
 impl<O: Opaque> RelationWrite for PostgresRelation<O> {
+    fn commit_pair(&self, first: Self::WriteGuard<'_>, second: Self::WriteGuard<'_>) {
+        PostgresBufferWriteGuard::commit_pair(first, second);
+    }
+
     fn write(&self, id: u32, tracking_freespace: bool) -> PostgresBufferWriteGuard<O> {
         unsafe {
             let buf = self.lock_exclusive(id);
