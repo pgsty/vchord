@@ -106,6 +106,7 @@ jobs:
         run: |
           ARCH=$(uname -m)
           ASSET=postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip
+          cp LICENSE ./build/LICENSE
           (cd ./build && zip -r ~/${ASSET} .)
           (cd ~ && sha256sum ${ASSET} > ${ASSET}.sha256)
           # No --clobber: published assets must never be replaced silently.

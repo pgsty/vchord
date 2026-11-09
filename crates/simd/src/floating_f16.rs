@@ -2163,11 +2163,16 @@ mod reduce_sum_of_d2_approx {
         };
         let dims = [1, 7, 8, 31, 32, 64, 768, 784, 1536, 4095, 16000, 65535];
         for n in dims {
-            // Ordinary f32 summation error over at most n / 64 + 7 additions
-            // per lane chain, with margin.
-            let gamma = (n as f64 / 64.0 + 16.0) * 2f64.powi(-24);
+            let gamma = |steps: f64| {
+                let nu = steps * 2f64.powi(-24);
+                nu / (1.0 - nu)
+            };
+            // FHM has 64 accumulators; the portable exact path may sum all
+            // n terms sequentially, with rounding in subtraction and square.
+            let fhm_gamma = gamma(n as f64 / 64.0 + 16.0);
+            let exact_gamma = gamma(n as f64 + 2.0);
             let unit = 2f64.powi(-11);
-            let bound = (1.0 + unit).powi(2) * (1.0 + gamma) - 1.0;
+            let bound = (1.0 + unit).powi(2) * (1.0 + fhm_gamma) - 1.0;
             for case in 0..8 {
                 let (x, y): (Vec<f16>, Vec<f16>) = (0..n)
                     .map(|_| match case {
@@ -2213,11 +2218,17 @@ mod reduce_sum_of_d2_approx {
                     continue;
                 }
                 assert!(approx > 0.0, "{label}: nonzero distance collapsed");
-                let error = (approx as f64 - reference).abs() / reference;
-                assert!(error <= bound, "{label}: {error} > {bound}");
                 let error = (exact as f64 - reference).abs() / reference;
-                assert!(error <= gamma, "{label}: exact {error} > {gamma}");
-                match (fast, model(&x, &y)) {
+                assert!(
+                    error <= exact_gamma,
+                    "{label}: exact {error} > {exact_gamma}"
+                );
+                let modeled = model(&x, &y);
+                if let Some(m) = modeled {
+                    let error = (m as f64 - reference).abs() / reference;
+                    assert!(error <= bound, "{label}: model {error} > {bound}");
+                }
+                match (fast, modeled) {
                     (true, Some(m)) => assert_eq!(approx.to_bits(), m.to_bits(), "{label}"),
                     (true, None) | (false, _) => assert_eq!(approx, exact, "{label}"),
                 }

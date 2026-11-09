@@ -3,6 +3,14 @@ name: Check
 # Temporarily keep CI manual while the local package builds are validated.
 on:
   workflow_dispatch:
+    inputs:
+      gha_cache:
+        description: "Use GitHub's compiler cache (disable during cache outages)"
+        type: boolean
+        default: true
+
+env:
+  SCCACHE_GHA_ENABLED: ${{ github.event_name != 'workflow_dispatch' || inputs.gha_cache }}
 
 concurrency:
   group: ${{ github.ref }}-${{ github.workflow }}
@@ -85,8 +93,19 @@ jobs:
             fi
           done
 
+          PGSTY_PY_HEADER=$(echo "$PY_HEADER" | sed '/Copyright (c) 2025-2026 TensorChord Inc./d')
           for p in $PY_FILES; do
-            if ! head -n "$COUNT" "$p" | cmp -s - <(echo "$PY_HEADER"); then
+            START=1
+            if head -n 1 "$p" | grep -q '^#!'; then START=2; fi
+            EXPECTED="$PY_HEADER"
+            # These scripts originated in this fork; preserve the historical
+            # TensorChord attribution in every inherited source file.
+            case "$p" in
+              ./devtools/test-recorder.py|./devtools/test-recovery.py)
+                EXPECTED="$PGSTY_PY_HEADER" ;;
+            esac
+            LINES=$(echo "$EXPECTED" | wc -l)
+            if ! tail -n +"$START" "$p" | head -n "$LINES" | cmp -s - <(echo "$EXPECTED"); then
               echo "license header mismatch in file $p"
               FLAG="1"
             fi
@@ -145,12 +164,12 @@ jobs:
       github.event_name == 'workflow_dispatch'
 
     strategy:
+      fail-fast: false
       matrix:
         arch: ["x86_64", "aarch64"]
     runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
 
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTUP_AUTO_INSTALL: "0"
       RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-Dwarnings"
@@ -220,13 +239,13 @@ jobs:
       github.event_name == 'workflow_dispatch'
 
     strategy:
+      fail-fast: false
       matrix:
         version: ["14", "15", "16", "17", "18"]
         arch: ["x86_64", "aarch64"]
     runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
 
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTUP_AUTO_INSTALL: "0"
       RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-Dwarnings"
@@ -352,6 +371,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
 
     strategy:
+      fail-fast: false
       matrix:
         version: ["14", "15", "16", "17", "18"]
         arch: ["aarch64", "x86_64"]
@@ -359,7 +379,6 @@ jobs:
     runs-on: ${{ matrix.arch == 'aarch64' && 'macos-15' || 'macos-15-intel' }}
 
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTUP_AUTO_INSTALL: "0"
       RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-Dwarnings"
@@ -459,6 +478,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
 
     strategy:
+      fail-fast: false
       matrix:
         version: ["14", "15", "16", "17", "18"]
         arch: ["x86_64"]
@@ -466,7 +486,6 @@ jobs:
     runs-on: "windows-2022"
 
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTUP_AUTO_INSTALL: "0"
       RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-Dwarnings"
@@ -579,6 +598,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
 
     strategy:
+      fail-fast: false
       matrix:
         version: ["15", "16", "17"]
         arch: ["x86_64", "aarch64"]
@@ -591,7 +611,6 @@ jobs:
         - /opt:/__e/node24:ro,rshared
 
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTUP_AUTO_INSTALL: "0"
       RUSTC_WRAPPER: "sccache"
       # RUSTFLAGS: "-Dwarnings"
@@ -713,6 +732,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
 
     strategy:
+      fail-fast: false
       matrix:
         include:
           # PGDG has no s390x packages, so s390x uses Debian's own PostgreSQL
@@ -762,7 +782,6 @@ jobs:
     runs-on: "ubuntu-24.04"
 
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTUP_AUTO_INSTALL: "0"
       RUSTC_WRAPPER: "sccache"
       # RUSTFLAGS: "-Dwarnings"
@@ -933,6 +952,7 @@ jobs:
       github.event_name == 'workflow_dispatch'
 
     strategy:
+      fail-fast: false
       matrix:
         version: ["17", "18"]
 
@@ -949,7 +969,6 @@ jobs:
       options: --user 1001 --privileged
 
     env:
-      SCCACHE_GHA_ENABLED: "true"
       RUSTUP_AUTO_INSTALL: "0"
       RUSTC_WRAPPER: "sccache"
       RUSTFLAGS: "-Dwarnings"
