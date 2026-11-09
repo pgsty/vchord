@@ -79,7 +79,7 @@ pub unsafe extern "C-unwind" fn validate_vchordrq_probes(value: *const c_char) {
     }
 }
 
-static VCHORDRQ_EPSILON: GucSetting<f64> = GucSetting::<f64>::new(2.5);
+static VCHORDRQ_EPSILON: GucSetting<f64> = GucSetting::<f64>::new(1.9);
 
 static mut VCHORDRQ_EPSILON_CONFIG: *mut pgrx::pg_sys::config_generic = core::ptr::null_mut();
 
@@ -492,7 +492,7 @@ pub unsafe fn vchordrq_epsilon(index: pgrx::pg_sys::Relation) -> f32 {
         x as f32
     }
     assert!(crate::is_main());
-    const DEFAULT: f64 = 2.5;
+    const DEFAULT: f64 = 1.9;
     if unsafe { (*VCHORDRQ_EPSILON_CONFIG).source } != pgrx::pg_sys::GucSource::PGC_S_DEFAULT {
         let value = VCHORDRQ_EPSILON.get();
         parse(value)

@@ -176,7 +176,7 @@ pub fn init() {
                 kind as _,
                 c"epsilon".as_ptr(),
                 c"Search parameter `vchordrq.epsilon`".as_ptr(),
-                2.5,
+                1.9,
                 0.0,
                 4.0,
                 pgrx::pg_sys::AccessExclusiveLock as pgrx::pg_sys::LOCKMODE,

@@ -126,9 +126,10 @@ all below `2.0`.
 
 ### Graph maintenance in the planned 1.3.0 release
 
-The default `vchordrq.epsilon` increases from `1.9` to `2.5` in 1.3.0 to improve
-recall and reduce distance-order inversions, at the cost of more reranking.
-Explicit session settings and per-index fallback values still take precedence.
+The default `vchordrq.epsilon` remains `1.9` in 1.3.0. Higher values, such as
+`2.5`, can improve recall and reduce distance-order inversions, at the cost of
+more reranking. Measure recall and latency on your workload before increasing
+it. Explicit session settings and per-index fallback values take precedence.
 
 `VACUUM` repairs `vchordg` locally and reuses deleted space. It follows deleted
 bridges when a neighbour list has spare capacity, with bounded expansion and
