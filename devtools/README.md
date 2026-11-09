@@ -22,6 +22,8 @@ the private cluster and `results.json` for inspection.
 It interrupts new-vector-page publication before/after the paired WAL record
 and after the FSM update, with concurrent insertion. It also persists just the
 FSM images before crashing to model stale hints surviving ahead of WAL. Checks
+include another writer committing on the new page before its publisher crashes.
+Other checks
 cover committed IDs, two-page WAL records, vector-tape reachability, VACUUM and
 concurrent REINDEX. These are controlled process-crash tests, not power-loss or
 storage-hardware certification. Complete maintenance-page reclamation remains

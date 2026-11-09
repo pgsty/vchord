@@ -88,6 +88,10 @@ s = s.replace(anchor, '            recovery_probe("after", first.id, second.id);
 anchor = '            second.record_freespace(second_space);\n        }'
 assert s.count(anchor) == 1
 s = s.replace(anchor, '            second.record_freespace(second_space);\n            recovery_probe("fsm", first.id, second.id);\n        }')
+anchor = '        drop(second);\n        drop(first);'
+assert s.count(anchor) == 1
+s = s.replace(anchor, '        let recovery_ids = (first.id, second.id);\n' + anchor +
+              '\n        recovery_probe("unlocked", recovery_ids.0, recovery_ids.1);')
 p.write_text(s + hook)
 run('build', ['make', '-C', src, 'build'])
 lib = root / 'lib'
@@ -147,9 +151,9 @@ def vector_pages(c, idx):
     return pages
 
 
-def vector_ctids(c, idx):
+def vector_ctids(c, idx, blocks=None):
     ctids = []
-    for block in vector_pages(c, idx):
+    for block in (vector_pages(c, idx) if blocks is None else blocks):
         raw = page(c, idx, block)
         lower = struct.unpack_from('<H', raw, 12)[0]
         for pos in range(24, lower, 4):
@@ -178,7 +182,7 @@ try:
         for extension in ['vchord CASCADE', 'pageinspect', 'pg_freespacemap', 'pg_walinspect']:
             c.execute('CREATE EXTENSION IF NOT EXISTS ' + extension)
     cases = [(stage, mode) for stage in ['before', 'after', 'fsm']
-             for mode in ['success', 'error', 'crash']] + [('stale', 'crash'), ('fsm', 'unflushed')]
+             for mode in ['success', 'error', 'crash']] + [('stale', 'crash'), ('fsm', 'unflushed'), ('unlocked', 'crash')]
     for n, (stage, mode) in enumerate(cases):
         table, idx = f'recovery_{n}', f'recovery_{n}_idx'
         with connect() as c:
@@ -199,10 +203,14 @@ try:
                     time.sleep(.02)
                 tail, fresh = map(int, marker.read_text().split(','))
                 free = c.execute('SELECT pg_freespace(%s,%s)', (idx, fresh)).fetchone()[0]
-                assert (free > 0) == (stage in ['fsm', 'stale']), (stage, free)
+                assert (free > 0) == (stage in ['fsm', 'stale', 'unlocked']), (stage, free)
                 bf = pool.submit(execute, b, f'INSERT INTO {table} VALUES(2000,array_fill(0.5::real,ARRAY[256])::vector)')
                 deadline = time.monotonic() + 5
-                while True:
+                if stage == 'unlocked':
+                    assert bf.result(timeout=5), 'independent writer failed to commit'
+                    b_ctid = c.execute(f'SELECT ctid::text FROM {table} WHERE id=2000').fetchone()[0]
+                    assert b_ctid in vector_ctids(c, idx, [fresh]), 'writer did not use the newly published page'
+                while stage != 'unlocked':
                     wait = c.execute('SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s', (b.info.backend_pid,)).fetchone()
                     if wait == ('LWLock',):
                         break
@@ -223,7 +231,7 @@ try:
                             struct.pack_into('<H', image, 8, checksum & 0xffff)
                             images.append(image)
                         saved_fsm = (data / (path + '_fsm'), images)
-                    elif mode != 'unflushed':
+                    elif mode != 'unflushed' and stage != 'unlocked':
                         c.execute('SELECT pg_switch_wal()')
                     stop('immediate')
                     if saved_fsm:
@@ -248,10 +256,10 @@ try:
             expected = sorted(row[0] for row in c.execute(f'SELECT id FROM {table}'))
             assert ids(c, table) == expected
             reachable = vector_pages(c, idx)
-            assert (fresh in reachable) == (stage in ['after', 'fsm'] or mode == 'success') or mode == 'unflushed'
+            assert (fresh in reachable) == (stage in ['after', 'fsm', 'unlocked'] or mode == 'success') or mode == 'unflushed'
             records = c.execute("SELECT block_ref FROM pg_get_wal_records_info(%s,pg_current_wal_lsn()) WHERE resource_manager='Generic'", (wal_start,)).fetchall()
             pair = [row[0] for row in records if re.search(rf'blk {tail}\b', row[0] or '') and re.search(rf'blk {fresh}\b', row[0] or '')]
-            if stage in ['after', 'fsm'] and mode != 'unflushed' or mode == 'success':
+            if stage in ['after', 'fsm', 'unlocked'] and mode != 'unflushed' or mode == 'success':
                 assert pair, 'initialization and link not found in one WAL record'
             c.execute(f'DELETE FROM {table} WHERE id=2000')
             c.execute(f'VACUUM {table}')
