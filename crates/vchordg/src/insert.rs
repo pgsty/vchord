@@ -70,7 +70,7 @@ where
             });
             left.chain(std::iter::once(right)).collect::<Vec<_>>()
         };
-        let mut vertex_bytes = {
+        let vertex_bytes = {
             let code = O::Vector::code(bits, vector);
             VertexTuple::serialize(&VertexTuple {
                 metadata: code.0.into_array(),
@@ -95,14 +95,14 @@ where
                 Pointer::new((vector_guard.id(), i))
             })
             .collect::<Vec<_>>();
-        {
-            let mut vertex_tuple = VertexTuple::deserialize_mut(&mut vertex_bytes);
-            vertex_tuple.pointers().copy_from_slice(&pointers_t);
-        }
         let t = {
             let i = vertex_guard
                 .alloc(&vertex_bytes)
                 .expect("implementation: a free page cannot accommodate a single tuple");
+            // Vec<u8> has no alignment guarantee. Patch the pointers in the
+            // aligned page tuple while its write guard is still held.
+            let mut vertex_tuple = VertexTuple::deserialize_mut(vertex_guard.get_mut(i).unwrap());
+            vertex_tuple.pointers().copy_from_slice(&pointers_t);
             (vertex_guard.id(), i)
         };
         drop(vertex_guard);

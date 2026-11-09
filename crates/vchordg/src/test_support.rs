@@ -19,11 +19,12 @@ use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::num::{NonZero, Wrapping};
 use std::ops::{Deref, DerefMut};
 use vector::vect::VectOwned;
+use zerocopy::IntoBytes;
 
 pub(crate) type TestOp = Op<VectOwned<f32>, L2S>;
 pub(crate) struct TestPage {
     opaque: Opaque,
-    items: Vec<Option<Vec<u8>>>,
+    items: Vec<Option<Vec<u64>>>,
     freespace: u16,
 }
 impl Page for TestPage {
@@ -38,13 +39,19 @@ impl Page for TestPage {
         self.items.len() as u16
     }
     fn get(&self, i: u16) -> Option<&[u8]> {
-        self.items.get(i as usize - 1)?.as_deref()
+        self.items
+            .get(i as usize - 1)?
+            .as_deref()
+            .map(IntoBytes::as_bytes)
     }
     fn get_mut(&mut self, i: u16) -> Option<&mut [u8]> {
-        self.items.get_mut(i as usize - 1)?.as_deref_mut()
+        self.items
+            .get_mut(i as usize - 1)?
+            .as_deref_mut()
+            .map(IntoBytes::as_mut_bytes)
     }
     fn alloc(&mut self, data: &[u8]) -> Option<u16> {
-        self.items.push(Some(data.to_vec()));
+        self.items.push(Some(aligned(data)));
         Some(self.len())
     }
     fn free(&mut self, i: u16) {
@@ -173,10 +180,19 @@ impl RelationWrite for TestRelation {
         None
     }
 }
+// Serialized tuples are padded to ALIGN bytes; match PostgreSQL's tuple
+// alignment instead of relying on the allocator over-aligning Vec<u8>.
+fn aligned(data: &[u8]) -> Vec<u64> {
+    assert_eq!(data.len() % size_of::<u64>(), 0);
+    let mut words = vec![0u64; data.len() / size_of::<u64>()];
+    words.as_mut_bytes().copy_from_slice(data);
+    words
+}
+
 fn page(link: u32, next: u32, items: Vec<Vec<u8>>) -> RefCell<TestPage> {
     RefCell::new(TestPage {
         opaque: Opaque { link, next },
-        items: items.into_iter().map(Some).collect(),
+        items: items.into_iter().map(|data| Some(aligned(&data))).collect(),
         freespace: 7000,
     })
 }
