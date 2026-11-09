@@ -65,8 +65,19 @@ ALTER TABLE t RESET (parallel_workers);
 statement ok
 DELETE FROM t WHERE id <= 1000;
 
+# A catalog autovacuum can hold a snapshot from before the DELETE even though
+# this table disables autovacuum. Wait until those rows can be removed; forcing
+# INDEX_CLEANUP alone cannot make tuples visible to old snapshots removable.
+query B retry 100 backoff 100ms
+SELECT NOT EXISTS (
+    SELECT FROM pg_stat_activity
+    WHERE pid <> pg_backend_pid() AND backend_xmin IS NOT NULL AND age(backend_xmin) > 0
+);
+----
+t
+
 statement ok
-VACUUM t;
+VACUUM (INDEX_CLEANUP ON) t;
 
 query TIB
 SELECT relname, reltuples::bigint, relpages > 0 FROM pg_class WHERE relname IN ('t', 't_idx') ORDER BY relname;
