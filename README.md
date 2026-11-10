@@ -6,7 +6,7 @@
 [![Version: v1.3.0](https://img.shields.io/badge/Version-v1.3.0-slategray?style=flat)](https://github.com/pgsty/vchord/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](https://github.com/pgsty/vchord/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/vchord?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/vchord&Date)
-[![PostgreSQL: 14-19](https://img.shields.io/badge/PostgreSQL-14--19-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
+[![PostgreSQL: 14-18](https://img.shields.io/badge/PostgreSQL-14--18-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
 
 **`vchord`** is a PostgreSQL extension engineered for scalable, high-performance, and disk-friendly vector similarity search, serving as the successor to `pgvecto.rs`.
 
@@ -72,7 +72,8 @@ sudo systemctl restart postgresql
 
 ### 2. Run with Docker
 
-To spin up a ready-to-use PostgreSQL 18 container with `vchord` preloaded:
+For a PostgreSQL 18 demo with upstream **1.1.1** preloaded
+(this image does not contain PGSTY 1.3.0):
 
 ```bash
 docker run \
@@ -124,7 +125,25 @@ compatibility with 1.1.1. An empty string is valid for `lists = []`.
 For `vchordg`, `alpha` must contain 1–8 ascending values starting with `1.0`,
 all below `2.0`.
 
-### Graph maintenance in the planned 1.3.0 release
+### Upgrading to 1.3.0
+
+The [1.3.0 release](https://github.com/pgsty/vchord/releases/tag/1.3.0) provides
+Linux ZIP archives and Debian packages for PostgreSQL 14–18 on x86_64 and
+aarch64, built on Ubuntu 22.04 (glibc 2.35 or newer). Distribution repositories
+may update on a different schedule.
+
+Install the matching library and SQL files, restart PostgreSQL, then run this
+in each database using the extension:
+
+```sql
+ALTER EXTENSION vchord UPDATE TO '1.3.0';
+```
+
+Upgrades from 1.1.1 and 1.2.0 are tested. The on-disk format is unchanged.
+Read the [release notes](https://vchord.pgsty.com/blog/release/vchord-1.3.0/)
+for cosine-index rebuilds, sampling permissions, and external-build compatibility.
+
+### Graph maintenance in 1.3.0
 
 The default `vchordrq.epsilon` remains `1.9` in 1.3.0. Higher values, such as
 `2.5`, can improve recall and reduce distance-order inversions, at the cost of
@@ -203,6 +222,21 @@ included in the CI or release matrices. Formal release support will be
 considered after PostgreSQL 19 GA and a fresh compatibility check.
 
 ---
+
+## Testing
+
+The **Check** workflow is manually dispatched. Regular jobs retain the full
+Rust and SQL suites, Clippy, and platform coverage. Valgrind on PostgreSQL 17/18
+defaults to the two existing `scan_abort.slt` regressions (100-row fixtures),
+covering scans, reranking, rescans, errors, cancellation, and resource cleanup.
+The SQL step has a 20-minute timeout; the job including debug builds has a
+90-minute timeout.
+
+Enable **full_valgrind** explicitly to run the complete SQL suite under
+Valgrind, with a five-hour SQL limit and a six-hour job limit. It can still time
+out on slow runners; a timeout is incomplete coverage, not a pass. Valgrind
+uses `--leak-check=no`, so this is not a full leak audit. Recovery and recorder
+checks are described in [devtools/README.md](devtools/README.md).
 
 ## Documentation
 

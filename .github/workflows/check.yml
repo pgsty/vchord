@@ -8,6 +8,10 @@ on:
         description: "Use GitHub's compiler cache (disable during cache outages)"
         type: boolean
         default: true
+      full_valgrind:
+        description: "Run the full SQL suite under Valgrind instead of the two small regressions"
+        type: boolean
+        default: false
 
 env:
   SCCACHE_GHA_ENABLED: ${{ github.event_name != 'workflow_dispatch' || inputs.gha_cache }}
@@ -963,6 +967,7 @@ jobs:
         version: ["17", "18"]
 
     runs-on: "ubuntu-24.04"
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.full_valgrind && 360 || 90 }}
 
     container:
       image: archlinux/archlinux:base-devel
@@ -1115,7 +1120,15 @@ jobs:
           psql -c 'CREATE EXTENSION IF NOT EXISTS vchord CASCADE;'
 
       - name: Sqllogictest
+        timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && inputs.full_valgrind && 300 || 20 }}
+        env:
+          FULL_VALGRIND: ${{ github.event_name == 'workflow_dispatch' && inputs.full_valgrind }}
         run: |
+          if [ "$FULL_VALGRIND" != "true" ]; then
+            sqllogictest --db $(whoami) --user $(whoami) './tests/vchordg/scan_abort.slt' --label pg${{ matrix.version }}
+            sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/scan_abort.slt' --label pg${{ matrix.version }}
+            exit 0
+          fi
           sqllogictest --db $(whoami) --user $(whoami) './tests/general/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordg/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/*.slt' --label pg${{ matrix.version }}
