@@ -40,7 +40,7 @@ pub use fast_heap::FastHeap;
 pub use insert::{InsertChooser, insert, insert_vector};
 pub use maintain::{MaintainChooser, Pending, maintain};
 pub use prewarm::prewarm;
-pub use rerank::{Table, how, rerank_heap, rerank_index};
+pub use rerank::{Table, TableAhead, how, rerank_heap, rerank_index};
 pub use search::{Candidates, MaxsimCandidate, SearchParams, default_search, maxsim_search};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};

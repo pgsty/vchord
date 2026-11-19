@@ -14,12 +14,12 @@ use always_equal::AlwaysEqual;
 use distance::Distance;
 use index::fetch::BorrowedIter;
 use index::packed::PackedRefMut;
-use index::prefetcher::Prefetcher;
+use index::prefetcher::{Prefetcher, Sequence};
 use index::relation::{Page, RelationRead};
 use index_accessor::{Accessor2, DefaultWithDimension, LTryAccess};
 use std::borrow::Borrow;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, VecDeque, vec_deque};
 use std::marker::PhantomData;
 use std::num::NonZero;
 use vector::{VectorBorrowed, VectorOwned};
@@ -51,6 +51,83 @@ impl Table for () {
     }
 
     fn prefetch(&mut self, _: NonZero<u64>) {}
+}
+
+/// Rows to read ahead after `n`, doubling so that a scan ended early reads few.
+#[inline]
+fn ramp(n: usize, window: usize) -> usize {
+    (1 << (n / 2 + 1).ilog2()).min(window)
+}
+
+/// Candidates whose table pages are read ahead of the table rerank, in the order it takes them.
+pub struct TableAhead<S: Sequence, H> {
+    sequence: S,
+    ahead: VecDeque<S::Item>,
+    taken: usize,
+    table: H,
+}
+
+impl<S: Sequence, H> TableAhead<S, H> {
+    pub fn new(sequence: S, table: H) -> Self {
+        Self {
+            sequence,
+            ahead: VecDeque::new(),
+            taken: 0,
+            table,
+        }
+    }
+}
+
+impl<'b, S, T, W, H> TableAhead<S, H>
+where
+    S: Sequence<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
+    W: PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
+    H: Table,
+{
+    #[inline]
+    fn fill(&mut self) {
+        while self.ahead.len() < ramp(self.taken, self.table.window())
+            && let Some(candidate) = self.sequence.next()
+        {
+            self.table.prefetch(candidate.1.0.get().0);
+            self.ahead.push_back(candidate);
+        }
+    }
+}
+
+impl<'b, S, T, W, H> Sequence for TableAhead<S, H>
+where
+    S: Sequence<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
+    W: PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
+    H: Table,
+{
+    type Item = S::Item;
+    type Inner = std::iter::Chain<vec_deque::IntoIter<S::Item>, S::Inner>;
+
+    #[inline]
+    fn next(&mut self) -> Option<S::Item> {
+        let candidate = self.ahead.pop_front().or_else(|| self.sequence.next())?;
+        self.taken += 1;
+        self.fill();
+        Some(candidate)
+    }
+
+    #[inline]
+    fn peek(&mut self) -> Option<&S::Item> {
+        if self.ahead.is_empty() {
+            self.sequence.peek()
+        } else {
+            self.ahead.front()
+        }
+    }
+
+    fn into_inner(self) -> Self::Inner {
+        self.ahead.into_iter().chain(self.sequence.into_inner())
+    }
+
+    fn refill(&mut self) -> bool {
+        self.sequence.refill()
+    }
 }
 
 pub struct Reranker<T, F, P, W, H> {
@@ -106,9 +183,8 @@ where
 }
 
 impl<T, F, P, W, H: Table> Reranker<T, F, P, W, H> {
-    /// Rows to read ahead, doubling with the rows returned so that a scan ended early reads few.
     fn window(&self) -> usize {
-        (1 << (self.returned / 2 + 1).ilog2()).min(self.table.window())
+        ramp(self.returned, self.table.window())
     }
 
     fn push(&mut self, row: Result) {
@@ -215,42 +291,57 @@ mod tests {
         }
     }
 
+    // (lower bound, exact distance); the fourth row's distance is below its bound
+    const ROWS: [(f32, f32); 6] = [
+        (0.1, 0.3),
+        (0.2, 0.25),
+        (0.3, 0.9),
+        (0.35, 0.33),
+        (0.4, 0.5),
+        (0.6, 0.7),
+    ];
+
+    type Candidate<'b> = (
+        (Reverse<Distance>, AlwaysEqual<()>),
+        AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
+    );
+
+    fn candidates<'b>() -> BinaryHeap<Candidate<'b>> {
+        let candidate = |(i, &(bound, _)): (usize, &(f32, f32))| -> Candidate<'b> {
+            let payload = NonZero::new(i as u64 + 1).unwrap();
+            let w = Box::leak(Box::new((
+                payload,
+                0,
+                BorrowedIter::from_slice(&[], |_| &[]),
+            )));
+            (
+                (Reverse(Distance::from_f32(bound)), AlwaysEqual(())),
+                AlwaysEqual(PackedRefMut4(w)),
+            )
+        };
+        ROWS.iter().enumerate().map(candidate).collect()
+    }
+
+    fn distance(payload: NonZero<u64>) -> Option<Distance> {
+        Some(Distance::from_f32(ROWS[payload.get() as usize - 1].1))
+    }
+
+    fn read(x: &RefCell<Vec<NonZero<u64>>>) -> Vec<u64> {
+        x.take().into_iter().map(NonZero::get).collect()
+    }
+
     #[test]
     fn reading_ahead_keeps_the_order() {
         let index = MemoryRelation::<crate::Opaque>::new([]);
-        // (lower bound, exact distance); the fourth row's distance is below its bound
-        let rows = [
-            (0.1, 0.3),
-            (0.2, 0.25),
-            (0.3, 0.9),
-            (0.35, 0.33),
-            (0.4, 0.5),
-            (0.6, 0.7),
-        ];
         let run = |table: Recorder| {
-            let candidates = rows.iter().enumerate().map(|(i, &(bound, _))| {
-                let payload = NonZero::new(i as u64 + 1).unwrap();
-                let w = Box::leak(Box::new((
-                    payload,
-                    0,
-                    BorrowedIter::from_slice(&[], |_| &[]),
-                )));
-                (
-                    (Reverse(Distance::from_f32(bound)), AlwaysEqual(())),
-                    AlwaysEqual(PackedRefMut4(w)),
-                )
-            });
-            let prefetcher = PlainPrefetcher::new(&index, candidates.collect::<BinaryHeap<_>>());
             let reranker = Reranker {
-                prefetcher,
+                prefetcher: PlainPrefetcher::new(&index, candidates()),
                 cache: BinaryHeap::new(),
                 ahead: VecDeque::new(),
                 returned: 0,
                 table,
-                f: |payload: NonZero<u64>, _, _| {
-                    Some(Distance::from_f32(rows[payload.get() as usize - 1].1))
-                },
-                _phantom: PhantomData::<fn((), PackedRefMut4<_>) -> ((), PackedRefMut4<_>)>,
+                f: |payload, _, _| distance(payload),
+                _phantom: PhantomData::<fn((), _) -> ((), _)>,
             };
             reranker
                 .map(|(_, payload)| payload.get())
@@ -261,12 +352,42 @@ mod tests {
         assert_eq!(expected, [2, 1, 4, 5, 6, 3]);
         assert_eq!(run(Recorder(1, &one)), expected);
         assert_eq!(run(Recorder(4, &four)), expected);
-        let read = |x: RefCell<Vec<NonZero<u64>>>| {
-            x.take().into_iter().map(NonZero::get).collect::<Vec<_>>()
-        };
-        assert!(read(none).is_empty());
+        assert!(read(&none).is_empty());
         // the window ramps from one row, so the first rows are read as with a window of one
-        assert_eq!(read(one), [1, 2, 1, 3, 4, 3, 5, 3, 6, 3]);
-        assert_eq!(read(four), [1, 2, 1, 3, 4, 5, 6]);
+        assert_eq!(read(&one), [1, 2, 1, 3, 4, 3, 5, 3, 6, 3]);
+        assert_eq!(read(&four), [1, 2, 1, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn table_rerank_reads_candidates_ahead() {
+        let index = MemoryRelation::<crate::Opaque>::new([]);
+        // requests as payloads, table reads as payloads + 100
+        let run = |window: usize, log: &RefCell<Vec<NonZero<u64>>>| {
+            let reranker = Reranker {
+                prefetcher: PlainPrefetcher::new(
+                    &index,
+                    TableAhead::new(candidates(), Recorder(window, log)),
+                ),
+                cache: BinaryHeap::new(),
+                ahead: VecDeque::new(),
+                returned: 0,
+                table: (),
+                f: |payload: NonZero<u64>, _, _| {
+                    log.borrow_mut().push(payload.checked_add(100).unwrap());
+                    distance(payload)
+                },
+                _phantom: PhantomData::<fn((), _) -> ((), _)>,
+            };
+            reranker
+                .map(|(_, payload)| payload.get())
+                .collect::<Vec<_>>()
+        };
+        let (none, one, four) = Default::default();
+        assert_eq!(run(0, &none), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(run(1, &one), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(run(4, &four), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(read(&none), [101, 102, 103, 104, 105, 106]);
+        assert_eq!(read(&one), [2, 101, 3, 102, 4, 103, 5, 104, 6, 105, 106]);
+        assert_eq!(read(&four), [2, 101, 3, 4, 102, 5, 103, 6, 104, 105, 106]);
     }
 }

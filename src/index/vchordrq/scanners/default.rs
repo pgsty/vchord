@@ -26,7 +26,9 @@ use std::num::NonZero;
 use std::rc::Rc;
 use vchordrq::operator::Operator;
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
-use vchordrq::{Candidates, RerankMethod, default_search, how, rerank_heap, rerank_index};
+use vchordrq::{
+    Candidates, RerankMethod, TableAhead, default_search, how, rerank_heap, rerank_index,
+};
 use vector::VectorOwned;
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
@@ -255,8 +257,9 @@ impl SearchBuilder for DefaultBuilder {
 }
 
 /// Reranks `candidates` by exact distance, reading vectors from the index or the table as it was
-/// built; with `prefilter`, rows the table's quals reject are dropped first. The table pages of
-/// rows about to be returned are read ahead unless reranking or the prefilter has read them.
+/// built; with `prefilter`, rows the table's quals reject are dropped first. Unless `io` is plain,
+/// table pages are read ahead: of candidates before the table rerank, else of rows about to be
+/// returned unless the prefilter has read them.
 fn rerank<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
@@ -284,8 +287,16 @@ where
             let vector = unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
             Some(O::Vector::from_owned(vector.unwrap()))
         };
-        let prefetcher = PlainPrefetcher::new(index, candidates);
-        return Box::new(rerank_heap::<O, _, _, _>(vector, prefetcher, fetch).map(f));
+        return match io {
+            Io::Plain => {
+                let prefetcher = PlainPrefetcher::new(index, candidates);
+                Box::new(rerank_heap::<O, _, _, _>(vector, prefetcher, fetch).map(f))
+            }
+            Io::Simple | Io::Stream => {
+                let prefetcher = PlainPrefetcher::new(index, TableAhead::new(candidates, table));
+                Box::new(rerank_heap::<O, _, _, _>(vector, prefetcher, fetch).map(f))
+            }
+        };
     }
     let predicate = id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
         let (key, _) = pointer_to_kv(*pointer);
