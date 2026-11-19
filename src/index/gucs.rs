@@ -105,12 +105,8 @@ static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::ne
     PostgresIo::ReadStream,
 );
 
-static VCHORDRQ_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
-    PostgresIo::PrefetchBuffer,
-    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
-    PostgresIo::ReadStream,
-);
+static VCHORDRQ_IO_RERANK: GucSetting<PostgresIo> =
+    GucSetting::<PostgresIo>::new(PostgresIo::PrefetchBuffer);
 
 pub fn init() {
     GucRegistry::define_bool_guc(
@@ -195,7 +191,7 @@ pub fn init() {
     GucRegistry::define_enum_guc(
         c"vchordrq.io_search",
         c"`io_search` argument of vchordrq.",
-        c"`io_search` argument of vchordrq.",
+        c"How the search reads list pages: read_buffer, prefetch_buffer or read_stream, the default where PostgreSQL has it.",
         &VCHORDRQ_IO_SEARCH,
         GucContext::Userset,
         GucFlags::default(),
@@ -203,7 +199,7 @@ pub fn init() {
     GucRegistry::define_enum_guc(
         c"vchordrq.io_rerank",
         c"`io_rerank` argument of vchordrq.",
-        c"`io_rerank` argument of vchordrq.",
+        c"How the rerank reads vectors and table pages: read_buffer, prefetch_buffer (the default, as reranked pages are scattered) or read_stream.",
         &VCHORDRQ_IO_RERANK,
         GucContext::Userset,
         GucFlags::default(),
