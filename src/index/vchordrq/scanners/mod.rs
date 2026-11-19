@@ -27,9 +27,16 @@ macro_rules! prefetched {
 mod default;
 mod maxsim;
 
+use crate::datatype::memory_halfvec::HalfvecInput;
+use crate::datatype::memory_rabitq4::Rabitq4Input;
+use crate::datatype::memory_rabitq8::Rabitq8Input;
+use crate::datatype::memory_vector::VectorInput;
 use crate::index::scanners::Io;
+use pgrx::datum::FromDatum;
+use pgrx::pg_sys::Datum;
 use simd::f16;
 use vchordrq::types::OwnedVector;
+use vector::VectorOwned;
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
 use vector::vect::VectOwned;
@@ -49,9 +56,11 @@ pub struct SearchOptions {
     pub table: crate::index::fetcher::TablePrefetch,
 }
 
-/// An opfamily's own vector type, taken out of an `OwnedVector`.
-pub trait FromOwned {
+/// An opfamily's own vector type, taken out of an `OwnedVector` or read in place from a datum.
+pub trait FromOwned: VectorOwned {
     fn from_owned(vector: OwnedVector) -> Self;
+    /// Calls `f` with the vector in `datum`, which must not be null; only a toasted value is copied.
+    unsafe fn in_datum<R>(datum: Datum, f: impl FnOnce(Self::Borrowed<'_>) -> R) -> R;
 }
 
 impl FromOwned for VectOwned<f32> {
@@ -60,6 +69,12 @@ impl FromOwned for VectOwned<f32> {
             unreachable!()
         };
         vector
+    }
+
+    unsafe fn in_datum<R>(datum: Datum, f: impl FnOnce(Self::Borrowed<'_>) -> R) -> R {
+        f(unsafe { VectorInput::from_datum(datum, false) }
+            .unwrap()
+            .as_borrowed())
     }
 }
 
@@ -70,6 +85,12 @@ impl FromOwned for VectOwned<f16> {
         };
         vector
     }
+
+    unsafe fn in_datum<R>(datum: Datum, f: impl FnOnce(Self::Borrowed<'_>) -> R) -> R {
+        f(unsafe { HalfvecInput::from_datum(datum, false) }
+            .unwrap()
+            .as_borrowed())
+    }
 }
 
 impl FromOwned for Rabitq8Owned {
@@ -79,6 +100,12 @@ impl FromOwned for Rabitq8Owned {
         };
         vector
     }
+
+    unsafe fn in_datum<R>(datum: Datum, f: impl FnOnce(Self::Borrowed<'_>) -> R) -> R {
+        f(unsafe { Rabitq8Input::from_datum(datum, false) }
+            .unwrap()
+            .as_borrowed())
+    }
 }
 
 impl FromOwned for Rabitq4Owned {
@@ -87,5 +114,11 @@ impl FromOwned for Rabitq4Owned {
             unreachable!()
         };
         vector
+    }
+
+    unsafe fn in_datum<R>(datum: Datum, f: impl FnOnce(Self::Borrowed<'_>) -> R) -> R {
+        f(unsafe { Rabitq4Input::from_datum(datum, false) }
+            .unwrap()
+            .as_borrowed())
     }
 }

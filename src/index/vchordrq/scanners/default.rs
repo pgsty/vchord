@@ -14,6 +14,7 @@ use crate::index::vchordrq::opclass::Opfamily;
 use crate::index::vchordrq::scanners::{FromOwned, SearchOptions};
 use crate::recorder::{Recorder, text};
 use always_equal::AlwaysEqual;
+use distance::Distance;
 use index::bump::Bump;
 use index::filter::filter;
 use index::packed::PackedRefMut4;
@@ -27,7 +28,8 @@ use std::rc::Rc;
 use vchordrq::operator::Operator;
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
 use vchordrq::{
-    Candidates, RerankMethod, TableAhead, default_search, how, rerank_heap, rerank_index,
+    Candidates, RerankMethod, TableAhead, default_search, exact_distance, how, rerank_heap,
+    rerank_index, unit_distance,
 };
 use vector::VectorOwned;
 use vector::rabitq4::Rabitq4Owned;
@@ -256,6 +258,48 @@ impl SearchBuilder for DefaultBuilder {
     }
 }
 
+/// The table rerank of `rerank`, with `d` the distance from the query to a row's vector.
+fn rerank_table<'b, R, O, D>(
+    index: &'b R,
+    candidates: Candidates<'b>,
+    vector: impl Borrow<O::Vector> + 'b,
+    (io, prefilter, table): (Io, bool, TablePrefetch),
+    mut fetcher: impl Fetcher + 'b,
+    (opfamily, d): (Opfamily, D),
+) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
+where
+    R: RelationRead,
+    O: Operator,
+    O::Vector: FromOwned,
+    D: Fn(
+            <O::Vector as VectorOwned>::Borrowed<'_>,
+            <O::Vector as VectorOwned>::Borrowed<'_>,
+        ) -> Distance
+        + 'b,
+{
+    let f = move |(distance, payload)| (opfamily.output(distance), payload);
+    let distance = move |payload| {
+        let (key, _) = pointer_to_kv(payload);
+        let mut tuple = fetcher.fetch(key)?;
+        if prefilter && !tuple.filter() {
+            return None;
+        }
+        let (datums, is_nulls) = tuple.build();
+        assert!(!is_nulls[0], "a reranked row has no vector");
+        let query = vector.borrow().as_borrowed();
+        Some(unsafe { O::Vector::in_datum(datums[0], |row| d(query, row)) })
+    };
+    match io {
+        Io::Plain => {
+            Box::new(rerank_heap(PlainPrefetcher::new(index, candidates), distance).map(f))
+        }
+        Io::Simple | Io::Stream => {
+            let prefetcher = PlainPrefetcher::new(index, TableAhead::new(candidates, table));
+            Box::new(rerank_heap(prefetcher, distance).map(f))
+        }
+    }
+}
+
 /// Reranks `candidates` by exact distance, reading vectors from the index or the table as it was
 /// built; with `prefilter`, rows the table's quals reject are dropped first. Unless `io` is plain,
 /// table pages are read ahead: of candidates before the table rerank, else of rows about to be
@@ -274,30 +318,17 @@ where
     O: Operator,
     O::Vector: FromOwned,
 {
-    let f = move |(distance, payload)| (opfamily.output(distance), payload);
     if let RerankMethod::Heap = how(index) {
-        let fetch = move |payload| {
-            let (key, _) = pointer_to_kv(payload);
-            let mut tuple = fetcher.fetch(key)?;
-            if prefilter && !tuple.filter() {
-                return None;
-            }
-            let (datums, is_nulls) = tuple.build();
-            let datum = (!is_nulls[0]).then_some(datums[0]);
-            let vector = unsafe { datum.and_then(|x| opfamily.input_vector(x)) };
-            Some(O::Vector::from_owned(vector.unwrap()))
-        };
-        return match io {
-            Io::Plain => {
-                let prefetcher = PlainPrefetcher::new(index, candidates);
-                Box::new(rerank_heap::<O, _, _, _>(vector, prefetcher, fetch).map(f))
-            }
-            Io::Simple | Io::Stream => {
-                let prefetcher = PlainPrefetcher::new(index, TableAhead::new(candidates, table));
-                Box::new(rerank_heap::<O, _, _, _>(vector, prefetcher, fetch).map(f))
-            }
+        let reranking = (io, prefilter, table);
+        return if opfamily.is_cosine() {
+            let d = (opfamily, unit_distance::<O>);
+            rerank_table::<_, O, _>(index, candidates, vector, reranking, fetcher, d)
+        } else {
+            let d = (opfamily, exact_distance::<O>);
+            rerank_table::<_, O, _>(index, candidates, vector, reranking, fetcher, d)
         };
     }
+    let f = move |(distance, payload)| (opfamily.output(distance), payload);
     let predicate = id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
         let (key, _) = pointer_to_kv(*pointer);
         let Some(mut tuple) = fetcher.fetch(key) else {
