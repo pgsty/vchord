@@ -1,0 +1,123 @@
+# Every vchordrq.io_search answers alike, and all but read_buffer, which skips the directories, read the same buffers.
+statement ok
+CREATE TABLE io_mixed (id int, v vector(3));
+
+statement ok
+INSERT INTO io_mixed SELECT i, ARRAY[sin(i), cos(i), sin(i * 0.37)]::vector FROM generate_series(1, 30000) i;
+
+statement ok
+CREATE INDEX io_mixed_v ON io_mixed USING vchordrq (v vector_l2_ops) WITH (options = $$
+[build.internal]
+lists = [1]
+$$);
+
+statement ok
+INSERT INTO io_mixed SELECT i, ARRAY[sin(i), cos(i), sin(i * 0.37)]::vector FROM generate_series(30001, 32000) i;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '1';
+
+statement ok
+CREATE TABLE io_mixed_result (lists int, io_search text, ids int[], buffers int);
+
+statement ok
+CREATE FUNCTION io_mixed_run(lists int) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  s text;
+  result int[];
+  plan json;
+  q text := 'SELECT id FROM io_mixed ORDER BY v <-> ''[0.5, 0.5, 0.1]'' LIMIT 500';
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' || q INTO plan;
+  FOREACH s IN ARRAY ARRAY['read_buffer', 'prefetch_buffer', 'read_stream', 'mixed'] LOOP
+    PERFORM set_config('vchordrq.io_search', s, true);
+    EXECUTE 'SELECT array_agg(id) FROM (' || q || ') t' INTO result;
+    EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ' || q INTO plan;
+    INSERT INTO io_mixed_result VALUES (lists, s, result,
+      (plan->0->'Plan'->>'Shared Hit Blocks')::int + (plan->0->'Plan'->>'Shared Read Blocks')::int);
+  END LOOP;
+END
+$$;
+
+statement ok
+SELECT io_mixed_run(1);
+
+# An error and a cancel while a mixed stream is open leave the backend usable.
+statement ok
+SET vchordrq.io_search = mixed;
+
+statement ok
+CREATE FUNCTION io_mixed_error(int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  IF $1 > 0 THEN
+    RAISE EXCEPTION 'intentional scan error';
+  END IF;
+  RETURN $1;
+END $$;
+
+statement ok
+BEGIN;
+DECLARE bad NO SCROLL CURSOR FOR SELECT io_mixed_error(id) FROM io_mixed ORDER BY v <-> '[0.5, 0.5, 0.1]' LIMIT 500;
+SAVEPOINT s;
+
+statement error intentional scan error
+FETCH 1 FROM bad;
+
+statement ok
+ROLLBACK TO s;
+CLOSE bad;
+COMMIT;
+
+statement ok
+SET statement_timeout = '1ms';
+
+statement error canceling statement due to statement timeout
+SELECT count(*) FROM (SELECT id, pg_sleep(0.01) FROM io_mixed ORDER BY v <-> '[0.5, 0.5, 0.1]' LIMIT 500) t;
+
+statement ok
+RESET statement_timeout;
+
+statement ok
+RESET vchordrq.io_search;
+
+query I
+SELECT count(*) FROM (SELECT id FROM io_mixed ORDER BY v <-> '[0.5, 0.5, 0.1]' LIMIT 500) t;
+----
+500
+
+statement ok
+DROP INDEX io_mixed_v;
+
+statement ok
+CREATE INDEX io_mixed_v ON io_mixed USING vchordrq (v vector_l2_ops) WITH (options = $$
+[build.internal]
+lists = [32]
+$$);
+
+statement ok
+SET vchordrq.probes = '8';
+
+statement ok
+SELECT io_mixed_run(32);
+
+query IB
+SELECT lists, count(*) = 4 AND count(DISTINCT ids) = 1 AND count(DISTINCT buffers) FILTER (WHERE io_search <> 'read_buffer') = 1
+FROM io_mixed_result GROUP BY lists ORDER BY lists;
+----
+1 t
+32 t
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE io_mixed, io_mixed_result;
+
+statement ok
+DROP FUNCTION io_mixed_run, io_mixed_error;

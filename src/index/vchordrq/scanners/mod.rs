@@ -9,17 +9,18 @@
 /// Calls `$search` with `$args` and the prefetchers that `$io` asks for.
 macro_rules! prefetched {
     ($index:expr, $io:expr, $search:path, ($($args:expr),* $(,)?)) => {{
-        use $crate::index::scanners::Io;
+        use $crate::index::scanners::{Io, SearchIo};
         use $crate::index::vchordrq::dispatch::*;
         let index = $index;
         let vectors = MakeH1PlainPrefetcher { index };
+        let hints = ::index::relation::Hints::default().full(true);
         match $io {
-            Io::Plain => $search($($args,)* vectors, MakeH0PlainPrefetcher { index }),
-            Io::Simple => $search($($args,)* vectors, MakeH0SimplePrefetcher { index }),
-            Io::Stream => {
-                let hints = ::index::relation::Hints::default().full(true);
+            SearchIo::Io(Io::Plain) => $search($($args,)* vectors, MakeH0PlainPrefetcher { index }),
+            SearchIo::Io(Io::Simple) => $search($($args,)* vectors, MakeH0SimplePrefetcher { index }),
+            SearchIo::Io(Io::Stream) => {
                 $search($($args,)* vectors, MakeH0StreamPrefetcher { index, hints })
             }
+            SearchIo::Mixed => $search($($args,)* vectors, MakeH0MixedPrefetcher { index, hints }),
         }
     }};
 }
@@ -31,7 +32,7 @@ use crate::datatype::memory_halfvec::HalfvecInput;
 use crate::datatype::memory_rabitq4::Rabitq4Input;
 use crate::datatype::memory_rabitq8::Rabitq8Input;
 use crate::datatype::memory_vector::VectorInput;
-use crate::index::scanners::Io;
+use crate::index::scanners::{Io, SearchIo};
 use pgrx::datum::FromDatum;
 use pgrx::pg_sys::Datum;
 use simd::f16;
@@ -50,7 +51,7 @@ pub struct SearchOptions {
     pub max_scan_tuples: Option<u32>,
     pub maxsim_refine: u32,
     pub maxsim_threshold: u32,
-    pub io_search: Io,
+    pub io_search: SearchIo,
     pub io_rerank: Io,
     pub prefilter: bool,
     pub table: crate::index::fetcher::TablePrefetch,
