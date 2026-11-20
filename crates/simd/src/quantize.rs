@@ -226,8 +226,10 @@ mod quantize_tests {
                 "x = {x}, code {c}, exact {exact}"
             );
             let y = f64::from(b) + f64::from(c) * f64::from(k);
+            // `x - b` rounds at the larger of the two magnitudes
+            let rounding = (f64::from(x).abs() + f64::from(b).abs()) * 1e-6;
             assert!(
-                (y - f64::from(x)).abs() <= f64::from(k) * 0.5 + f64::from(x).abs() * 1e-6,
+                (y - f64::from(x)).abs() <= f64::from(k) * 0.5 + rounding,
                 "x = {x}, reconstructed {y}, k = {k}, b = {b}"
             );
         }
