@@ -8,6 +8,7 @@
 
 /// `len < N` elements from `p`, then `fill`.
 #[inline(always)]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn partial<T: Copy, const N: usize>(p: *const T, len: usize, fill: T) -> [T; N] {
     unsafe { core::hint::assert_unchecked(len < N) };
     // Element by element for short arrays, where a copy loop becomes a `memcpy` call, and in a
