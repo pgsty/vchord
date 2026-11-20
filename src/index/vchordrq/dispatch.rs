@@ -657,6 +657,41 @@ impl<'b, R: RelationRead + RelationPrefetch> PrefetcherSequenceFamily<'b, R>
 }
 
 #[derive(Debug)]
+pub struct MakeH0MixedPrefetcher<'b, R> {
+    pub index: &'b R,
+    pub hints: Hints,
+}
+
+impl<'b, R> Clone for MakeH0MixedPrefetcher<'b, R> {
+    fn clone(&self) -> Self {
+        Self {
+            index: self.index,
+            hints: self.hints,
+        }
+    }
+}
+
+impl<'b, R: RelationRead + RelationPrefetch + RelationReadStream> PrefetcherSequenceFamily<'b, R>
+    for MakeH0MixedPrefetcher<'b, R>
+{
+    type P<S: Sequence>
+        = MixedPrefetcher<'b, R, S>
+    where
+        S::Item: Fetch<'b>;
+
+    fn prefetch<S: Sequence>(&mut self, seq: S) -> Self::P<S>
+    where
+        S::Item: Fetch<'b>,
+    {
+        MixedPrefetcher::new(self.index, seq, self.hints)
+    }
+
+    fn is_not_plain(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
 pub struct MakeH0StreamPrefetcher<'b, R> {
     pub index: &'b R,
     pub hints: Hints,

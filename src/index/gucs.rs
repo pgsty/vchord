@@ -6,7 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-use crate::index::scanners::Io;
+use crate::index::scanners::{Io, SearchIo};
 use pgrx::guc::{GucCheckError, GucContext, GucFlags, GucRegistry, GucSetting, PostgresGucEnum};
 use std::ffi::{CStr, CString, c_char};
 
@@ -19,6 +19,20 @@ pub enum PostgresIo {
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     #[name = c"read_stream"]
     ReadStream,
+}
+
+#[derive(Debug, Clone, Copy, PostgresGucEnum)]
+pub enum PostgresIoSearch {
+    #[name = c"read_buffer"]
+    ReadBuffer,
+    #[name = c"prefetch_buffer"]
+    PrefetchBuffer,
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+    #[name = c"read_stream"]
+    ReadStream,
+    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+    #[name = c"mixed"]
+    Mixed,
 }
 
 static VCHORDRQ_QUERY_SAMPLING_ENABLE: GucSetting<bool> = GucSetting::<bool>::new(false);
@@ -98,19 +112,15 @@ static mut VCHORDRQ_MAXSIM_THRESHOLD_CONFIG: *mut pgrx::pg_sys::config_generic =
 
 static VCHORDRQ_PREFILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
 
-static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
+static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIoSearch> = GucSetting::<PostgresIoSearch>::new(
     #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
-    PostgresIo::PrefetchBuffer,
+    PostgresIoSearch::PrefetchBuffer,
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
-    PostgresIo::ReadStream,
+    PostgresIoSearch::Mixed,
 );
 
-static VCHORDRQ_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
-    PostgresIo::PrefetchBuffer,
-    #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
-    PostgresIo::ReadStream,
-);
+static VCHORDRQ_IO_RERANK: GucSetting<PostgresIo> =
+    GucSetting::<PostgresIo>::new(PostgresIo::PrefetchBuffer);
 
 pub fn init() {
     GucRegistry::define_bool_guc(
@@ -195,7 +205,7 @@ pub fn init() {
     GucRegistry::define_enum_guc(
         c"vchordrq.io_search",
         c"`io_search` argument of vchordrq.",
-        c"`io_search` argument of vchordrq.",
+        c"How the search reads list pages: read_buffer, prefetch_buffer, read_stream or mixed (the default where PostgreSQL has read streams: a read stream where pages mostly follow one another, prefetch_buffer elsewhere).",
         &VCHORDRQ_IO_SEARCH,
         GucContext::Userset,
         GucFlags::default(),
@@ -203,7 +213,7 @@ pub fn init() {
     GucRegistry::define_enum_guc(
         c"vchordrq.io_rerank",
         c"`io_rerank` argument of vchordrq.",
-        c"`io_rerank` argument of vchordrq.",
+        c"How the rerank reads vectors and table pages: read_buffer, prefetch_buffer (the default, as reranked pages are scattered) or read_stream.",
         &VCHORDRQ_IO_RERANK,
         GucContext::Userset,
         GucFlags::default(),
@@ -564,12 +574,14 @@ pub fn vchordrq_prefilter() -> bool {
     VCHORDRQ_PREFILTER.get()
 }
 
-pub fn vchordrq_io_search() -> Io {
+pub fn vchordrq_io_search() -> SearchIo {
     match VCHORDRQ_IO_SEARCH.get() {
-        PostgresIo::ReadBuffer => Io::Plain,
-        PostgresIo::PrefetchBuffer => Io::Simple,
+        PostgresIoSearch::ReadBuffer => SearchIo::Io(Io::Plain),
+        PostgresIoSearch::PrefetchBuffer => SearchIo::Io(Io::Simple),
         #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
-        PostgresIo::ReadStream => Io::Stream,
+        PostgresIoSearch::ReadStream => SearchIo::Io(Io::Stream),
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+        PostgresIoSearch::Mixed => SearchIo::Mixed,
     }
 }
 

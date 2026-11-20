@@ -23,6 +23,17 @@ pub enum Io {
     Stream,
 }
 
+/// How a vchordrq search reads list pages: as an `Io`, or `Mixed`, a read stream on dense spans and `Io::Simple` elsewhere.
+#[derive(Debug, Clone, Copy)]
+pub enum SearchIo {
+    Io(Io),
+    #[cfg_attr(
+        any(feature = "pg14", feature = "pg15", feature = "pg16"),
+        expect(dead_code)
+    )]
+    Mixed,
+}
+
 pub trait SearchBuilder: 'static {
     type Options;
 
