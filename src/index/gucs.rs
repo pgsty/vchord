@@ -205,7 +205,7 @@ pub fn init() {
     GucRegistry::define_enum_guc(
         c"vchordrq.io_search",
         c"`io_search` argument of vchordrq.",
-        c"How the search reads list pages: read_buffer, prefetch_buffer, read_stream or mixed (the default where PostgreSQL has read streams: a read stream where pages mostly follow one another, prefetch_buffer elsewhere).",
+        c"How the search reads list pages: read_buffer, prefetch_buffer, read_stream or mixed (the default where PostgreSQL has read streams: a read stream where pages mostly follow one another and prefetch_buffer elsewhere, or a read stream throughout when io_method is not worker).",
         &VCHORDRQ_IO_SEARCH,
         GucContext::Userset,
         GucFlags::default(),
@@ -574,14 +574,25 @@ pub fn vchordrq_prefilter() -> bool {
     VCHORDRQ_PREFILTER.get()
 }
 
+/// Whether `io_method` is `worker`, which hands every read of a read stream to an I/O worker.
+#[cfg(any(feature = "pg18", feature = "pg19"))]
+fn io_method_worker() -> bool {
+    let method = unsafe { pgrx::pg_sys::io_method };
+    method as pgrx::pg_sys::IoMethod::Type == pgrx::pg_sys::IoMethod::IOMETHOD_WORKER
+}
+
 pub fn vchordrq_io_search() -> SearchIo {
     match VCHORDRQ_IO_SEARCH.get() {
         PostgresIoSearch::ReadBuffer => SearchIo::Io(Io::Plain),
         PostgresIoSearch::PrefetchBuffer => SearchIo::Io(Io::Simple),
         #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
         PostgresIoSearch::ReadStream => SearchIo::Io(Io::Stream),
-        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+        #[cfg(feature = "pg17")]
         PostgresIoSearch::Mixed => SearchIo::Mixed,
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        PostgresIoSearch::Mixed if io_method_worker() => SearchIo::Mixed,
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        PostgresIoSearch::Mixed => SearchIo::Io(Io::Stream),
     }
 }
 
