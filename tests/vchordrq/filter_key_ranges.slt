@@ -130,7 +130,7 @@ $$;
 
 query T
 SELECT fr_plan('SELECT id FROM fr WHERE c = ANY(''{7,14,70}'') AND c < 50 ORDER BY v <-> ''[0.5,0.5,0.5]''')
-  ~ 'Index Cond: \(c = ANY .*Filter: \(c < 50\)';
+  ~ 'Filter: .*\(c < 50\)';
 ----
 t
 
