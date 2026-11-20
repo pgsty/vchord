@@ -52,14 +52,14 @@ static VCHORDG_BEAM_SEARCH: GucSetting<i32> = GucSetting::<i32>::new(1);
 static VCHORDG_MAX_SCAN_TUPLES: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
 static VCHORDG_IO_SEARCH: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+    #[cfg(any(feature = "pg15", feature = "pg16"))]
     PostgresIo::PrefetchBuffer,
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     PostgresIo::ReadStream,
 );
 
 static VCHORDG_IO_RERANK: GucSetting<PostgresIo> = GucSetting::<PostgresIo>::new(
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+    #[cfg(any(feature = "pg15", feature = "pg16"))]
     PostgresIo::PrefetchBuffer,
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     PostgresIo::ReadStream,
@@ -113,7 +113,7 @@ static mut VCHORDRQ_MAXSIM_THRESHOLD_CONFIG: *mut pgrx::pg_sys::config_generic =
 static VCHORDRQ_PREFILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIoSearch> = GucSetting::<PostgresIoSearch>::new(
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+    #[cfg(any(feature = "pg15", feature = "pg16"))]
     PostgresIoSearch::PrefetchBuffer,
     #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
     PostgresIoSearch::Mixed,
@@ -247,15 +247,6 @@ pub fn init() {
         GucFlags::default(),
     );
     unsafe {
-        #[cfg(feature = "pg14")]
-        pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchordrq".as_ptr());
-        #[cfg(any(
-            feature = "pg15",
-            feature = "pg16",
-            feature = "pg17",
-            feature = "pg18",
-            feature = "pg19"
-        ))]
         pgrx::pg_sys::MarkGUCPrefixReserved(c"vchordrq".as_ptr());
     }
     GucRegistry::define_bool_guc(
@@ -313,15 +304,6 @@ pub fn init() {
         GucFlags::default(),
     );
     unsafe {
-        #[cfg(feature = "pg14")]
-        pgrx::pg_sys::EmitWarningsOnPlaceholders(c"vchordg".as_ptr());
-        #[cfg(any(
-            feature = "pg15",
-            feature = "pg16",
-            feature = "pg17",
-            feature = "pg18",
-            feature = "pg19"
-        ))]
         pgrx::pg_sys::MarkGUCPrefixReserved(c"vchordg".as_ptr());
     }
     assert!(crate::is_main());
@@ -338,7 +320,7 @@ pub fn init() {
         ),
         (c"vchordrq.probes", &raw mut VCHORDRQ_PROBES_CONFIG),
     ];
-    #[cfg(any(feature = "pg14", feature = "pg15"))]
+    #[cfg(feature = "pg15")]
     unsafe {
         let len = pgrx::pg_sys::GetNumConfigOptions() as usize;
         let arr = pgrx::pg_sys::get_guc_variables();

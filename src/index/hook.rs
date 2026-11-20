@@ -71,7 +71,9 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                         (*node).iss_NumScanKeys,
                         (*node).iss_NumOrderByKeys,
                         #[cfg(feature = "pg19")]
-                        pgrx::pg_sys::ScanOptions::SO_NONE,
+                        {
+                            pgrx::pg_sys::ScanOptions::SO_NONE as _
+                        },
                     );
 
                     let scanner = &mut *((*(*node).iss_ScanDesc).opaque as *mut Scanner);
@@ -106,7 +108,9 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                         (*node).iss_NumScanKeys,
                         (*node).iss_NumOrderByKeys,
                         #[cfg(feature = "pg19")]
-                        pgrx::pg_sys::ScanOptions::SO_NONE,
+                        {
+                            pgrx::pg_sys::ScanOptions::SO_NONE as _
+                        },
                     );
 
                     let scanner = &mut *((*(*node).iss_ScanDesc).opaque as *mut Scanner);

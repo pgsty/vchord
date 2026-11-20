@@ -32,7 +32,7 @@ pub fn init() {
 /// it. pgrx turns a raised error into a Rust panic that unwinds normally.
 fn check_for_interrupts() {
     if crate::is_main() {
-        pgrx::pg_sys::check_for_interrupts!();
+        pgrx::check_for_interrupts();
     }
 }
 

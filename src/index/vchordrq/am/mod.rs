@@ -513,7 +513,7 @@ unsafe fn filter_key_selectivity(
                         let args = (*expr.cast::<ScalarArrayOpExpr>()).args;
                         let array = pgrx::PgList::<pgrx::pg_sys::Node>::from_pg(args).get_ptr(1);
                         let array = array.expect("a scalar array operator with two operands");
-                        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+                        #[cfg(any(feature = "pg15", feature = "pg16"))]
                         let n = pgrx::pg_sys::estimate_array_length(array);
                         #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
                         let n = pgrx::pg_sys::estimate_array_length(root, array);
@@ -602,7 +602,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     let opfamily = unsafe { opfamily((*info).index) };
     let index = unsafe { PostgresRelation::new((*info).index) };
     let check = || unsafe {
-        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
         pgrx::pg_sys::vacuum_delay_point();
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         pgrx::pg_sys::vacuum_delay_point(false);
@@ -855,7 +855,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
     }
     // `index_getnext_slot` calls back without checking interrupts while heap
     // tuples are invisible; no buffer lock is held here (#28).
-    pgrx::pg_sys::check_for_interrupts!();
+    pgrx::check_for_interrupts();
     // https://www.postgresql.org/docs/current/index-locking.html
     // If heap entries referenced physical pointers are deleted before
     // they are consumed by PostgreSQL, PostgreSQL will received wrong

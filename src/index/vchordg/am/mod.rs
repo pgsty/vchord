@@ -334,7 +334,7 @@ pub unsafe extern "C-unwind" fn ambulkdelete(
     let opfamily = unsafe { opfamily((*info).index) };
     let index = unsafe { PostgresRelation::new((*info).index) };
     let check = || unsafe {
-        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
         pgrx::pg_sys::vacuum_delay_point();
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         pgrx::pg_sys::vacuum_delay_point(false);
@@ -385,7 +385,7 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     let opfamily = unsafe { opfamily((*info).index) };
     let index = unsafe { PostgresRelation::new((*info).index) };
     let check = || unsafe {
-        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
         pgrx::pg_sys::vacuum_delay_point();
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         pgrx::pg_sys::vacuum_delay_point(false);
@@ -595,7 +595,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
     }
     // `index_getnext_slot` calls back without checking interrupts while heap
     // tuples are invisible; no buffer lock is held here (#28).
-    pgrx::pg_sys::check_for_interrupts!();
+    pgrx::check_for_interrupts();
     // https://www.postgresql.org/docs/current/index-locking.html
     // If heap entries referenced physical pointers are deleted before
     // they are consumed by PostgreSQL, PostgreSQL will received wrong

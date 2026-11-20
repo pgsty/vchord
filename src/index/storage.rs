@@ -329,8 +329,7 @@ impl<O: Opaque> RelationRead for PostgresRelation<O> {
         assert!(id != u32::MAX, "no such page");
         unsafe {
             use pgrx::pg_sys::{
-                BUFFER_LOCK_SHARE, BufferGetPage, ForkNumber, LockBuffer, ReadBufferExtended,
-                ReadBufferMode,
+                BUFFER_LOCK_SHARE, ForkNumber, LockBuffer, ReadBufferExtended, ReadBufferMode,
             };
             let buf = ReadBufferExtended(
                 self.raw,
@@ -340,7 +339,8 @@ impl<O: Opaque> RelationRead for PostgresRelation<O> {
                 std::ptr::null_mut(),
             );
             LockBuffer(buf, BUFFER_LOCK_SHARE as _);
-            let page = NonNull::new(BufferGetPage(buf).cast()).expect("failed to get page");
+            let page =
+                NonNull::new(pgrx::BufferGetPage!(buf).get().cast()).expect("failed to get page");
             PostgresBufferReadGuard { buf, page, id }
         }
     }
@@ -418,7 +418,7 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
                 GENERIC_XLOG_FULL_IMAGE, GenericXLogRegisterBuffer, GenericXLogStart,
             };
             let buf;
-            #[cfg(any(feature = "pg14", feature = "pg15"))]
+            #[cfg(feature = "pg15")]
             {
                 use pgrx::pg_sys::{
                     BUFFER_LOCK_EXCLUSIVE, ExclusiveLock, ForkNumber, LockBuffer,
@@ -473,8 +473,8 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
     fn search(&self, freespace: usize) -> Option<PostgresBufferWriteGuard<O>> {
         unsafe {
             use pgrx::pg_sys::{
-                BufferGetPage, FreeSpaceMapVacuumRange, GetPageWithFreeSpace,
-                RecordPageWithFreeSpace, UnlockReleaseBuffer,
+                FreeSpaceMapVacuumRange, GetPageWithFreeSpace, RecordPageWithFreeSpace,
+                UnlockReleaseBuffer,
             };
             loop {
                 let id = GetPageWithFreeSpace(self.raw, freespace);
@@ -482,7 +482,8 @@ impl<O: Opaque> RelationWrite for PostgresRelation<O> {
                     return None;
                 }
                 let buf = self.lock_exclusive(id);
-                let actual = (*BufferGetPage(buf).cast::<PostgresPage<O>>()).freespace();
+                let actual =
+                    (*pgrx::BufferGetPage!(buf).get().cast::<PostgresPage<O>>()).freespace();
                 if (actual as usize) < freespace {
                     // The free space is recorded incorrectly. Correct the FSM
                     // only: the page is unchanged, so it needs no WAL record.
@@ -628,7 +629,7 @@ where
 {
     type Item = PostgresBufferReadGuard<O>;
 
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+    #[cfg(any(feature = "pg15", feature = "pg16"))]
     fn next(&mut self) -> Option<Self::Item> {
         unimplemented!()
     }
@@ -637,10 +638,11 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         let id = self.list.next()?;
         unsafe {
-            use pgrx::pg_sys::{BUFFER_LOCK_SHARE, BufferGetPage, LockBuffer};
+            use pgrx::pg_sys::{BUFFER_LOCK_SHARE, LockBuffer};
             let buf = read_stream_next_expected(self.raw, id);
             LockBuffer(buf, BUFFER_LOCK_SHARE as _);
-            let page = NonNull::new(BufferGetPage(buf).cast()).expect("failed to get page");
+            let page =
+                NonNull::new(pgrx::BufferGetPage!(buf).get().cast()).expect("failed to get page");
             Some(PostgresBufferReadGuard { buf, page, id })
         }
     }
@@ -699,12 +701,12 @@ where
 
     type Iter = I;
 
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+    #[cfg(any(feature = "pg15", feature = "pg16"))]
     fn next(&mut self) -> Option<(I::Item, Self::Guards)> {
         panic!("read_stream is not supported on PostgreSQL versions earlier than 17.");
     }
 
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+    #[cfg(any(feature = "pg15", feature = "pg16"))]
     fn next_if<P: FnOnce(&I::Item) -> bool>(
         &mut self,
         _predicate: P,
@@ -782,7 +784,7 @@ impl<O: Opaque> RelationReadStreamTypes for PostgresRelation<O> {
 }
 
 impl<O: Opaque> RelationReadStream for PostgresRelation<O> {
-    #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16"))]
+    #[cfg(any(feature = "pg15", feature = "pg16"))]
     fn read_stream<'b, I: Iterator>(&'b self, _iter: I, _hints: Hints) -> Self::ReadStream<'b, I>
     where
         I::Item: Fetch<'b>,
@@ -858,19 +860,13 @@ fn lp_flags(x: pgrx::pg_sys::ItemIdData) -> u32 {
 struct RawBox<T>(NonNull<T>);
 
 impl<T> RawBox<T> {
-    #[cfg_attr(
-        any(feature = "pg14", feature = "pg15", feature = "pg16"),
-        expect(dead_code)
-    )]
+    #[cfg_attr(any(feature = "pg15", feature = "pg16"), expect(dead_code))]
     fn new(value: T) -> Self {
         let ptr = Box::into_raw(Box::new(value));
         Self(NonNull::new(ptr).expect("Box::into_raw returned a null pointer"))
     }
 
-    #[cfg_attr(
-        any(feature = "pg14", feature = "pg15", feature = "pg16"),
-        expect(dead_code)
-    )]
+    #[cfg_attr(any(feature = "pg15", feature = "pg16"), expect(dead_code))]
     fn as_ptr(&self) -> *mut T {
         self.0.as_ptr()
     }

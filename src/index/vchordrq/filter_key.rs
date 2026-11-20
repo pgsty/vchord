@@ -358,7 +358,10 @@ impl<'a> FilterKeys<'a> {
             let value = pg_sys::Oid::from(value.value() as u32);
             let accepted = (members.iter())
                 .map(|&x| {
-                    (*pg_sys::GETSTRUCT(&raw mut (*x).tuple).cast::<pg_sys::FormData_pg_enum>()).oid
+                    (*pg_sys::GETSTRUCT!(&raw mut (*x).tuple)
+                        .get()
+                        .cast::<pg_sys::FormData_pg_enum>())
+                    .oid
                 })
                 .filter(|&x| {
                     let order = pg_sys::compare_values_of_enum(cache, x, value);
