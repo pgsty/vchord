@@ -183,7 +183,7 @@ fn cosine_distance_rescaled<S: Floating>(x: &[S], y: &[S]) -> f32 {
 }
 
 /// Below this, subnormal squares could bias `x2`, so the vector is rescaled.
-const MIN_FAST_X2: f32 = 1e-30;
+pub const MIN_FAST_X2: f32 = 1e-30;
 
 /// The power of two that brings the largest magnitude near 1, or `None` for a zero vector.
 fn scale<S: Floating>(values: &[S]) -> Option<f32> {

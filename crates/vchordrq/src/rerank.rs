@@ -14,14 +14,15 @@ use always_equal::AlwaysEqual;
 use distance::Distance;
 use index::fetch::BorrowedIter;
 use index::packed::PackedRefMut;
-use index::prefetcher::Prefetcher;
+use index::prefetcher::{Prefetcher, Sequence};
 use index::relation::{Page, RelationRead};
 use index_accessor::{Accessor2, DefaultWithDimension, LTryAccess};
 use std::borrow::Borrow;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BinaryHeap, VecDeque, vec_deque};
 use std::marker::PhantomData;
 use std::num::NonZero;
+use vector::vect::MIN_FAST_X2;
 use vector::{VectorBorrowed, VectorOwned};
 
 type Result = (Reverse<Distance>, AlwaysEqual<NonZero<u64>>);
@@ -51,6 +52,83 @@ impl Table for () {
     }
 
     fn prefetch(&mut self, _: NonZero<u64>) {}
+}
+
+/// Rows to read ahead after `n`, doubling so that a scan ended early reads few.
+#[inline]
+fn ramp(n: usize, window: usize) -> usize {
+    (1 << (n / 2 + 1).ilog2()).min(window)
+}
+
+/// Candidates whose table pages are read ahead of the table rerank, in the order it takes them.
+pub struct TableAhead<S: Sequence, H> {
+    sequence: S,
+    ahead: VecDeque<S::Item>,
+    taken: usize,
+    table: H,
+}
+
+impl<S: Sequence, H> TableAhead<S, H> {
+    pub fn new(sequence: S, table: H) -> Self {
+        Self {
+            sequence,
+            ahead: VecDeque::new(),
+            taken: 0,
+            table,
+        }
+    }
+}
+
+impl<'b, S, T, W, H> TableAhead<S, H>
+where
+    S: Sequence<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
+    W: PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
+    H: Table,
+{
+    #[inline]
+    fn fill(&mut self) {
+        while self.ahead.len() < ramp(self.taken, self.table.window())
+            && let Some(candidate) = self.sequence.next()
+        {
+            self.table.prefetch(candidate.1.0.get().0);
+            self.ahead.push_back(candidate);
+        }
+    }
+}
+
+impl<'b, S, T, W, H> Sequence for TableAhead<S, H>
+where
+    S: Sequence<Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
+    W: PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
+    H: Table,
+{
+    type Item = S::Item;
+    type Inner = std::iter::Chain<vec_deque::IntoIter<S::Item>, S::Inner>;
+
+    #[inline]
+    fn next(&mut self) -> Option<S::Item> {
+        let candidate = self.ahead.pop_front().or_else(|| self.sequence.next())?;
+        self.taken += 1;
+        self.fill();
+        Some(candidate)
+    }
+
+    #[inline]
+    fn peek(&mut self) -> Option<&S::Item> {
+        if self.ahead.is_empty() {
+            self.sequence.peek()
+        } else {
+            self.ahead.front()
+        }
+    }
+
+    fn into_inner(self) -> Self::Inner {
+        self.ahead.into_iter().chain(self.sequence.into_inner())
+    }
+
+    fn refill(&mut self) -> bool {
+        self.sequence.refill()
+    }
 }
 
 pub struct Reranker<T, F, P, W, H> {
@@ -106,9 +184,8 @@ where
 }
 
 impl<T, F, P, W, H: Table> Reranker<T, F, P, W, H> {
-    /// Rows to read ahead, doubling with the rows returned so that a scan ended early reads few.
     fn window(&self) -> usize {
-        (1 << (self.returned / 2 + 1).ilog2()).min(self.table.window())
+        ramp(self.returned, self.table.window())
     }
 
     fn push(&mut self, row: Result) {
@@ -166,32 +243,47 @@ pub fn rerank_index<
 
 pub fn rerank_heap<
     'b,
-    O: Operator,
     T,
     P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
     W: 'b + PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
 >(
-    vector: impl Borrow<O::Vector>,
     prefetcher: P,
-    mut fetch: impl FnMut(NonZero<u64>) -> Option<O::Vector> + 'b,
+    mut distance: impl FnMut(NonZero<u64>) -> Option<Distance> + 'b,
 ) -> Reranker<T, impl FnMut(NonZero<u64>, P::Guards, u16) -> Option<Distance>, P, W, ()> {
-    let dim = vector.borrow().as_borrowed().dim();
     Reranker {
         prefetcher,
         cache: BinaryHeap::new(),
         ahead: VecDeque::new(),
         returned: 0,
         table: (),
-        f: id_4::<_, P, _, _, _>(move |payload, _, _| {
-            let unpack = O::Vector::unpack(vector.borrow().as_borrowed());
-            let vector = fetch(payload)?;
-            let vector = O::Vector::unpack(vector.as_borrowed());
-            let mut accessor = O::DistanceAccessor::default_with_dimension(dim);
-            accessor.push(unpack.0, vector.0);
-            let distance = accessor.finish(unpack.1, vector.1);
-            Some(distance)
-        }),
+        f: id_4::<_, P, _, _, _>(move |payload, _, _| distance(payload)),
         _phantom: PhantomData,
+    }
+}
+
+/// The distance from `query` to `row`.
+#[inline]
+pub fn exact_distance<O: Operator>(
+    query: <O::Vector as VectorOwned>::Borrowed<'_>,
+    row: <O::Vector as VectorOwned>::Borrowed<'_>,
+) -> Distance {
+    let mut accessor = O::DistanceAccessor::default_with_dimension(query.dim());
+    let (query, row) = (O::Vector::unpack(query), O::Vector::unpack(row));
+    accessor.push(query.0, row.0);
+    accessor.finish(query.1, row.1)
+}
+
+/// The dot product distance from `query` to `row` scaled to unit length, as a cosine index stores it.
+#[inline]
+pub fn unit_distance<O: Operator>(
+    query: <O::Vector as VectorOwned>::Borrowed<'_>,
+    row: <O::Vector as VectorOwned>::Borrowed<'_>,
+) -> Distance {
+    let x2 = O::Vector::squared_norm(row);
+    if (MIN_FAST_X2..f32::INFINITY).contains(&x2) {
+        Distance::from_f32(exact_distance::<O>(query, row).to_f32() / x2.sqrt())
+    } else {
+        exact_distance::<O>(query, row.function_normalize().as_borrowed())
     }
 }
 
@@ -201,6 +293,7 @@ mod tests {
     use index::packed::PackedRefMut4;
     use index::prefetcher::PlainPrefetcher;
     use index::test_support::MemoryRelation;
+    use index_accessor::Dot;
     use std::cell::RefCell;
 
     struct Recorder<'a>(usize, &'a RefCell<Vec<NonZero<u64>>>);
@@ -215,42 +308,57 @@ mod tests {
         }
     }
 
+    // (lower bound, exact distance); the fourth row's distance is below its bound
+    const ROWS: [(f32, f32); 6] = [
+        (0.1, 0.3),
+        (0.2, 0.25),
+        (0.3, 0.9),
+        (0.35, 0.33),
+        (0.4, 0.5),
+        (0.6, 0.7),
+    ];
+
+    type Candidate<'b> = (
+        (Reverse<Distance>, AlwaysEqual<()>),
+        AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
+    );
+
+    fn candidates<'b>() -> BinaryHeap<Candidate<'b>> {
+        let candidate = |(i, &(bound, _)): (usize, &(f32, f32))| -> Candidate<'b> {
+            let payload = NonZero::new(i as u64 + 1).unwrap();
+            let w = Box::leak(Box::new((
+                payload,
+                0,
+                BorrowedIter::from_slice(&[], |_| &[]),
+            )));
+            (
+                (Reverse(Distance::from_f32(bound)), AlwaysEqual(())),
+                AlwaysEqual(PackedRefMut4(w)),
+            )
+        };
+        ROWS.iter().enumerate().map(candidate).collect()
+    }
+
+    fn distance(payload: NonZero<u64>) -> Option<Distance> {
+        Some(Distance::from_f32(ROWS[payload.get() as usize - 1].1))
+    }
+
+    fn read(x: &RefCell<Vec<NonZero<u64>>>) -> Vec<u64> {
+        x.take().into_iter().map(NonZero::get).collect()
+    }
+
     #[test]
     fn reading_ahead_keeps_the_order() {
         let index = MemoryRelation::<crate::Opaque>::new([]);
-        // (lower bound, exact distance); the fourth row's distance is below its bound
-        let rows = [
-            (0.1, 0.3),
-            (0.2, 0.25),
-            (0.3, 0.9),
-            (0.35, 0.33),
-            (0.4, 0.5),
-            (0.6, 0.7),
-        ];
         let run = |table: Recorder| {
-            let candidates = rows.iter().enumerate().map(|(i, &(bound, _))| {
-                let payload = NonZero::new(i as u64 + 1).unwrap();
-                let w = Box::leak(Box::new((
-                    payload,
-                    0,
-                    BorrowedIter::from_slice(&[], |_| &[]),
-                )));
-                (
-                    (Reverse(Distance::from_f32(bound)), AlwaysEqual(())),
-                    AlwaysEqual(PackedRefMut4(w)),
-                )
-            });
-            let prefetcher = PlainPrefetcher::new(&index, candidates.collect::<BinaryHeap<_>>());
             let reranker = Reranker {
-                prefetcher,
+                prefetcher: PlainPrefetcher::new(&index, candidates()),
                 cache: BinaryHeap::new(),
                 ahead: VecDeque::new(),
                 returned: 0,
                 table,
-                f: |payload: NonZero<u64>, _, _| {
-                    Some(Distance::from_f32(rows[payload.get() as usize - 1].1))
-                },
-                _phantom: PhantomData::<fn((), PackedRefMut4<_>) -> ((), PackedRefMut4<_>)>,
+                f: |payload, _, _| distance(payload),
+                _phantom: PhantomData::<fn((), _) -> ((), _)>,
             };
             reranker
                 .map(|(_, payload)| payload.get())
@@ -261,12 +369,111 @@ mod tests {
         assert_eq!(expected, [2, 1, 4, 5, 6, 3]);
         assert_eq!(run(Recorder(1, &one)), expected);
         assert_eq!(run(Recorder(4, &four)), expected);
-        let read = |x: RefCell<Vec<NonZero<u64>>>| {
-            x.take().into_iter().map(NonZero::get).collect::<Vec<_>>()
-        };
-        assert!(read(none).is_empty());
+        assert!(read(&none).is_empty());
         // the window ramps from one row, so the first rows are read as with a window of one
-        assert_eq!(read(one), [1, 2, 1, 3, 4, 3, 5, 3, 6, 3]);
-        assert_eq!(read(four), [1, 2, 1, 3, 4, 5, 6]);
+        assert_eq!(read(&one), [1, 2, 1, 3, 4, 3, 5, 3, 6, 3]);
+        assert_eq!(read(&four), [1, 2, 1, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn table_rerank_reads_candidates_ahead() {
+        let index = MemoryRelation::<crate::Opaque>::new([]);
+        // requests as payloads, table reads as payloads + 100
+        let run = |window: usize, log: &RefCell<Vec<NonZero<u64>>>| {
+            let table = Recorder(window, log);
+            let prefetcher = PlainPrefetcher::new(&index, TableAhead::new(candidates(), table));
+            rerank_heap(prefetcher, |payload: NonZero<u64>| {
+                log.borrow_mut().push(payload.checked_add(100).unwrap());
+                distance(payload)
+            })
+            .map(|(_, payload)| payload.get())
+            .collect::<Vec<_>>()
+        };
+        let (none, one, four) = Default::default();
+        assert_eq!(run(0, &none), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(run(1, &one), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(run(4, &four), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(read(&none), [101, 102, 103, 104, 105, 106]);
+        assert_eq!(read(&one), [2, 101, 3, 102, 4, 103, 5, 104, 6, 105, 106]);
+        assert_eq!(read(&four), [2, 101, 3, 4, 102, 5, 103, 6, 104, 105, 106]);
+    }
+
+    fn floats(seed: u64, scale: f32) -> Vec<f32> {
+        let mut state = seed;
+        (0..300)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 40) as f32 / (1 << 24) as f32 - 0.5) * scale
+            })
+            .collect()
+    }
+
+    fn unit(x: Vec<f32>) -> Vec<f32> {
+        let norm = x.iter().map(|x| x * x).sum::<f32>().sqrt();
+        x.into_iter().map(|x| x / norm).collect()
+    }
+
+    /// `unit_distance` against the distance to a normalised copy of the row, within the copy's rounding.
+    fn compare<V: Vector>(make: impl Fn(&[f32]) -> V, tolerance: f32)
+    where
+        Op<V, Dot>: Operator<Vector = V>,
+    {
+        let (query, row) = (make(&unit(floats(0, 1.0))), make(&floats(99, 3.0)));
+        let (query, row) = (query.as_borrowed(), row.as_borrowed());
+        let scaled = unit_distance::<Op<V, Dot>>(query, row).to_f32();
+        let copied =
+            exact_distance::<Op<V, Dot>>(query, row.function_normalize().as_borrowed()).to_f32();
+        assert!((scaled - copied).abs() <= tolerance, "{scaled} {copied}");
+    }
+
+    #[test]
+    fn unit_distance_scales_by_the_norm() {
+        use simd::{F16, Floating, f16};
+        use vector::rabitq4::Rabitq4Owned;
+        use vector::rabitq8::Rabitq8Owned;
+        use vector::vect::VectOwned;
+        compare(|x| VectOwned::new(x.to_vec()), 1e-6);
+        compare(
+            |x| VectOwned::new(x.iter().map(|&x| f16::_from_f32(x)).collect()),
+            2e-3,
+        );
+        compare(
+            |x| {
+                let (m, code) = rabitq::byte::ugly_code(x);
+                let code = rabitq::byte::pack_code(&code);
+                let abs = f32::reduce_sum_of_abs_x(x);
+                Rabitq8Owned::new(
+                    x.len() as u32,
+                    m.dis_u_2,
+                    m.norm_of_lattice,
+                    m.sum_of_code,
+                    abs,
+                    code,
+                )
+            },
+            1e-4,
+        );
+        compare(
+            |x| {
+                let (m, code) = rabitq::halfbyte::ugly_code(x);
+                let code = rabitq::halfbyte::pack_code(&code);
+                let abs = f32::reduce_sum_of_abs_x(x);
+                Rabitq4Owned::new(
+                    x.len() as u32,
+                    m.dis_u_2,
+                    m.norm_of_lattice,
+                    m.sum_of_code,
+                    abs,
+                    code,
+                )
+            },
+            1e-4,
+        );
+        let query = VectOwned::new(unit(vec![1.0; 300]));
+        let row = VectOwned::new(vec![1e-22f32; 300]);
+        let d = unit_distance::<Op<VectOwned<f32>, Dot>>(query.as_borrowed(), row.as_borrowed());
+        assert!((d.to_f32() + 1.0).abs() <= 1e-6, "{}", d.to_f32());
     }
 }
