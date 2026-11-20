@@ -427,6 +427,7 @@ mod u16s {
                 matches_portable,
             );
         }
+        check(sample(random), matches, matches_portable);
     }
 
     #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
@@ -507,6 +508,7 @@ mod u16s {
             if crate::is_cpu_detected!("a2") {
                 check_between(random, |c, l, h| unsafe { between_a2(c, l, h) });
             }
+            check_between(random, between);
         }
 
         #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
@@ -612,6 +614,7 @@ mod u32s {
                 matches_portable,
             );
         }
+        check(sample(random), matches, matches_portable);
     }
 
     #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
@@ -693,6 +696,7 @@ mod u32s {
             if crate::is_cpu_detected!("a2") {
                 check_between(random, |c, l, h| unsafe { between_a2(c, l, h) });
             }
+            check_between(random, between);
         }
 
         #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
@@ -800,6 +804,7 @@ mod u64s {
                 matches_portable,
             );
         }
+        check(sample(random), matches, matches_portable);
     }
 
     #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
@@ -884,6 +889,7 @@ mod u64s {
             if crate::is_cpu_detected!("a2") {
                 check_between(random, |c, l, h| unsafe { between_a2(c, l, h) });
             }
+            check_between(random, between);
         }
 
         #[crate::multiversion(@"v4", @"v3", "v2", @"a2", "z17", "z16", "z15", "z14", "z13", "p9", "p8", "p7", "r1")]
@@ -1029,6 +1035,7 @@ mod u128s {
                 matches_portable,
             );
         }
+        check(sample(random), matches, matches_portable);
         // a row that matches one half of a key and the other half of another
         let column = std::array::from_fn(|i| [i as u64, 100 + i as u64]);
         let keys = [[3, 0], [0, 103], [5, 105]];
@@ -1165,6 +1172,7 @@ mod u128s {
             if crate::is_cpu_detected!("a2") {
                 check_between(random, |c, l, h| unsafe { between_a2(c, l, h) });
             }
+            check_between(random, between);
             // the high word decides first, then the low word
             let column = std::array::from_fn(|i| [u64::MAX - i as u64, i as u64]);
             assert_eq!(between(&column, [u64::MAX - 3, 3], [0, 7]), 0b0111_1000);

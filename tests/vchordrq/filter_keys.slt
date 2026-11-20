@@ -290,7 +290,7 @@ RESET vchordrq.probes;
 statement error invalid value for option "bytes": 3, not 2, 4 or 8
 CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_hash_ops (bytes = 3));
 
-statement error operator class public.uuid_ops has no options
+statement error operator class (public\.)?uuid_ops has no options
 CREATE INDEX ON fk USING vchordrq (v vector_l2_ops, u uuid_ops (bytes = 4));
 
 statement error value 4 out of bounds for option "bytes"

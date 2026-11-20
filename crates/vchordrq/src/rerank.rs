@@ -318,25 +318,29 @@ mod tests {
         (0.6, 0.7),
     ];
 
+    type Row<'b> = (NonZero<u64>, u16, BorrowedIter<'b>);
+
     type Candidate<'b> = (
         (Reverse<Distance>, AlwaysEqual<()>),
-        AlwaysEqual<PackedRefMut4<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
+        AlwaysEqual<PackedRefMut4<'b, Row<'b>>>,
     );
 
-    fn candidates<'b>() -> BinaryHeap<Candidate<'b>> {
-        let candidate = |(i, &(bound, _)): (usize, &(f32, f32))| -> Candidate<'b> {
+    fn rows<'b>() -> [Row<'b>; 6] {
+        std::array::from_fn(|i| {
             let payload = NonZero::new(i as u64 + 1).unwrap();
-            let w = Box::leak(Box::new((
-                payload,
-                0,
-                BorrowedIter::from_slice(&[], |_| &[]),
-            )));
-            (
-                (Reverse(Distance::from_f32(bound)), AlwaysEqual(())),
-                AlwaysEqual(PackedRefMut4(w)),
-            )
-        };
-        ROWS.iter().enumerate().map(candidate).collect()
+            (payload, 0, BorrowedIter::from_slice(&[], |_| &[]))
+        })
+    }
+
+    fn candidates<'b>(rows: &'b mut [Row<'b>; 6]) -> BinaryHeap<Candidate<'b>> {
+        std::iter::zip(rows, ROWS)
+            .map(|(w, (bound, _))| {
+                (
+                    (Reverse(Distance::from_f32(bound)), AlwaysEqual(())),
+                    AlwaysEqual(PackedRefMut4(w)),
+                )
+            })
+            .collect()
     }
 
     fn distance(payload: NonZero<u64>) -> Option<Distance> {
@@ -351,8 +355,9 @@ mod tests {
     fn reading_ahead_keeps_the_order() {
         let index = MemoryRelation::<crate::Opaque>::new([]);
         let run = |table: Recorder| {
+            let mut rows = rows();
             let reranker = Reranker {
-                prefetcher: PlainPrefetcher::new(&index, candidates()),
+                prefetcher: PlainPrefetcher::new(&index, candidates(&mut rows)),
                 cache: BinaryHeap::new(),
                 ahead: VecDeque::new(),
                 returned: 0,
@@ -380,8 +385,9 @@ mod tests {
         let index = MemoryRelation::<crate::Opaque>::new([]);
         // requests as payloads, table reads as payloads + 100
         let run = |window: usize, log: &RefCell<Vec<NonZero<u64>>>| {
-            let table = Recorder(window, log);
-            let prefetcher = PlainPrefetcher::new(&index, TableAhead::new(candidates(), table));
+            let (table, mut rows) = (Recorder(window, log), rows());
+            let candidates = TableAhead::new(candidates(&mut rows), table);
+            let prefetcher = PlainPrefetcher::new(&index, candidates);
             rerank_heap(prefetcher, |payload: NonZero<u64>| {
                 log.borrow_mut().push(payload.checked_add(100).unwrap());
                 distance(payload)

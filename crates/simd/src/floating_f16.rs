@@ -392,6 +392,7 @@ mod reduce_sum_of_d2_approx {
 
     /// Retries in f32 when the difference of two finite halves overflows f16.
     #[inline(always)]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     fn finite_or_exact(result: f32, lhs: &[f16], rhs: &[f16]) -> f32 {
         if result.is_finite() {
             result

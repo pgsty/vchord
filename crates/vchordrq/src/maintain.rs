@@ -724,6 +724,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn appended_meanwhile() {
         // `burst` rows at every delay point until the swap: with 120 they outpace each pass
         for (keys, memory, burst) in keys()
@@ -778,6 +779,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn abandoned() {
         for keys in keys() {
             let calls = Cell::new(0);

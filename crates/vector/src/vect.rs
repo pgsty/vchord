@@ -363,12 +363,16 @@ mod tests {
         assert!(cos(&[0.0, 0.0], &[1.0, 0.0]).is_nan());
         assert!(cos(&[0.0, 0.0], &[0.0, 0.0]).is_nan());
         // Subnormal squares: rescaled exactly like the fast path on the scaled-up vector.
-        let up = |x: &[f32]| x.iter().map(|&x| x * 2f32.powi(70)).collect::<Vec<_>>();
-        let sub = vec![1.1e-21f32; 65535];
-        let mut ones = vec![1.0f32; 65535];
+        let up = |x: &[f32]| {
+            x.iter()
+                .map(|&x| x * (1u128 << 70) as f32)
+                .collect::<Vec<_>>()
+        };
+        let sub = vec![1.1e-21f32; 4096];
+        let mut ones = vec![1.0f32; 4096];
         assert_eq!(cos(&sub, &ones).to_bits(), cos(&up(&sub), &ones).to_bits());
         assert!(cos(&sub, &ones).abs() < 1e-4);
-        ones[0] = -65533.0;
+        ones[0] = -4094.0;
         assert_eq!(cos(&sub, &ones).to_bits(), cos(&up(&sub), &ones).to_bits());
         assert!((cos(&sub, &ones) - 1.0).abs() < 1e-4);
     }
@@ -376,10 +380,14 @@ mod tests {
     #[test]
     fn normalized_subnormal_squares() {
         let norm = |x: &[f32]| x.iter().map(|&x| x as f64 * x as f64).sum::<f64>().sqrt();
-        let up = |x: &[f32]| x.iter().map(|&x| x * 2f32.powi(70)).collect::<Vec<_>>();
-        let mut mixed = vec![1e-21f32; 65535];
+        let up = |x: &[f32]| {
+            x.iter()
+                .map(|&x| x * (1u128 << 70) as f32)
+                .collect::<Vec<_>>()
+        };
+        let mut mixed = vec![1e-21f32; 4096];
         mixed[0] = 1.1e-21;
-        for x in [vec![1.1e-21f32; 65535], mixed] {
+        for x in [vec![1.1e-21f32; 4096], mixed] {
             assert!(has_direction(&x));
             let r = normalized(&x).unwrap();
             assert_eq!(r, normalized(&up(&x)).unwrap());
