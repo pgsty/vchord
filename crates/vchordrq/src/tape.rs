@@ -748,7 +748,7 @@ mod tests {
 
     #[test]
     fn layout() {
-        for i in 0..512 {
+        for i in 0..if cfg!(not(miri)) { 512 } else { 2 } {
             let (pages, zones) = tape(i % 2 == 0);
             let wanted = (0..1 + rand::random::<u32>() % 12)
                 .map(|_| rand::random::<u64>() % 1000)
@@ -786,7 +786,7 @@ mod tests {
 
     #[test]
     fn layout_all() {
-        for _ in 0..64 {
+        for _ in 0..if cfg!(not(miri)) { 64 } else { 1 } {
             let (pages, zones) = tape(true);
             let n = pages.len();
             let some = filter(vec![rand::random::<u64>() % 1000]);

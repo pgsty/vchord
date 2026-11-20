@@ -233,6 +233,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn parts() {
         for dim in [64, 768, 1000, 1536, 3000] {
             let relation = MemoryRelation::<Opaque>::new([]);
