@@ -20,7 +20,7 @@ use std::collections::BinaryHeap;
 use std::num::NonZero;
 use vchordrq::operator::Op;
 use vchordrq::types::*;
-use vchordrq::{FastHeap, InsertChooser, MaintainChooser};
+use vchordrq::{FastHeap, InsertChooser};
 use vector::VectorOwned;
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
@@ -136,10 +136,184 @@ where
 }
 
 /// Compacts the chosen lists and returns the number of live index tuples in them.
+/// Appends the row as the build sorts it.
+#[allow(clippy::too_many_arguments)]
+pub fn encode<R>(
+    opfamily: Opfamily,
+    index: &R,
+    payload: NonZero<u64>,
+    columns: &[u8],
+    vector: OwnedVector,
+    bump: &impl Bump,
+    out: &mut Vec<u8>,
+) where
+    R: RelationRead,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
+{
+    let make_h1_plain_prefetcher = MakeH1PlainPrefetcherForInsertion { index };
+    match (vector, opfamily.distance_kind()) {
+        (OwnedVector::Vecf32(vector), DistanceKind::L2S) => {
+            assert!(opfamily.vector_kind() == VectorKind::Vecf32);
+            let projected = RandomProject::project(vector.as_borrowed());
+            vchordrq::encode::<_, Op<VectOwned<f32>, L2S>>(
+                index,
+                payload,
+                columns,
+                vector.as_borrowed(),
+                projected.as_borrowed(),
+                bump,
+                make_h1_plain_prefetcher,
+                out,
+            )
+        }
+        (OwnedVector::Vecf32(vector), DistanceKind::Dot) => {
+            assert!(opfamily.vector_kind() == VectorKind::Vecf32);
+            let projected = RandomProject::project(vector.as_borrowed());
+            vchordrq::encode::<_, Op<VectOwned<f32>, Dot>>(
+                index,
+                payload,
+                columns,
+                vector.as_borrowed(),
+                projected.as_borrowed(),
+                bump,
+                make_h1_plain_prefetcher,
+                out,
+            )
+        }
+        (OwnedVector::Vecf16(vector), DistanceKind::L2S) => {
+            assert!(opfamily.vector_kind() == VectorKind::Vecf16);
+            let projected = RandomProject::project(vector.as_borrowed());
+            vchordrq::encode::<_, Op<VectOwned<f16>, L2S>>(
+                index,
+                payload,
+                columns,
+                vector.as_borrowed(),
+                projected.as_borrowed(),
+                bump,
+                make_h1_plain_prefetcher,
+                out,
+            )
+        }
+        (OwnedVector::Vecf16(vector), DistanceKind::Dot) => {
+            assert!(opfamily.vector_kind() == VectorKind::Vecf16);
+            let projected = RandomProject::project(vector.as_borrowed());
+            vchordrq::encode::<_, Op<VectOwned<f16>, Dot>>(
+                index,
+                payload,
+                columns,
+                vector.as_borrowed(),
+                projected.as_borrowed(),
+                bump,
+                make_h1_plain_prefetcher,
+                out,
+            )
+        }
+        (OwnedVector::Rabitq8(vector), DistanceKind::Dot) => {
+            assert!(opfamily.vector_kind() == VectorKind::Rabitq8);
+            vchordrq::encode::<_, Op<Rabitq8Owned, Dot>>(
+                index,
+                payload,
+                columns,
+                vector.as_borrowed(),
+                vector.as_borrowed(),
+                bump,
+                make_h1_plain_prefetcher,
+                out,
+            )
+        }
+        (OwnedVector::Rabitq8(vector), DistanceKind::L2S) => {
+            assert!(opfamily.vector_kind() == VectorKind::Rabitq8);
+            vchordrq::encode::<_, Op<Rabitq8Owned, L2S>>(
+                index,
+                payload,
+                columns,
+                vector.as_borrowed(),
+                vector.as_borrowed(),
+                bump,
+                make_h1_plain_prefetcher,
+                out,
+            )
+        }
+        (OwnedVector::Rabitq4(vector), DistanceKind::Dot) => {
+            assert!(opfamily.vector_kind() == VectorKind::Rabitq4);
+            vchordrq::encode::<_, Op<Rabitq4Owned, Dot>>(
+                index,
+                payload,
+                columns,
+                vector.as_borrowed(),
+                vector.as_borrowed(),
+                bump,
+                make_h1_plain_prefetcher,
+                out,
+            )
+        }
+        (OwnedVector::Rabitq4(vector), DistanceKind::L2S) => {
+            assert!(opfamily.vector_kind() == VectorKind::Rabitq4);
+            vchordrq::encode::<_, Op<Rabitq4Owned, L2S>>(
+                index,
+                payload,
+                columns,
+                vector.as_borrowed(),
+                vector.as_borrowed(),
+                bump,
+                make_h1_plain_prefetcher,
+                out,
+            )
+        }
+    }
+}
+
+/// Writes every list from the rows `encode` appends, sorted.
+pub fn write<R>(opfamily: Opfamily, index: &R, rows: impl vchordrq::Sorted)
+where
+    R: RelationRead + RelationWrite,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
+{
+    let memory = memory();
+    match (opfamily.vector_kind(), opfamily.distance_kind()) {
+        (VectorKind::Vecf32, DistanceKind::L2S) => {
+            vchordrq::write::<_, Op<VectOwned<f32>, L2S>>(index, rows, memory)
+        }
+        (VectorKind::Vecf32, DistanceKind::Dot) => {
+            vchordrq::write::<_, Op<VectOwned<f32>, Dot>>(index, rows, memory)
+        }
+        (VectorKind::Vecf16, DistanceKind::L2S) => {
+            vchordrq::write::<_, Op<VectOwned<f16>, L2S>>(index, rows, memory)
+        }
+        (VectorKind::Vecf16, DistanceKind::Dot) => {
+            vchordrq::write::<_, Op<VectOwned<f16>, Dot>>(index, rows, memory)
+        }
+        (VectorKind::Rabitq8, DistanceKind::Dot) => {
+            vchordrq::write::<_, Op<Rabitq8Owned, Dot>>(index, rows, memory)
+        }
+        (VectorKind::Rabitq8, DistanceKind::L2S) => {
+            vchordrq::write::<_, Op<Rabitq8Owned, L2S>>(index, rows, memory)
+        }
+        (VectorKind::Rabitq4, DistanceKind::Dot) => {
+            vchordrq::write::<_, Op<Rabitq4Owned, Dot>>(index, rows, memory)
+        }
+        (VectorKind::Rabitq4, DistanceKind::L2S) => {
+            vchordrq::write::<_, Op<Rabitq4Owned, L2S>>(index, rows, memory)
+        }
+    }
+}
+
+/// What a list's rows may take to be sorted: maintenance memory, as a vacuum reads it.
+fn memory() -> usize {
+    use pgrx::pg_sys::{BackendType, MyBackendType, autovacuum_work_mem, maintenance_work_mem};
+    let kilobytes = unsafe {
+        if MyBackendType == BackendType::B_AUTOVAC_WORKER && autovacuum_work_mem != -1 {
+            autovacuum_work_mem
+        } else {
+            maintenance_work_mem
+        }
+    };
+    kilobytes as usize * 1024
+}
+
 pub fn maintain<R>(
     opfamily: Opfamily,
     index: &R,
-    chooser: &mut impl MaintainChooser,
     pending: &vchordrq::Pending,
     check: impl Fn(),
 ) -> u64
@@ -148,22 +322,12 @@ where
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
-    // what a list's rows may take to be sorted: maintenance memory, as a vacuum reads it
-    let memory = unsafe {
-        use pgrx::pg_sys::{BackendType, MyBackendType, autovacuum_work_mem, maintenance_work_mem};
-        if MyBackendType == BackendType::B_AUTOVAC_WORKER && autovacuum_work_mem != -1 {
-            autovacuum_work_mem
-        } else {
-            maintenance_work_mem
-        }
-    } as usize
-        * 1024;
+    let memory = memory();
     let maintain = match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
             vchordrq::maintain::<_, Op<VectOwned<f32>, L2S>>(
                 index,
                 make_h0_plain_prefetcher,
-                chooser,
                 memory,
                 pending,
                 check,
@@ -173,7 +337,6 @@ where
             vchordrq::maintain::<_, Op<VectOwned<f32>, Dot>>(
                 index,
                 make_h0_plain_prefetcher,
-                chooser,
                 memory,
                 pending,
                 check,
@@ -183,7 +346,6 @@ where
             vchordrq::maintain::<_, Op<VectOwned<f16>, L2S>>(
                 index,
                 make_h0_plain_prefetcher,
-                chooser,
                 memory,
                 pending,
                 check,
@@ -193,7 +355,6 @@ where
             vchordrq::maintain::<_, Op<VectOwned<f16>, Dot>>(
                 index,
                 make_h0_plain_prefetcher,
-                chooser,
                 memory,
                 pending,
                 check,
@@ -202,7 +363,6 @@ where
         (VectorKind::Rabitq8, DistanceKind::L2S) => vchordrq::maintain::<_, Op<Rabitq8Owned, L2S>>(
             index,
             make_h0_plain_prefetcher,
-            chooser,
             memory,
             pending,
             check,
@@ -210,7 +370,6 @@ where
         (VectorKind::Rabitq8, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq8Owned, Dot>>(
             index,
             make_h0_plain_prefetcher,
-            chooser,
             memory,
             pending,
             check,
@@ -218,7 +377,6 @@ where
         (VectorKind::Rabitq4, DistanceKind::L2S) => vchordrq::maintain::<_, Op<Rabitq4Owned, L2S>>(
             index,
             make_h0_plain_prefetcher,
-            chooser,
             memory,
             pending,
             check,
@@ -226,7 +384,6 @@ where
         (VectorKind::Rabitq4, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq4Owned, Dot>>(
             index,
             make_h0_plain_prefetcher,
-            chooser,
             memory,
             pending,
             check,
@@ -323,8 +480,6 @@ pub fn insert<R>(
     payload: NonZero<u64>,
     columns: &[u8],
     vector: OwnedVector,
-    skip_freespaces: bool,
-    skip_search: bool,
     chooser: &mut impl InsertChooser,
     bump: &impl Bump,
 ) where
@@ -341,7 +496,6 @@ pub fn insert<R>(
                 payload,
                 vector.as_borrowed(),
                 chooser,
-                skip_search,
             );
             vchordrq::insert::<_, Op<VectOwned<f32>, L2S>>(
                 index,
@@ -351,7 +505,6 @@ pub fn insert<R>(
                 key,
                 bump,
                 make_h1_plain_prefetcher,
-                skip_freespaces,
             )
         }
         (OwnedVector::Vecf32(vector), DistanceKind::Dot) => {
@@ -362,7 +515,6 @@ pub fn insert<R>(
                 payload,
                 vector.as_borrowed(),
                 chooser,
-                skip_search,
             );
             vchordrq::insert::<_, Op<VectOwned<f32>, Dot>>(
                 index,
@@ -372,7 +524,6 @@ pub fn insert<R>(
                 key,
                 bump,
                 make_h1_plain_prefetcher,
-                skip_freespaces,
             )
         }
         (OwnedVector::Vecf16(vector), DistanceKind::L2S) => {
@@ -383,7 +534,6 @@ pub fn insert<R>(
                 payload,
                 vector.as_borrowed(),
                 chooser,
-                skip_search,
             );
             vchordrq::insert::<_, Op<VectOwned<f16>, L2S>>(
                 index,
@@ -393,7 +543,6 @@ pub fn insert<R>(
                 key,
                 bump,
                 make_h1_plain_prefetcher,
-                skip_freespaces,
             )
         }
         (OwnedVector::Vecf16(vector), DistanceKind::Dot) => {
@@ -404,7 +553,6 @@ pub fn insert<R>(
                 payload,
                 vector.as_borrowed(),
                 chooser,
-                skip_search,
             );
             vchordrq::insert::<_, Op<VectOwned<f16>, Dot>>(
                 index,
@@ -414,7 +562,6 @@ pub fn insert<R>(
                 key,
                 bump,
                 make_h1_plain_prefetcher,
-                skip_freespaces,
             )
         }
         (OwnedVector::Rabitq8(vector), DistanceKind::Dot) => {
@@ -424,7 +571,6 @@ pub fn insert<R>(
                 payload,
                 vector.as_borrowed(),
                 chooser,
-                skip_search,
             );
             vchordrq::insert::<_, Op<Rabitq8Owned, Dot>>(
                 index,
@@ -434,7 +580,6 @@ pub fn insert<R>(
                 key,
                 bump,
                 make_h1_plain_prefetcher,
-                skip_freespaces,
             )
         }
         (OwnedVector::Rabitq8(vector), DistanceKind::L2S) => {
@@ -444,7 +589,6 @@ pub fn insert<R>(
                 payload,
                 vector.as_borrowed(),
                 chooser,
-                skip_search,
             );
             vchordrq::insert::<_, Op<Rabitq8Owned, L2S>>(
                 index,
@@ -454,7 +598,6 @@ pub fn insert<R>(
                 key,
                 bump,
                 make_h1_plain_prefetcher,
-                skip_freespaces,
             )
         }
         (OwnedVector::Rabitq4(vector), DistanceKind::Dot) => {
@@ -464,7 +607,6 @@ pub fn insert<R>(
                 payload,
                 vector.as_borrowed(),
                 chooser,
-                skip_search,
             );
             vchordrq::insert::<_, Op<Rabitq4Owned, Dot>>(
                 index,
@@ -474,7 +616,6 @@ pub fn insert<R>(
                 key,
                 bump,
                 make_h1_plain_prefetcher,
-                skip_freespaces,
             )
         }
         (OwnedVector::Rabitq4(vector), DistanceKind::L2S) => {
@@ -484,7 +625,6 @@ pub fn insert<R>(
                 payload,
                 vector.as_borrowed(),
                 chooser,
-                skip_search,
             );
             vchordrq::insert::<_, Op<Rabitq4Owned, L2S>>(
                 index,
@@ -494,7 +634,6 @@ pub fn insert<R>(
                 key,
                 bump,
                 make_h1_plain_prefetcher,
-                skip_freespaces,
             )
         }
     }

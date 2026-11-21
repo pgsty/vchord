@@ -9,7 +9,7 @@
 use crate::datatype::typmod::Typmod;
 use crate::index::fetcher::*;
 use crate::index::sample::{HeapSampler, Sample, Sampler, Tuple};
-use crate::index::storage::buffered::BufferedPostgresRelation;
+use crate::index::sort::Sort;
 use crate::index::storage::{PostgresPage, PostgresRelation};
 use crate::index::traverse::{HeapTraverser, Traverser};
 use crate::index::vchordrq::am::Reloption;
@@ -17,18 +17,14 @@ use crate::index::vchordrq::build::{Normalize, Normalized};
 use crate::index::vchordrq::filter_key::{FilterKeys, of_options};
 use crate::index::vchordrq::opclass::{Opfamily, opfamily};
 use crate::index::vchordrq::types::*;
-use index::relation::{
-    Page, PageGuard, Relation, RelationRead, RelationReadTypes, RelationWrite, RelationWriteTypes,
-};
+use index::relation::{Page, PageGuard, Relation, RelationRead, RelationReadTypes};
 use k_means::k_means_lookup;
 use k_means::square::{Square, SquareMut};
 use simd::Floating;
 use std::ffi::CStr;
 use std::marker::PhantomData;
-use std::num::NonZero;
 use std::ops::Deref;
 use vchordrq::types::*;
-use vchordrq::{InsertChooser, MaintainChooser};
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
 use vector::vect::VectOwned;
@@ -320,6 +316,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         vchordrq_cached::VchordrqCached::_0 {}
     }
     .serialize();
+    let memory = unsafe { pgrx::pg_sys::maintenance_work_mem };
     let (heap_tuples, index_tuples) = if let Some(leader) = unsafe {
         VchordrqLeader::enter(
             c"vchordrq_parallel_build_main",
@@ -330,147 +327,70 @@ pub unsafe extern "C-unwind" fn ambuild(
         )
     } {
         drop(cached);
+        leader.wait();
+        reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
+        let shared = leader.vchordrqshared;
         unsafe {
-            leader.wait();
-            parallel_build(
+            participate(
                 index_relation,
                 heap_relation,
                 index_info,
+                shared,
                 leader.tablescandesc,
-                leader.vchordrqshared,
                 leader.vchordrqcached,
-                |indtuples| {
-                    reporter.tuples_done(indtuples);
-                },
-                || {
-                    #[allow(clippy::needless_late_init)]
-                    let order;
-                    // enter the barrier
-                    let shared = leader.vchordrqshared;
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    (*shared).nparticipants = leader.nparticipants as u32;
-                    order = (*shared).barrier_enter_0 as u32;
-                    (*shared).barrier_enter_0 += 1;
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableBroadcast(
-                        &raw mut (*shared).condvar_barrier_enter_0,
-                    );
-                    // leave the barrier
-                    let total = leader.nparticipants;
-                    loop {
-                        pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                        if (*shared).barrier_enter_0 == total {
-                            pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                            break;
-                        }
-                        pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                        pgrx::pg_sys::ConditionVariableSleep(
-                            &raw mut (*shared).condvar_barrier_enter_0,
-                            pgrx::pg_sys::WaitEventIPC::WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN as _,
-                        );
-                    }
-                    pgrx::pg_sys::ConditionVariableCancelSleep();
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    (*shared).barrier_leave_0 = true;
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableBroadcast(
-                        &raw mut (*shared).condvar_barrier_leave_0,
-                    );
-                    reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
-                    order
-                },
-                |indtuples| {
-                    reporter.tuples_done(indtuples);
-                    reporter.tuples_total(indtuples);
-                    // enter the barrier
-                    let shared = leader.vchordrqshared;
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    (*shared).barrier_enter_1 += 1;
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableBroadcast(
-                        &raw mut (*shared).condvar_barrier_enter_1,
-                    );
-                    // leave the barrier
-                    let total = leader.nparticipants;
-                    loop {
-                        pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                        if (*shared).barrier_enter_1 == total {
-                            pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                            break;
-                        }
-                        pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                        pgrx::pg_sys::ConditionVariableSleep(
-                            &raw mut (*shared).condvar_barrier_enter_1,
-                            pgrx::pg_sys::WaitEventIPC::WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN as _,
-                        );
-                    }
-                    pgrx::pg_sys::ConditionVariableCancelSleep();
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    (*shared).barrier_leave_1 = true;
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableBroadcast(
-                        &raw mut (*shared).condvar_barrier_leave_1,
-                    );
-                    reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
-                },
-                || {
-                    // enter the barrier
-                    let shared = leader.vchordrqshared;
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    (*shared).barrier_enter_2 += 1;
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableBroadcast(
-                        &raw mut (*shared).condvar_barrier_enter_2,
-                    );
-                    // leave the barrier
-                    let total = leader.nparticipants;
-                    loop {
-                        pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                        if (*shared).barrier_enter_2 == total {
-                            pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                            break;
-                        }
-                        pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                        pgrx::pg_sys::ConditionVariableSleep(
-                            &raw mut (*shared).condvar_barrier_enter_2,
-                            pgrx::pg_sys::WaitEventIPC::WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN as _,
-                        );
-                    }
-                    pgrx::pg_sys::ConditionVariableCancelSleep();
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    (*shared).barrier_leave_2 = true;
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableBroadcast(
-                        &raw mut (*shared).condvar_barrier_leave_2,
-                    );
-                },
+                leader.sharedsort,
+                |indtuples| reporter.tuples_done(indtuples),
             );
-            // Every participant added its counts before entering barrier 1.
-            let shared = leader.vchordrqshared;
+            pgrx::pg_sys::ConditionVariablePrepareToSleep(&raw mut (*shared).done);
+            loop {
+                pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
+                let done = (*shared).nparticipantsdone;
+                pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
+                if done == leader.nparticipants {
+                    break;
+                }
+                pgrx::pg_sys::ConditionVariableSleep(
+                    &raw mut (*shared).done,
+                    pgrx::pg_sys::WaitEventIPC::WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN as _,
+                );
+            }
+            pgrx::pg_sys::ConditionVariableCancelSleep();
+            reporter.tuples_total((*shared).indtuples);
+            reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
+            let coordinate = pgrx::pg_sys::SortCoordinateData {
+                isWorker: false,
+                nParticipants: leader.nparticipants,
+                sharedsort: leader.sharedsort,
+            };
+            let mut sort = Sort::new(memory, Some(coordinate));
+            sort.perform();
+            crate::index::vchordrq::dispatch::write(opfamily, &index, sort);
             ((*shared).heap_tuples, (*shared).index_tuples as f64)
         }
     } else {
-        unsafe {
-            sequential_build(
+        reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
+        let mut sort = unsafe { Sort::new(memory, None) };
+        let mut indtuples = 0;
+        let (heap_tuples, index_tuples) = unsafe {
+            scan(
                 index_relation,
                 heap_relation,
                 index_info,
-                &keys,
+                std::ptr::null_mut(),
                 &cached,
-                |indtuples| {
-                    reporter.tuples_done(indtuples);
-                },
+                FilterKeys::new(index_relation, &keys),
+                &mut sort,
                 || {
-                    reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
-                },
-                |indtuples| {
+                    indtuples += 1;
                     reporter.tuples_done(indtuples);
-                    reporter.tuples_total(indtuples);
-                    reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
                 },
-                || {},
             )
-        }
+        };
+        reporter.tuples_total(indtuples);
+        reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
+        sort.perform();
+        crate::index::vchordrq::dispatch::write(opfamily, &index, sort);
+        (heap_tuples, index_tuples as f64)
     };
     let mut result = unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0() };
     result.heap_tuples = heap_tuples;
@@ -483,28 +403,19 @@ struct VchordrqShared {
     heaprelid: pgrx::pg_sys::Oid,
     indexrelid: pgrx::pg_sys::Oid,
     isconcurrent: bool,
+    /// The sorts there is room for: one per worker asked for, and the leader's.
+    scantuplesortstates: i32,
 
     /* locking */
     mutex: pgrx::pg_sys::slock_t,
-    condvar_barrier_enter_0: pgrx::pg_sys::ConditionVariable,
-    condvar_barrier_leave_0: pgrx::pg_sys::ConditionVariable,
-    condvar_barrier_enter_1: pgrx::pg_sys::ConditionVariable,
-    condvar_barrier_leave_1: pgrx::pg_sys::ConditionVariable,
-    condvar_barrier_enter_2: pgrx::pg_sys::ConditionVariable,
-    condvar_barrier_leave_2: pgrx::pg_sys::ConditionVariable,
+    done: pgrx::pg_sys::ConditionVariable,
 
     /* mutable state */
-    barrier_enter_0: i32,
-    nparticipants: u32,
+    nparticipantsdone: i32,
     indtuples: u64,
     /* sums of every participant's counts, reported by `ambuild` */
     heap_tuples: f64,
     index_tuples: u64,
-    barrier_leave_0: bool,
-    barrier_enter_1: i32,
-    barrier_leave_1: bool,
-    barrier_enter_2: i32,
-    barrier_leave_2: bool,
 }
 
 mod vchordrq_cached {
@@ -655,6 +566,7 @@ struct VchordrqLeader {
     vchordrqshared: *mut VchordrqShared,
     tablescandesc: *mut pgrx::pg_sys::ParallelTableScanDescData,
     vchordrqcached: *const u8,
+    sharedsort: *mut pgrx::pg_sys::Sharedsort,
 }
 
 impl VchordrqLeader {
@@ -706,12 +618,17 @@ impl VchordrqLeader {
         }
         let est_tablescandesc =
             unsafe { pgrx::pg_sys::table_parallelscan_estimate(heap_relation, snapshot) };
+        let scantuplesortstates = request + 1;
+        let est_sharedsort =
+            unsafe { pgrx::pg_sys::tuplesort_estimate_shared(scantuplesortstates) };
         unsafe {
             estimate_chunk(&mut (*pcxt).estimator, size_of::<VchordrqShared>());
             estimate_keys(&mut (*pcxt).estimator, 1);
             estimate_chunk(&mut (*pcxt).estimator, est_tablescandesc);
             estimate_keys(&mut (*pcxt).estimator, 1);
             estimate_chunk(&mut (*pcxt).estimator, 8 + vchordrq_cached.len());
+            estimate_keys(&mut (*pcxt).estimator, 1);
+            estimate_chunk(&mut (*pcxt).estimator, est_sharedsort);
             estimate_keys(&mut (*pcxt).estimator, 1);
         }
 
@@ -735,30 +652,15 @@ impl VchordrqLeader {
                 heaprelid: (*heap_relation).rd_id,
                 indexrelid: (*index_relation).rd_id,
                 isconcurrent,
-                nparticipants: 0,
-                condvar_barrier_enter_0: std::mem::zeroed(),
-                condvar_barrier_leave_0: std::mem::zeroed(),
-                condvar_barrier_enter_1: std::mem::zeroed(),
-                condvar_barrier_leave_1: std::mem::zeroed(),
-                condvar_barrier_enter_2: std::mem::zeroed(),
-                condvar_barrier_leave_2: std::mem::zeroed(),
-                barrier_enter_0: 0,
-                barrier_leave_0: false,
-                barrier_enter_1: 0,
-                barrier_leave_1: false,
-                barrier_enter_2: 0,
-                barrier_leave_2: false,
+                scantuplesortstates,
                 mutex: std::mem::zeroed(),
+                done: std::mem::zeroed(),
+                nparticipantsdone: 0,
                 indtuples: 0,
                 heap_tuples: 0.0,
                 index_tuples: 0,
             });
-            pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_enter_0);
-            pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_leave_0);
-            pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_enter_1);
-            pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_leave_1);
-            pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_enter_2);
-            pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_leave_2);
+            pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).done);
             pgrx::pg_sys::SpinLockInit(&raw mut (*vchordrqshared).mutex);
             vchordrqshared
         };
@@ -778,7 +680,15 @@ impl VchordrqLeader {
             x
         };
 
+        let sharedsort = unsafe {
+            let sharedsort = pgrx::pg_sys::shm_toc_allocate((*pcxt).toc, est_sharedsort)
+                .cast::<pgrx::pg_sys::Sharedsort>();
+            pgrx::pg_sys::tuplesort_initialize_shared(sharedsort, scantuplesortstates, (*pcxt).seg);
+            sharedsort
+        };
+
         unsafe {
+            pgrx::pg_sys::shm_toc_insert((*pcxt).toc, 0xA000000000000004, sharedsort.cast());
             pgrx::pg_sys::shm_toc_insert((*pcxt).toc, 0xA000000000000001, vchordrqshared.cast());
             pgrx::pg_sys::shm_toc_insert((*pcxt).toc, 0xA000000000000002, tablescandesc.cast());
             pgrx::pg_sys::shm_toc_insert((*pcxt).toc, 0xA000000000000003, vchordrqcached.cast());
@@ -809,6 +719,7 @@ impl VchordrqLeader {
             vchordrqshared,
             tablescandesc,
             vchordrqcached,
+            sharedsort,
         })
     }
 
@@ -837,7 +748,7 @@ impl Drop for VchordrqLeader {
 #[pgrx::pg_guard]
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
-    _seg: *mut pgrx::pg_sys::dsm_segment,
+    seg: *mut pgrx::pg_sys::dsm_segment,
     toc: *mut pgrx::pg_sys::shm_toc,
 ) {
     let _ = rand::rng().reseed();
@@ -852,6 +763,10 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
         pgrx::pg_sys::shm_toc_lookup(toc, 0xA000000000000003, false)
             .cast::<u8>()
             .cast_const()
+    };
+    let sharedsort = unsafe {
+        pgrx::pg_sys::shm_toc_lookup(toc, 0xA000000000000004, false)
+            .cast::<pgrx::pg_sys::Sharedsort>()
     };
     let (heap_lockmode, index_lockmode) = if unsafe { !(*vchordrqshared).isconcurrent } {
         (
@@ -872,90 +787,16 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
     }
 
     unsafe {
-        parallel_build(
+        pgrx::pg_sys::tuplesort_attach_shared(sharedsort, seg);
+        participate(
             index,
             heap,
             index_info,
-            tablescandesc,
             vchordrqshared,
+            tablescandesc,
             vchordrqcached,
+            sharedsort,
             |_| (),
-            || {
-                #[allow(clippy::needless_late_init)]
-                let order;
-                // enter the barrier
-                let shared = vchordrqshared;
-                pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                order = (*shared).barrier_enter_0 as u32;
-                (*shared).barrier_enter_0 += 1;
-                pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                pgrx::pg_sys::ConditionVariableBroadcast(
-                    &raw mut (*shared).condvar_barrier_enter_0,
-                );
-                // leave the barrier
-                loop {
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    if (*shared).barrier_leave_0 {
-                        pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                        break;
-                    }
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableSleep(
-                        &raw mut (*shared).condvar_barrier_leave_0,
-                        pgrx::pg_sys::WaitEventIPC::WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN as _,
-                    );
-                }
-                pgrx::pg_sys::ConditionVariableCancelSleep();
-                order
-            },
-            |_| {
-                // enter the barrier
-                let shared = vchordrqshared;
-                pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                (*shared).barrier_enter_1 += 1;
-                pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                pgrx::pg_sys::ConditionVariableBroadcast(
-                    &raw mut (*shared).condvar_barrier_enter_1,
-                );
-                // leave the barrier
-                loop {
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    if (*shared).barrier_leave_1 {
-                        pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                        break;
-                    }
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableSleep(
-                        &raw mut (*shared).condvar_barrier_leave_1,
-                        pgrx::pg_sys::WaitEventIPC::WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN as _,
-                    );
-                }
-                pgrx::pg_sys::ConditionVariableCancelSleep();
-            },
-            || {
-                // enter the barrier
-                let shared = vchordrqshared;
-                pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                (*shared).barrier_enter_2 += 1;
-                pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                pgrx::pg_sys::ConditionVariableBroadcast(
-                    &raw mut (*shared).condvar_barrier_enter_2,
-                );
-                // leave the barrier
-                loop {
-                    pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
-                    if (*shared).barrier_leave_2 {
-                        pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                        break;
-                    }
-                    pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
-                    pgrx::pg_sys::ConditionVariableSleep(
-                        &raw mut (*shared).condvar_barrier_leave_2,
-                        pgrx::pg_sys::WaitEventIPC::WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN as _,
-                    );
-                }
-                pgrx::pg_sys::ConditionVariableCancelSleep();
-            },
         );
     }
 
@@ -965,229 +806,129 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
     }
 }
 
-unsafe fn parallel_build(
+/// A participant's share of a parallel build: its part of the table, routed, encoded and sorted.
+#[allow(clippy::too_many_arguments)]
+unsafe fn participate(
+    index_relation: pgrx::pg_sys::Relation,
+    heap_relation: pgrx::pg_sys::Relation,
+    index_info: *mut pgrx::pg_sys::IndexInfo,
+    shared: *mut VchordrqShared,
+    tablescandesc: *mut pgrx::pg_sys::ParallelTableScanDescData,
+    vchordrqcached: *const u8,
+    sharedsort: *mut pgrx::pg_sys::Sharedsort,
+    report: impl Fn(u64),
+) {
+    let cached = unsafe {
+        let bytes = (vchordrqcached as *const u64).read_unaligned();
+        std::slice::from_raw_parts(vchordrqcached.add(8), bytes as _)
+    };
+    let memory = unsafe { pgrx::pg_sys::maintenance_work_mem / (*shared).scantuplesortstates };
+    let coordinate = pgrx::pg_sys::SortCoordinateData {
+        isWorker: true,
+        nParticipants: -1,
+        sharedsort,
+    };
+    let mut sort = unsafe { Sort::new(memory, Some(coordinate)) };
+    let (heap_tuples, index_tuples) = unsafe {
+        scan(
+            index_relation,
+            heap_relation,
+            index_info,
+            tablescandesc,
+            cached,
+            FilterKeys::of_index(index_relation),
+            &mut sort,
+            || {
+                pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
+                (*shared).indtuples += 1;
+                let indtuples = (*shared).indtuples;
+                pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
+                report(indtuples);
+            },
+        )
+    };
+    sort.perform();
+    drop(sort);
+    unsafe {
+        pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
+        (*shared).heap_tuples += heap_tuples;
+        (*shared).index_tuples += index_tuples;
+        (*shared).nparticipantsdone += 1;
+        pgrx::pg_sys::SpinLockRelease(&raw mut (*shared).mutex);
+        pgrx::pg_sys::ConditionVariableBroadcast(&raw mut (*shared).done);
+    }
+}
+
+/// Routes, encodes and sorts the table's rows, or with `tablescandesc` this participant's part of them.
+unsafe fn scan(
     index_relation: pgrx::pg_sys::Relation,
     heap_relation: pgrx::pg_sys::Relation,
     index_info: *mut pgrx::pg_sys::IndexInfo,
     tablescandesc: *mut pgrx::pg_sys::ParallelTableScanDescData,
-    vchordrqshared: *mut VchordrqShared,
-    vchordrqcached: *const u8,
-    mut callback: impl FnMut(u64),
-    sync_0: impl FnOnce() -> u32,
-    sync_1: impl FnOnce(u64),
-    sync_2: impl FnOnce(),
-) {
+    cached: &[u8],
+    keys: FilterKeys<'_>,
+    sort: &mut Sort,
+    progress: impl FnMut(),
+) -> (f64, u64) {
     use vchordrq_cached::VchordrqCachedReader;
 
-    let cached = VchordrqCachedReader::deserialize_ref(unsafe {
-        let bytes = (vchordrqcached as *const u64).read_unaligned();
-        std::slice::from_raw_parts(vchordrqcached.add(8), bytes as _)
-    });
-
-    let scan = unsafe {
-        pgrx::pg_sys::table_beginscan_parallel(
-            heap_relation,
-            tablescandesc,
-            #[cfg(feature = "pg19")]
-            {
-                pgrx::pg_sys::ScanOptions::SO_NONE as _
-            },
-        )
+    let scan = if tablescandesc.is_null() {
+        std::ptr::null_mut()
+    } else {
+        unsafe {
+            pgrx::pg_sys::table_beginscan_parallel(
+                heap_relation,
+                tablescandesc,
+                #[cfg(feature = "pg19")]
+                {
+                    pgrx::pg_sys::ScanOptions::SO_NONE as _
+                },
+            )
+        }
     };
     let opfamily = unsafe { opfamily(index_relation) };
-    let keys = unsafe { FilterKeys::of_index(index_relation) };
     let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
-
-    struct IdChooser(u32);
-    impl InsertChooser for IdChooser {
-        fn choose(&mut self, n: NonZero<usize>) -> usize {
-            self.0 as usize % n
-        }
-    }
-
-    struct ChooseSome {
-        n: usize,
-        k: usize,
-    }
-    impl MaintainChooser for ChooseSome {
-        fn choose(&mut self, i: usize) -> bool {
-            i % self.n == self.k
-        }
-    }
-
-    let check = || {
-        pgrx::check_for_interrupts();
-    };
-
-    let order = sync_0();
-
-    let index = unsafe { BufferedPostgresRelation::new(index_relation) };
-
-    let mut index_tuples = 0_u64;
-    let heap_tuples = match cached {
-        VchordrqCachedReader::_0(_) => {
-            traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
-                let ctid = tuple.id();
-                let (values, is_nulls) = tuple.build();
-                let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
-                let columns = unsafe { keys.row(values, is_nulls) };
-                let store = value
-                    .and_then(|x| unsafe { opfamily.store(x) })
-                    .unwrap_or_default();
-                for (vector, extra) in store {
-                    let key = ctid_to_key(ctid);
-                    let payload = kv_to_pointer((key, extra));
-                    let mut chooser = IdChooser(order);
-                    let bump = bumpalo::Bump::new();
-                    crate::index::vchordrq::dispatch::insert(
-                        opfamily,
-                        &index,
-                        payload,
-                        &columns,
-                        vector,
-                        true,
-                        true,
-                        &mut chooser,
-                        &bump,
-                    );
-                    index_tuples += 1;
-                }
-                unsafe {
-                    let indtuples;
-                    {
-                        pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
-                        (*vchordrqshared).indtuples += 1;
-                        indtuples = (*vchordrqshared).indtuples;
-                        pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordrqshared).mutex);
-                    }
-                    callback(indtuples);
-                }
-            })
-        }
-        VchordrqCachedReader::_1(cached) => {
-            let index = CachingRelation {
-                cache: cached,
-                relation: &index,
-            };
-            traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
-                let ctid = tuple.id();
-                let (values, is_nulls) = tuple.build();
-                let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
-                let columns = unsafe { keys.row(values, is_nulls) };
-                let store = value
-                    .and_then(|x| unsafe { opfamily.store(x) })
-                    .unwrap_or_default();
-                for (vector, extra) in store {
-                    let key = ctid_to_key(ctid);
-                    let payload = kv_to_pointer((key, extra));
-                    let mut chooser = IdChooser(order);
-                    let bump = bumpalo::Bump::new();
-                    crate::index::vchordrq::dispatch::insert(
-                        opfamily,
-                        &index,
-                        payload,
-                        &columns,
-                        vector,
-                        true,
-                        true,
-                        &mut chooser,
-                        &bump,
-                    );
-                    index_tuples += 1;
-                }
-                unsafe {
-                    let indtuples;
-                    {
-                        pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
-                        (*vchordrqshared).indtuples += 1;
-                        indtuples = (*vchordrqshared).indtuples;
-                        pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordrqshared).mutex);
-                    }
-                    callback(indtuples);
-                }
-            })
-        }
-    };
-
-    unsafe {
-        pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
-        (*vchordrqshared).heap_tuples += heap_tuples;
-        (*vchordrqshared).index_tuples += index_tuples;
-        pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordrqshared).mutex);
-    }
-
-    while index.release() {
-        vchordrq::consume(&index);
-    }
-
-    drop(index);
-
-    sync_1(unsafe { (*vchordrqshared).indtuples });
-
     let index = unsafe { PostgresRelation::new(index_relation) };
-
-    let mut chooser = ChooseSome {
-        n: unsafe { (*vchordrqshared).nparticipants as usize },
-        k: order as usize,
+    let encoder = Encoder {
+        traverser: &traverser,
+        opfamily,
+        keys: &keys,
+        sort,
+        progress,
     };
-    let pending = vchordrq::Pending::default();
-    crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, &pending, check);
-
-    sync_2();
+    match VchordrqCachedReader::deserialize_ref(cached) {
+        VchordrqCachedReader::_0(_) => encoder.scan(&index),
+        VchordrqCachedReader::_1(cache) => encoder.scan(&CachingRelation {
+            cache,
+            relation: &index,
+        }),
+    }
 }
 
-unsafe fn sequential_build(
-    index_relation: pgrx::pg_sys::Relation,
-    heap_relation: pgrx::pg_sys::Relation,
-    index_info: *mut pgrx::pg_sys::IndexInfo,
-    keys: &vchordrq::keys::Keys,
-    vchordrqcached: &[u8],
-    mut callback: impl FnMut(u64),
-    sync_0: impl FnOnce(),
-    sync_1: impl FnOnce(u64),
-    sync_2: impl FnOnce(),
-) -> (f64, f64) {
-    use vchordrq_cached::VchordrqCachedReader;
+/// What a scan routes, encodes and sorts its rows with.
+struct Encoder<'a, P> {
+    traverser: &'a HeapTraverser,
+    opfamily: Opfamily,
+    keys: &'a FilterKeys<'a>,
+    sort: &'a mut Sort,
+    progress: P,
+}
 
-    let cached = VchordrqCachedReader::deserialize_ref(vchordrqcached);
-
-    let opfamily = unsafe { opfamily(index_relation) };
-    let keys = FilterKeys::new(index_relation, keys);
-    let traverser = unsafe {
-        HeapTraverser::new(
-            heap_relation,
-            index_relation,
-            index_info,
-            std::ptr::null_mut(),
-        )
-    };
-
-    struct ChooseZero;
-    impl InsertChooser for ChooseZero {
-        fn choose(&mut self, _: NonZero<usize>) -> usize {
-            0
-        }
-    }
-
-    struct ChooseAll;
-    impl MaintainChooser for ChooseAll {
-        fn choose(&mut self, _: usize) -> bool {
-            true
-        }
-    }
-
-    let check = || {
-        pgrx::check_for_interrupts();
-    };
-
-    sync_0();
-
-    let index = unsafe { BufferedPostgresRelation::new(index_relation) };
-
-    let mut indtuples = 0;
-    let mut index_tuples = 0_u64;
-    let heap_tuples = match cached {
-        VchordrqCachedReader::_0(_) => {
+impl<P: FnMut()> Encoder<'_, P> {
+    fn scan<R>(self, index: &R) -> (f64, u64)
+    where
+        R: RelationRead,
+        R::Page: Page<Opaque = vchordrq::Opaque>,
+    {
+        let Self {
+            traverser,
+            opfamily,
+            keys,
+            sort,
+            mut progress,
+        } = self;
+        let (mut out, mut index_tuples) = (Vec::new(), 0_u64);
+        let heap_tuples =
             traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
                 let ctid = tuple.id();
                 let (values, is_nulls) = tuple.build();
@@ -1197,81 +938,19 @@ unsafe fn sequential_build(
                     .and_then(|x| unsafe { opfamily.store(x) })
                     .unwrap_or_default();
                 for (vector, extra) in store {
-                    let key = ctid_to_key(ctid);
-                    let payload = kv_to_pointer((key, extra));
-                    let mut chooser = ChooseZero;
+                    let payload = kv_to_pointer((ctid_to_key(ctid), extra));
                     let bump = bumpalo::Bump::new();
-                    crate::index::vchordrq::dispatch::insert(
-                        opfamily,
-                        &index,
-                        payload,
-                        &columns,
-                        vector,
-                        true,
-                        true,
-                        &mut chooser,
-                        &bump,
+                    out.clear();
+                    crate::index::vchordrq::dispatch::encode(
+                        opfamily, index, payload, &columns, vector, &bump, &mut out,
                     );
+                    sort.put(&out);
                     index_tuples += 1;
                 }
-                indtuples += 1;
-                callback(indtuples);
-            })
-        }
-        VchordrqCachedReader::_1(cached) => {
-            let index = CachingRelation {
-                cache: cached,
-                relation: &index,
-            };
-            traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
-                let ctid = tuple.id();
-                let (values, is_nulls) = tuple.build();
-                let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
-                let columns = unsafe { keys.row(values, is_nulls) };
-                let store = value
-                    .and_then(|x| unsafe { opfamily.store(x) })
-                    .unwrap_or_default();
-                for (vector, extra) in store {
-                    let key = ctid_to_key(ctid);
-                    let payload = kv_to_pointer((key, extra));
-                    let mut chooser = ChooseZero;
-                    let bump = bumpalo::Bump::new();
-                    crate::index::vchordrq::dispatch::insert(
-                        opfamily,
-                        &index,
-                        payload,
-                        &columns,
-                        vector,
-                        true,
-                        true,
-                        &mut chooser,
-                        &bump,
-                    );
-                    index_tuples += 1;
-                }
-                indtuples += 1;
-                callback(indtuples);
-            })
-        }
-    };
-
-    while index.release() {
-        vchordrq::consume(&index);
+                progress();
+            });
+        (heap_tuples, index_tuples)
     }
-
-    drop(index);
-
-    sync_1(indtuples);
-
-    let index = unsafe { PostgresRelation::new(index_relation) };
-
-    let mut chooser = ChooseAll;
-    let pending = vchordrq::Pending::default();
-    crate::index::vchordrq::dispatch::maintain(opfamily, &index, &mut chooser, &pending, check);
-
-    sync_2();
-
-    (heap_tuples, index_tuples as f64)
 }
 
 #[pgrx::pg_guard]
@@ -2054,35 +1733,5 @@ impl<R: RelationRead<Page = PostgresPage<vchordrq::Opaque>>> RelationRead
         } else {
             CachingRelationReadGuard::Wrapping(self.relation.read(id))
         }
-    }
-}
-
-impl<R: RelationWrite<Page = PostgresPage<vchordrq::Opaque>>> RelationWriteTypes
-    for CachingRelation<'_, R>
-{
-    type WriteGuard<'a> = R::WriteGuard<'a>;
-}
-
-impl<R: RelationWrite<Page = PostgresPage<vchordrq::Opaque>>> RelationWrite
-    for CachingRelation<'_, R>
-{
-    fn commit_pair(&self, first: Self::WriteGuard<'_>, second: Self::WriteGuard<'_>) {
-        self.relation.commit_pair(first, second);
-    }
-
-    fn write(&self, id: u32, tracking_freespace: bool) -> Self::WriteGuard<'_> {
-        self.relation.write(id, tracking_freespace)
-    }
-
-    fn extend(
-        &self,
-        opaque: <Self::Page as Page>::Opaque,
-        tracking_freespace: bool,
-    ) -> Self::WriteGuard<'_> {
-        self.relation.extend(opaque, tracking_freespace)
-    }
-
-    fn search(&self, freespace: usize) -> Option<Self::WriteGuard<'_>> {
-        self.relation.search(freespace)
     }
 }

@@ -14,6 +14,7 @@ mod hook;
 mod opclass;
 mod sample;
 mod scanners;
+mod sort;
 mod storage;
 mod traverse;
 mod vchordg;

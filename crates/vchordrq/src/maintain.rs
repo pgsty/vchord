@@ -6,7 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
+use crate::closure_lifetime_binder::{id_1, id_2, id_3};
 use crate::keys::Keys;
 use crate::list::{ListWriter, Rows, appendable_tuple, firsts, unpack_code};
 use crate::operator::Operator;
@@ -20,16 +20,6 @@ use index::relation::{
 use index_accessor::FunctionalAccessor;
 use rabitq::packing::unpack;
 use std::cell::RefCell;
-
-pub trait MaintainChooser {
-    fn choose(&mut self, i: usize) -> bool;
-    /// Whether a chosen list whose compaction would reproduce its tapes
-    /// unchanged may be skipped (VACUUM); parallel build compaction always
-    /// rewrites.
-    fn skip_unchanged(&self) -> bool {
-        false
-    }
-}
 
 pub struct Maintain {
     pub number_of_formerly_allocated_pages: usize,
@@ -81,7 +71,6 @@ impl Pending {
 pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
     index: &'b R,
     mut prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R>,
-    chooser: &mut impl MaintainChooser,
     memory: usize,
     pending: &Pending,
     check: impl Fn(),
@@ -132,14 +121,9 @@ where
     let mut number_of_freed_pages = 0_usize;
 
     let mut words = Vec::new();
-    for (idx, first) in state.into_iter().enumerate() {
-        if !chooser.choose(idx) {
-            continue;
-        }
-
-        if chooser.skip_unchanged()
-            && let Some(tuples) = inspect_unchanged::<R>(index, first)
-        {
+    for first in state {
+        // lists with nothing to compact are left alone: VACUUM used to rewrite and WAL-log every list (#24)
+        if let Some(tuples) = inspect_unchanged::<R>(index, first) {
             number_of_tuples += tuples;
             check();
             continue;
@@ -430,6 +414,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::closure_lifetime_binder::id_0;
     use crate::keys::{Summary, Width};
     use crate::operator::Op;
     use crate::types::{DistanceKind, Structure, VchordrqIndexOptions, VectorKind, VectorOptions};
@@ -444,11 +429,11 @@ mod tests {
     type O = Op<VectOwned<f32>, L2S>;
     const DIM: usize = 100;
 
-    struct All;
+    struct NoRows;
 
-    impl MaintainChooser for All {
-        fn choose(&mut self, _: usize) -> bool {
-            true
+    impl crate::Sorted for NoRows {
+        fn next(&mut self) -> Option<&[u8]> {
+            None
         }
     }
 
@@ -465,7 +450,7 @@ mod tests {
         (meta.first(), meta.freepages_first())
     }
 
-    /// One list as a build writes it, with rows 1 to `n` appended; returns its jump page.
+    /// One empty list as a build writes it, with rows 1 to `n` appended; returns its jump page.
     fn index(relation: &M, keys: &Keys, n: u64) -> u32 {
         let (dim, v, d) = (DIM as _, VectorKind::Vecf32, DistanceKind::L2S);
         let options = VchordrqIndexOptions {
@@ -484,6 +469,7 @@ mod tests {
             relation,
             vec![structure],
         );
+        crate::write::<_, O>(relation, NoRows, usize::MAX);
         let first = meta(relation).0;
         (1..=n).for_each(|payload| append(relation, keys, first, payload));
         first
@@ -580,19 +566,18 @@ mod tests {
                 }
             };
             for _ in 0..2 {
+                // a block's worth more, so that the list is compacted, not left alone
+                for _ in 0..32 {
+                    append(&relation, &keys, first, next.get());
+                    next.set(next.get() + 1);
+                }
                 let (_, _, other) = list(&relation, first);
                 let jump_guard = relation.read(first);
                 old.set(JumpTuple::deserialize_ref(jump_guard.get(1).unwrap()).appendable_first());
                 drop(jump_guard);
                 let prefetch = MakePlainPrefetcher { index: &relation };
-                let maintain = maintain::<_, O>(
-                    &relation,
-                    prefetch,
-                    &mut All,
-                    memory,
-                    &Pending::default(),
-                    check,
-                );
+                let maintain =
+                    maintain::<_, O>(&relation, prefetch, memory, &Pending::default(), check);
                 let (payloads, tuples, now) = list(&relation, first);
                 assert_eq!(payloads, (1..next.get()).collect::<Vec<_>>());
                 assert_eq!(
@@ -612,14 +597,9 @@ mod tests {
             let relation = M::new([]);
             index(&relation, &keys, 3000);
             let prefetch = MakePlainPrefetcher { index: &relation };
-            maintain::<_, O>(
-                &relation,
-                prefetch,
-                &mut All,
-                1 << 12,
-                &Pending::default(),
-                || calls.set(calls.get() + 1),
-            );
+            maintain::<_, O>(&relation, prefetch, 1 << 12, &Pending::default(), || {
+                calls.set(calls.get() + 1)
+            });
             for k in 1..=calls.get() {
                 let relation = M::new([]);
                 let first = index(&relation, &keys, 3000);
@@ -634,7 +614,7 @@ mod tests {
                 };
                 let prefetch = MakePlainPrefetcher { index: &relation };
                 let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    maintain::<_, O>(&relation, prefetch, &mut All, 1 << 12, &pending, check)
+                    maintain::<_, O>(&relation, prefetch, 1 << 12, &pending, check)
                 }));
                 assert_eq!(*result.err().unwrap().downcast::<u32>().unwrap(), k);
                 pending.give_back(&relation);

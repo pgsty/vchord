@@ -19,6 +19,7 @@ validator.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]
+bumpalo.workspace = true
 index = { path = "../index", features = ["test-support"] }
 rand.workspace = true
 

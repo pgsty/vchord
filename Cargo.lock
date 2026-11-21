@@ -1891,6 +1891,7 @@ name = "vchordrq"
 version = "1.4.0"
 dependencies = [
  "always_equal",
+ "bumpalo",
  "dary_heap",
  "distance",
  "index",

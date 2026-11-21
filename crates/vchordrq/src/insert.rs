@@ -34,7 +34,6 @@ pub fn insert_vector<R: RelationRead + RelationWrite, O: Operator>(
     payload: NonZero<u64>,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     chooser: &mut impl InsertChooser,
-    skip_search: bool,
 ) -> (Vec<u32>, u16)
 where
     R::Page: Page<Opaque = Opaque>,
@@ -55,7 +54,7 @@ where
     drop(meta_guard);
 
     if !rerank_in_heap {
-        vectors::append::<O, R>(index, vectors_first, vector, payload, skip_search)
+        vectors::append::<O, R>(index, vectors_first, vector, payload)
     } else {
         (Vec::new(), 0)
     }
@@ -69,7 +68,6 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     key: (Vec<u32>, u16),
     bump: &'b impl Bump,
     prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-    skip_freespaces: bool,
 ) where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -105,7 +103,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         jump_tuple.appendable_first(),
         &serialized,
         false,
-        (!skip_freespaces).then_some(freepages_first),
+        Some(freepages_first),
     );
 }
 

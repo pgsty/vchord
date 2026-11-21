@@ -180,18 +180,51 @@ impl Rows {
     pub fn push(&mut self, row: tape::Row<'_, (rabitq::bit::Code, f32)>, keys: &Keys) {
         let ((m, signs), delta) = row.value;
         let metadata = [m.dis_u_2, m.factor_cnt, m.factor_ip, m.factor_err];
-        let (head, payload) = (row.head, row.payload);
+        // a frozen code is padded to a multiple of 4 signs, with zeros
+        let signs = rabitq::bit::binary::pack_code(&signs[..self.dim]);
+        self.fixed(
+            metadata,
+            delta,
+            (row.head, row.payload),
+            &signs,
+            row.prefetch,
+        );
+        row.columns.extend(keys, &mut self.columns);
+    }
+    /// A row as an appendable tuple stores it, with its vector at `prefetch` and `head`.
+    pub fn push_appendable(
+        &mut self,
+        tuple: AppendableTupleReader<'_>,
+        prefetch: &[u32],
+        head: u16,
+    ) {
+        let payload = tuple.payload().expect("a live row");
+        let fixed = (head, payload);
+        self.fixed(
+            tuple.metadata(),
+            tuple.delta(),
+            fixed,
+            tuple.elements(),
+            prefetch,
+        );
+        self.columns.extend_from_slice(tuple.columns());
+    }
+    fn fixed(
+        &mut self,
+        metadata: [f32; 4],
+        delta: f32,
+        (head, payload): (u16, NonZero<u64>),
+        signs: &[u64],
+        prefetch: &[u32],
+    ) {
         self.fixed.push(Fixed {
             metadata,
             delta,
             head,
             payload,
         });
-        // a frozen code is padded to a multiple of 4 signs, with zeros
-        let signs = rabitq::bit::binary::pack_code(&signs[..self.dim]);
-        self.signs.extend_from_slice(&signs);
-        self.prefetch.extend_from_slice(row.prefetch);
-        row.columns.extend(keys, &mut self.columns);
+        self.signs.extend_from_slice(signs);
+        self.prefetch.extend_from_slice(prefetch);
     }
     /// Writes the rows to `sink` in the order of their keys, stable, and clears them.
     pub fn flush(&mut self, keys: &Keys, mut sink: impl FnMut(Branch<NonZero<u64>>, &[u8])) {

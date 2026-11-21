@@ -240,6 +240,13 @@ impl Keys {
         }
         Ordering::Equal
     }
+    /// How many bytes `sortable` appends.
+    pub fn sortable_len(&self) -> usize {
+        self.as_slice()
+            .iter()
+            .map(|key| 1 + key.width.bytes())
+            .sum()
+    }
     /// Appends the row's keys in bytes that compare as `cmp` orders the rows.
     pub fn sortable(&self, row: Columns<'_>, out: &mut Vec<u8>) {
         for key in self.as_slice() {

@@ -78,6 +78,12 @@ where
     pub fn freespace(&mut self) -> u16 {
         self.head().freespace()
     }
+    /// Moves on to a new page unless the last is empty.
+    pub fn renew(&mut self) {
+        if self.head().len() != 0 {
+            self.tape_move();
+        }
+    }
     pub fn tape_move(&mut self) {
         if self.head().len() == 0 {
             panic!("implementation: a clear page cannot accommodate a single tuple");

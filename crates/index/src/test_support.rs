@@ -183,3 +183,21 @@ impl<'b, R: RelationRead + 'b> crate::prefetcher::PrefetcherSequenceFamily<'b, R
         false
     }
 }
+
+impl<'b, R: RelationRead + 'b> crate::prefetcher::PrefetcherHeapFamily<'b, R>
+    for MakePlainPrefetcher<'b, R>
+{
+    type P<T>
+        = crate::prefetcher::PlainPrefetcher<'b, R, std::collections::BinaryHeap<T>>
+    where
+        T: Ord + crate::fetch::Fetch<'b>;
+    fn prefetch<T>(&mut self, seq: Vec<T>) -> Self::P<T>
+    where
+        T: Ord + crate::fetch::Fetch<'b>,
+    {
+        crate::prefetcher::PlainPrefetcher::new(self.index, seq.into())
+    }
+    fn is_not_plain(&self) -> bool {
+        false
+    }
+}

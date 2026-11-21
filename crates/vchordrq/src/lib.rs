@@ -11,7 +11,6 @@ mod bulkdelete;
 mod cache;
 mod centroids;
 mod closure_lifetime_binder;
-mod consume;
 mod cost;
 mod fast_heap;
 mod freepages;
@@ -32,14 +31,13 @@ pub mod keys;
 pub mod operator;
 pub mod types;
 
-pub use build::build;
+pub use build::{Sorted, build, encode, write};
 pub use bulkdelete::{bulkdelete, bulkdelete_vectors};
 pub use cache::cache;
-pub use consume::consume;
 pub use cost::cost;
 pub use fast_heap::FastHeap;
 pub use insert::{InsertChooser, insert, insert_vector};
-pub use maintain::{MaintainChooser, Pending, maintain};
+pub use maintain::{Pending, maintain};
 pub use prewarm::prewarm;
 pub use rerank::{
     Table, TableAhead, exact_distance, how, rerank_heap, rerank_index, unit_distance,

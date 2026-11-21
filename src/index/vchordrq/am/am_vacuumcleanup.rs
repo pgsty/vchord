@@ -10,7 +10,6 @@ use crate::index::vchordrq::am::PostgresRelation;
 use crate::index::vchordrq::dispatch;
 use crate::index::vchordrq::opclass::opfamily;
 use std::cell::Cell;
-use vchordrq::MaintainChooser;
 
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn amvacuumcleanup(
@@ -49,18 +48,6 @@ unsafe fn sequential_vacuumcleanup(
     sync_0: impl FnOnce(),
     sync_1: impl FnOnce(),
 ) -> u64 {
-    struct ChooseAll;
-    impl MaintainChooser for ChooseAll {
-        fn choose(&mut self, _: usize) -> bool {
-            true
-        }
-        // Lists with nothing to compact are left alone: VACUUM used to
-        // rewrite and WAL-log every list, even with nothing deleted (#24).
-        fn skip_unchanged(&self) -> bool {
-            true
-        }
-    }
-
     let opfamily = unsafe { opfamily(index_relation) };
     let index = unsafe { PostgresRelation::new(index_relation) };
     let pending = vchordrq::Pending::default();
@@ -86,10 +73,9 @@ unsafe fn sequential_vacuumcleanup(
 
     sync_0();
 
-    let mut chooser = ChooseAll;
     let tuples = unsafe {
         pgrx::pg_sys::InterruptHoldoffCount += 1;
-        let maintain = || dispatch::maintain(opfamily, &index, &mut chooser, &pending, check);
+        let maintain = || dispatch::maintain(opfamily, &index, &pending, check);
         let tuples = ensure_cleanup(&give_back, maintain);
         pgrx::pg_sys::InterruptHoldoffCount -= 1;
         tuples

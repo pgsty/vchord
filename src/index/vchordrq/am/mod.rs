@@ -575,8 +575,6 @@ pub unsafe extern "C-unwind" fn aminsert(
                 payload,
                 &columns,
                 vector,
-                false,
-                false,
                 &mut chooser,
                 &bump,
             );
