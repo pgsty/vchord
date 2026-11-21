@@ -20,7 +20,6 @@ use index::relation::{
 use index_accessor::FunctionalAccessor;
 use rabitq::packing::unpack;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
 use std::ops::Range;
 
 pub struct Maintain {
@@ -31,12 +30,9 @@ pub struct Maintain {
     pub number_of_tuples: u64,
 }
 
-/// The pages a maintain holds: a list's new ones while unpublished, then its old ones, and the free runs that lists are placed on.
+/// The pages a maintain holds unpublished or not yet freed: a list's new ones, then its old ones.
 #[derive(Default)]
-pub struct Pending {
-    list: RefCell<Vec<u32>>,
-    runs: RefCell<Runs>,
-}
+pub struct Pending(RefCell<Vec<u32>>);
 
 impl Pending {
     /// Frees them, where the maintain holding them locks no page, as in its `check`.
@@ -50,9 +46,9 @@ impl Pending {
         drop(meta_guard);
         self.free(index, freepages_first, || ());
     }
-    /// The runs are kept for the next maintain, the longest first, and the pages of those that are not kept go to
-    /// the free list, which hands out what is freed last first: they are freed from the highest, so they are handed
-    /// out in order.
+    /// Their runs are kept for the lists that maintains place, the longest that fit, and the pages of the others go
+    /// to the free list, which hands out what is freed last first: they are freed from the highest, so they are
+    /// handed out in order.
     fn free<R: RelationRead + RelationWrite>(
         &self,
         index: &R,
@@ -62,79 +58,24 @@ impl Pending {
     where
         R::Page: Page<Opaque = Opaque>,
     {
-        let mut runs = std::mem::take(&mut *self.runs.borrow_mut());
-        self.list
-            .borrow_mut()
-            .drain(..)
-            .for_each(|id| runs.insert(id));
-        let mut runs = runs.0.into_iter().map(|(s, e)| [s, e]).collect::<Vec<_>>();
-        let n = runs.iter().map(|&[s, e]| (e - s) as usize).sum();
-        runs.sort_by_key(|&[s, e]| std::cmp::Reverse(e - s));
-        let kept = freepages::put_runs(index, freepages_first, &runs);
-        let mut rest = runs[kept..]
-            .iter()
-            .flat_map(|&[s, e]| s..e)
-            .collect::<Vec<_>>();
+        let mut ids = self.0.borrow().clone();
+        ids.sort_unstable();
+        let mut runs = Vec::<[u32; 2]>::new();
+        for &id in &ids {
+            match runs.last_mut() {
+                Some(run) if run[1] == id => run[1] += 1,
+                _ => runs.push([id, id + 1]),
+            }
+        }
+        let rest = freepages::put_runs(index, freepages_first, &runs);
+        let mut rest = rest.into_iter().flat_map(|[s, e]| s..e).collect::<Vec<_>>();
         rest.sort_unstable();
-        *self.list.borrow_mut() = rest;
-        while let Some(id) = { self.list.borrow_mut().pop() } {
+        *self.0.borrow_mut() = rest;
+        while let Some(id) = { self.0.borrow_mut().pop() } {
             freepages::free(index, freepages_first, id);
             between();
         }
-        n
-    }
-}
-
-/// Free pages, as runs of pages that follow one another: each run's first page and its end.
-#[derive(Default)]
-struct Runs(BTreeMap<u32, u32>);
-
-impl Runs {
-    fn insert(&mut self, id: u32) {
-        self.insert_run(id, id + 1);
-    }
-    /// Pages `start..end`, none of which it holds.
-    fn insert_run(&mut self, start: u32, end: u32) {
-        let (mut start, mut end) = (start, end);
-        if let Some((&s, &e)) = self.0.range(..start).next_back()
-            && e == start
-        {
-            start = s;
-        }
-        if let Some(e) = self.0.remove(&end) {
-            end = e;
-        }
-        self.0.insert(start, end);
-    }
-    /// The front `n` pages of the shortest run of at least `n`, or else the longest run of at least `least`.
-    fn take(&mut self, n: usize, least: usize) -> Option<Range<u32>> {
-        let len = |(&s, &e): (&u32, &u32)| (e - s) as usize;
-        let fits = self
-            .0
-            .iter()
-            .filter(|&x| len(x) >= n)
-            .min_by_key(|&x| len(x));
-        let (&start, &end) = fits.or_else(|| {
-            self.0
-                .iter()
-                .filter(|&x| len(x) >= least)
-                .max_by_key(|&x| len(x))
-        })?;
-        self.0.remove(&start);
-        let taken = start..end.min(start + n as u32);
-        if taken.end < end {
-            self.0.insert(taken.end, end);
-        }
-        Some(taken)
-    }
-    /// Up to `n` pages of the run that begins at `start`.
-    fn take_from(&mut self, start: u32, n: usize) -> Option<Range<u32>> {
-        let end = self.0.remove(&start)?;
-        let taken = start..end.min(start + n as u32);
-        if taken.end < end {
-            self.0.insert(taken.end, end);
-        }
-        Some(taken)
+        ids.len()
     }
 }
 
@@ -142,8 +83,8 @@ impl Runs {
 enum Source {
     /// Not chosen yet.
     None,
-    /// Free pages that this maintain holds.
-    Runs(Range<u32>),
+    /// The kept run that begins with this page.
+    Runs(u32),
     /// The pages at the head of the free list, as they were when chosen.
     Free(Range<u32>),
     Extend,
@@ -181,27 +122,24 @@ where
     });
 
     let state = firsts(index, &check);
-    // the runs that earlier maintains left free; given back with the rest of the pending pages on an error
-    for [start, end] in freepages::take_runs(index, freepages_first) {
-        pending.runs.borrow_mut().insert_run(start, end);
-    }
 
-    // a list's `n` pages, in the order it is written: a free run that fits, else the longest free run if it takes
-    // at least half of them, else an extension
+    // a list's `n` pages, in the order it is written: the shortest kept run that fits, else the free list's head if
+    // it fits, else the longest kept run or else the head if it takes at least half of them, else an extension
     let choose = |index: &R, n: usize| {
-        let mut runs = pending.runs.borrow_mut();
-        if let Some(run) = runs.take(n, usize::MAX) {
-            return Source::Runs(run);
+        let runs = freepages::runs(index, freepages_first);
+        let len = |run: &&[u32; 2]| (run[1] - run[0]) as usize;
+        if let Some(&[start, _]) = runs.iter().filter(|x| len(x) >= n).min_by_key(len) {
+            return Source::Runs(start);
         }
         let head = freepages::head(index, freepages_first, n);
         let free = head.first().map_or(0..0, |&id| id..id + head.len() as u32);
         if free.len() == n {
             return Source::Free(free);
         }
-        let half = n.div_ceil(2);
-        match runs.take(n, half.max(free.len() + 1)) {
-            Some(run) => Source::Runs(run),
-            None if free.len() >= half => Source::Free(free),
+        let least = n.div_ceil(2).max(free.len() + 1);
+        match runs.iter().filter(|x| len(x) >= least).max_by_key(len) {
+            Some(&[start, _]) => Source::Runs(start),
+            None if free.len() >= n.div_ceil(2) => Source::Free(free),
             None => Source::Extend,
         }
     };
@@ -216,12 +154,12 @@ where
                 match source {
                     _ if tracking_freespace => break None,
                     Source::None => *source = choose(index, *want + 1),
-                    Source::Runs(run) => match run.next() {
-                        Some(id) => break Some(index.write(id, false)),
-                        None => match pending.runs.borrow_mut().take_from(run.end, *want + 1) {
-                            Some(run) => *source = Source::Runs(run),
-                            None => *source = Source::None,
-                        },
+                    Source::Runs(id) => match freepages::take(index, freepages_first, *id) {
+                        Some(guard) => {
+                            *id += 1;
+                            break Some(guard);
+                        }
+                        None => *source = Source::None,
                     },
                     Source::Free(run) => match run.next() {
                         Some(id) => match freepages::alloc(index, freepages_first) {
@@ -249,12 +187,13 @@ where
                     index.extend(opaque, tracking_freespace)
                 }
             };
-            pending.list.borrow_mut().push(guard.id());
+            pending.0.borrow_mut().push(guard.id());
             guard
         })
     });
 
     let mut number_of_tuples = 0_u64;
+    let mut number_of_freed_pages = 0_usize;
 
     let mut words = Vec::new();
     for first in state {
@@ -409,14 +348,9 @@ where
 
         // dropping the guard publishes the new tapes; readers of the old ones hold its share lock
         drop(jump_guard);
-        pending.list.borrow_mut().clear();
-        let mut runs = pending.runs.borrow_mut();
-        if let (_, Source::Runs(rest)) = placement.replace((0, Source::None)) {
-            rest.for_each(|id| runs.insert(id));
-        }
-        trace.into_iter().for_each(|id| runs.insert(id));
+        *pending.0.borrow_mut() = trace;
+        number_of_freed_pages += pending.free(index, freepages_first, &check);
     }
-    let number_of_freed_pages = pending.free(index, freepages_first, &check);
 
     let buffers = RefCell::into_inner(buffers);
 
@@ -774,6 +708,65 @@ mod tests {
                 let (payloads, _, now) = list(&relation, first);
                 assert_eq!(payloads, (1..=3001).collect::<Vec<_>>());
                 assert_eq!(now, other, "a page is lost at delay point {k}");
+            }
+        }
+    }
+
+    /// A maintain that stops at a delay point and gives nothing back, as in a crash, loses at most one list's pages.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn crashed() {
+        let sizes = [3000, 2600, 2200, 1800, 1400, 1000];
+        let held = |relation: &M, firsts: &[u32]| {
+            let lists = firsts.iter().map(|&first| {
+                let (tape, directory) = pages(relation, first);
+                tape.len() + directory.len()
+            });
+            (lists.collect::<Vec<_>>(), free_list(relation).len())
+        };
+        let mut payload = sizes.iter().sum::<u64>();
+        let mut grown = |relation: &M, keys: &Keys, firsts: &[u32]| {
+            for &first in firsts {
+                for _ in 0..40 {
+                    payload += 1;
+                    append(relation, keys, first, payload);
+                }
+            }
+        };
+        for keys in keys() {
+            let calls = Cell::new(0);
+            for k in 1.. {
+                let relation = M::new([]);
+                let firsts = lists(&relation, &keys, &sizes);
+                let prefetch = MakePlainPrefetcher { index: &relation };
+                maintain::<_, O>(&relation, prefetch, 1 << 30, &Pending::default(), || ());
+                grown(&relation, &keys, &firsts);
+                let (lists, free) = held(&relation, &firsts);
+                let other = relation.pages() as usize - lists.iter().sum::<usize>() - free;
+                calls.set(0);
+                let check = || {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == k {
+                        std::panic::panic_any(k);
+                    }
+                };
+                let prefetch = MakePlainPrefetcher { index: &relation };
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    maintain::<_, O>(&relation, prefetch, 1 << 30, &Pending::default(), check)
+                }));
+                if result.is_ok() {
+                    break;
+                }
+                let (now, free) = held(&relation, &firsts);
+                let lost = relation.pages() as usize - now.iter().sum::<usize>() - free - other;
+                let most = std::iter::zip(&lists, &now)
+                    .map(|(a, b)| a.max(b))
+                    .max()
+                    .unwrap();
+                assert!(
+                    lost <= *most,
+                    "{lost} pages lost at delay point {k}, more than a list's {most}"
+                );
             }
         }
     }

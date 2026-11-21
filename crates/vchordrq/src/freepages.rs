@@ -72,37 +72,46 @@ where
     run
 }
 
-/// Takes the runs of free pages that the free pages' page keeps: until they are put back, they are the caller's.
-pub fn take_runs<R: RelationRead + RelationWrite>(index: &R, freepages_first: u32) -> Vec<[u32; 2]>
+/// The runs of free pages that the free pages' page keeps.
+pub fn runs<R: RelationRead>(index: &R, freepages_first: u32) -> Vec<[u32; 2]>
 where
     R::Page: Page<Opaque = Opaque>,
 {
     let guard = index.read(freepages_first);
-    let kept = guard
-        .get(2)
-        .is_some_and(|x| !FreeRunsTuple::deserialize_ref(x).runs().is_empty());
-    drop(guard);
-    if !kept {
-        return Vec::new();
-    }
-    let mut guard = index.write(freepages_first, false);
-    let mut tuple = FreeRunsTuple::deserialize_mut(guard.get_mut(2).expect("data corruption"));
-    let runs = tuple.runs().to_vec();
-    tuple.set(&[]);
-    runs
+    let tuple = guard.get(2).map(FreeRunsTuple::deserialize_ref);
+    tuple.map_or_else(Vec::new, |x| x.runs().to_vec())
 }
 
-/// Keeps the first of `runs`, beside those kept already, as many as fit; returns how many.
+/// Takes page `id`, if a kept run begins with it.
+pub fn take<R: RelationWrite>(index: &R, freepages_first: u32, id: u32) -> Option<R::WriteGuard<'_>>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let mut freepages_guard = index.write(freepages_first, false);
+    let mut tuple = FreeRunsTuple::deserialize_mut(freepages_guard.get_mut(2)?);
+    let mut runs = tuple.runs().to_vec();
+    let i = runs.iter().position(|&[start, _]| start == id)?;
+    runs[i][0] += 1;
+    if runs[i][0] == runs[i][1] {
+        runs.remove(i);
+    }
+    tuple.set(&runs);
+    let guard = index.write(id, false);
+    drop(freepages_guard); // write log of freespaces_guard
+    Some(guard)
+}
+
+/// Keeps `runs` with those kept already, joined where they meet, the longest that fit; returns the others.
 pub fn put_runs<R: RelationRead + RelationWrite>(
     index: &R,
     freepages_first: u32,
     runs: &[[u32; 2]],
-) -> usize
+) -> Vec<[u32; 2]>
 where
     R::Page: Page<Opaque = Opaque>,
 {
     if runs.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let mut guard = index.write(freepages_first, false);
     if guard.get(2).is_none() {
@@ -110,7 +119,16 @@ where
         assert_eq!(guard.alloc(&bytes), Some(2), "data corruption");
     }
     let mut tuple = FreeRunsTuple::deserialize_mut(guard.get_mut(2).expect("data corruption"));
-    let kept = tuple.runs().len();
-    let all = [tuple.runs(), runs].concat();
-    tuple.set(&all) - kept
+    let mut all = [tuple.runs(), runs].concat();
+    all.sort_unstable();
+    let mut joined = Vec::<[u32; 2]>::new();
+    for [start, end] in all {
+        match joined.last_mut() {
+            Some(run) if run[1] == start => run[1] = end,
+            _ => joined.push([start, end]),
+        }
+    }
+    joined.sort_by_key(|&[start, end]| std::cmp::Reverse(end - start));
+    let kept = tuple.set(&joined);
+    joined.split_off(kept)
 }
