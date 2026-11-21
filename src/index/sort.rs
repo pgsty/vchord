@@ -11,6 +11,9 @@ use pgrx::pg_sys::{Datum, SortCoordinateData, Tuplesortstate, varlena};
 /// Rows sorted by their bytes, through PostgreSQL's tuplesort of `bytea`.
 pub struct Sort {
     state: *mut Tuplesortstate,
+    /// The row being put, after its header; the sort copies it.
+    row: *mut varlena,
+    capacity: usize,
     /// The row last taken, which this owns before PostgreSQL 16.
     #[cfg(feature = "pg15")]
     last: *mut varlena,
@@ -40,15 +43,32 @@ impl Sort {
         };
         Self {
             state,
+            row: std::ptr::null_mut(),
+            capacity: 0,
             #[cfg(feature = "pg15")]
             last: std::ptr::null_mut(),
         }
     }
     pub fn put(&mut self, bytes: &[u8]) {
-        let datum = pgrx::rust_byte_slice_to_bytea(bytes).into_pg();
+        let size = size_of::<u32>() + bytes.len();
         unsafe {
-            pgrx::pg_sys::tuplesort_putdatum(self.state, Datum::from(datum), false);
-            pgrx::pg_sys::pfree(datum.cast());
+            if self.capacity < size {
+                self.row = match self.row.is_null() {
+                    true => pgrx::pg_sys::palloc(size),
+                    false => pgrx::pg_sys::repalloc(self.row.cast(), size),
+                }
+                .cast();
+                self.capacity = size;
+            }
+            // the header of an uncompressed value, as SET_VARSIZE_4B writes it
+            let header = match cfg!(target_endian = "little") {
+                true => (size as u32) << 2,
+                false => size as u32 & 0x3fff_ffff,
+            };
+            self.row.cast::<u32>().write(header);
+            let data = self.row.cast::<u8>().add(size_of::<u32>());
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+            pgrx::pg_sys::tuplesort_putdatum(self.state, Datum::from(self.row), false);
         }
     }
     pub fn perform(&mut self) {
