@@ -213,6 +213,8 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
     let mut aligned = Vec::<u64>::new();
     let mut row = rows.next();
     for first in firsts {
+        // Between lists nothing is locked (#28).
+        index::interrupt::check();
         let (mut list, mut pending, mut tuples) = (None, Rows::new(dim as _), 0_u64);
         while let Some(bytes) = row
             && bytes[..4] == first.to_be_bytes()
@@ -248,7 +250,7 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
         }
         let mut list = list.unwrap_or_else(|| ListWriter::create(index, &keys));
         pending.flush(&keys, |branch, columns| _ = list.push(branch, columns));
-        let written = list.finish(|| ());
+        let written = list.finish(index::interrupt::check);
         let mut jump_guard = index.write(first, false);
         let mut jump_tuple =
             JumpTuple::deserialize_mut(jump_guard.get_mut(1).expect("data corruption"));
