@@ -8,9 +8,10 @@
 
 use crate::closure_lifetime_binder::id_0;
 use crate::linked_vec::LinkedVec;
+use crate::list::appendable_tuple;
 use crate::operator::*;
 use crate::tuples::*;
-use crate::{Opaque, centroids, tape, vectors};
+use crate::{Branch, Opaque, centroids, tape, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use index::bump::Bump;
@@ -71,49 +72,43 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
 ) where
     R::Page: Page<Opaque = Opaque>,
 {
-    let (first, (code, delta)) = assign::<R, O>(index, vector, bump, prefetch_h1_vectors);
-
-    let meta_guard = index.read(0);
-    let meta_bytes = meta_guard.get(1).expect("data corruption");
-    let freepages_first = MetaTuple::deserialize_ref(meta_bytes).freepages_first();
-    drop(meta_guard);
-
-    let jump_guard = index.read(first);
-    let jump_bytes = jump_guard.get(1).expect("data corruption");
-    let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
-
+    let assigned = assign::<R, O>(index, vector, bump, prefetch_h1_vectors);
+    let (code, delta) = assigned.code;
     let (prefetch, head) = key;
-    let serialized = AppendableTuple::serialize(&AppendableTuple {
-        metadata: [
-            code.0.dis_u_2,
-            code.0.factor_cnt,
-            code.0.factor_ip,
-            code.0.factor_err,
-        ],
+    let branch = Branch {
+        code,
         delta,
-        payload: Some(payload),
         prefetch,
         head,
-        elements: rabitq::bit::binary::pack_code(&code.1),
-        columns: columns.to_vec(),
-    });
-
+        norm: 0.0,
+        extra: payload,
+    };
+    let serialized = AppendableTuple::serialize(&appendable_tuple(branch, columns));
     tape::append(
         index,
-        jump_tuple.appendable_first(),
+        assigned.appendable_first,
         &serialized,
         false,
-        Some(freepages_first),
+        Some(assigned.freepages_first),
     );
 }
 
-/// The list that `vector` goes to, as its jump page, and the vector's code there.
+/// The list a vector goes to and its code there, with the tapes an insert appends it to.
+pub struct Assigned {
+    /// The list's jump page.
+    pub first: u32,
+    pub appendable_first: u32,
+    pub freepages_first: u32,
+    pub code: (rabitq::bit::Code, f32),
+}
+
+/// The list that `vector` goes to and the vector's code there.
 pub fn assign<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     bump: &'b impl Bump,
     mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-) -> (u32, (rabitq::bit::Code, f32))
+) -> Assigned
 where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -123,6 +118,7 @@ where
     let dim = meta_tuple.dim();
     let is_residual = meta_tuple.is_residual();
     let height_of_root = meta_tuple.height_of_root();
+    let freepages_first = meta_tuple.freepages_first();
     assert_eq!(dim, vector.dim(), "unmatched dimensions");
     let epsilon = 1.9;
 
@@ -229,5 +225,10 @@ where
         }),
     );
 
-    (first, code)
+    Assigned {
+        first,
+        appendable_first: jump_tuple.appendable_first(),
+        freepages_first,
+        code,
+    }
 }

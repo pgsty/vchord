@@ -258,7 +258,7 @@ where
 
     let mut words = Vec::new();
     for first in state {
-        // lists with nothing to compact are left alone: VACUUM used to rewrite and WAL-log every list (#24)
+        // lists with nothing to compact are left alone (#24)
         if let Some(tuples) = inspect_unchanged::<R>(index, first) {
             number_of_tuples += tuples;
             check();

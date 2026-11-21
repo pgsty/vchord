@@ -358,7 +358,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             };
             let mut sort = Sort::new(memory, Some(coordinate));
             sort.perform();
-            write_lists(index_relation, opfamily, sort);
+            write_lists(index_relation, opfamily, sort, memory);
             ((*shared).heap_tuples, (*shared).index_tuples as f64)
         }
     } else {
@@ -366,24 +366,22 @@ pub unsafe extern "C-unwind" fn ambuild(
         let mut sort = unsafe { Sort::new(memory, None) };
         let mut indtuples = 0;
         let (heap_tuples, index_tuples) = unsafe {
-            scan(
-                index_relation,
+            let traverser = HeapTraverser::new(
                 heap_relation,
+                index_relation,
                 index_info,
                 std::ptr::null_mut(),
-                &cached,
-                FilterKeys::new(index_relation, &keys),
-                &mut sort,
-                || {
-                    indtuples += 1;
-                    reporter.tuples_done(indtuples);
-                },
-            )
+            );
+            let keys = FilterKeys::new(index_relation, &keys);
+            scan(index_relation, &traverser, &cached, keys, &mut sort, || {
+                indtuples += 1;
+                reporter.tuples_done(indtuples);
+            })
         };
         reporter.tuples_total(indtuples);
         reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
         sort.perform();
-        unsafe { write_lists(index_relation, opfamily, sort) };
+        unsafe { write_lists(index_relation, opfamily, sort, memory) };
         (heap_tuples, index_tuples as f64)
     };
     let mut result = unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0() };
@@ -804,10 +802,16 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
     }
 }
 
-/// Writes the lists from the sorted rows, extending the index by a batch of pages at a time.
-unsafe fn write_lists(index_relation: pgrx::pg_sys::Relation, opfamily: Opfamily, sort: Sort) {
+/// Writes the lists from the sorted rows, extending the index by a batch of pages at a time; `memory` in kilobytes.
+unsafe fn write_lists(
+    index_relation: pgrx::pg_sys::Relation,
+    opfamily: Opfamily,
+    sort: Sort,
+    memory: i32,
+) {
     let index = unsafe { BufferedPostgresRelation::new(index_relation) };
-    crate::index::vchordrq::dispatch::write(opfamily, &index, sort);
+    let memory = memory as usize * 1024;
+    crate::index::vchordrq::dispatch::write(opfamily, &index, sort, memory);
     while index.release() {
         vchordrq::consume(&index);
     }
@@ -830,13 +834,21 @@ unsafe fn participate(
     };
     let mut sort = unsafe { Sort::new(memory, Some(coordinate)) };
     let (heap_tuples, index_tuples) = unsafe {
+        let tablescan = pgrx::pg_sys::table_beginscan_parallel(
+            heap_relation,
+            shm.tablescandesc,
+            #[cfg(feature = "pg19")]
+            {
+                pgrx::pg_sys::ScanOptions::SO_NONE as _
+            },
+        );
+        let traverser = HeapTraverser::new(heap_relation, index_relation, index_info, tablescan);
+        let keys = FilterKeys::of_index(index_relation);
         scan(
             index_relation,
-            heap_relation,
-            index_info,
-            shm.tablescandesc,
+            &traverser,
             shm.cached(),
-            FilterKeys::of_index(index_relation),
+            keys,
             &mut sort,
             || {
                 pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
@@ -859,12 +871,10 @@ unsafe fn participate(
     }
 }
 
-/// Routes, encodes and sorts the table's rows, or with `tablescandesc` this participant's part of them.
+/// Routes, encodes and sorts the rows that `traverser` gives, reading the pages pinned in `cached` from there.
 unsafe fn scan(
     index_relation: pgrx::pg_sys::Relation,
-    heap_relation: pgrx::pg_sys::Relation,
-    index_info: *mut pgrx::pg_sys::IndexInfo,
-    tablescandesc: *mut pgrx::pg_sys::ParallelTableScanDescData,
+    traverser: &HeapTraverser,
     cached: &[u8],
     keys: FilterKeys<'_>,
     sort: &mut Sort,
@@ -872,82 +882,56 @@ unsafe fn scan(
 ) -> (f64, u64) {
     use vchordrq_cached::VchordrqCachedReader;
 
-    let scan = if tablescandesc.is_null() {
-        std::ptr::null_mut()
-    } else {
-        unsafe {
-            pgrx::pg_sys::table_beginscan_parallel(
-                heap_relation,
-                tablescandesc,
-                #[cfg(feature = "pg19")]
-                {
-                    pgrx::pg_sys::ScanOptions::SO_NONE as _
-                },
-            )
-        }
-    };
     let opfamily = unsafe { opfamily(index_relation) };
-    let traverser = unsafe { HeapTraverser::new(heap_relation, index_relation, index_info, scan) };
     let index = unsafe { PostgresRelation::new(index_relation) };
-    let encoder = Encoder {
-        traverser: &traverser,
-        opfamily,
-        keys: &keys,
-        sort,
-        progress,
-    };
     match VchordrqCachedReader::deserialize_ref(cached) {
-        VchordrqCachedReader::_0(_) => encoder.scan(&index),
-        VchordrqCachedReader::_1(cache) => encoder.scan(&CachingRelation {
-            cache,
-            relation: &index,
-        }),
+        VchordrqCachedReader::_0(_) => encode(&index, opfamily, traverser, &keys, sort, progress),
+        VchordrqCachedReader::_1(cache) => {
+            let index = CachingRelation {
+                cache,
+                relation: &index,
+            };
+            encode(&index, opfamily, traverser, &keys, sort, progress)
+        }
     }
 }
 
-/// What a scan routes, encodes and sorts its rows with.
-struct Encoder<'a, P> {
-    traverser: &'a HeapTraverser,
+fn encode<R>(
+    index: &R,
     opfamily: Opfamily,
-    keys: &'a FilterKeys<'a>,
-    sort: &'a mut Sort,
-    progress: P,
-}
-
-impl<P: FnMut()> Encoder<'_, P> {
-    fn scan<R>(self, index: &R) -> (f64, u64)
-    where
-        R: RelationRead,
-        R::Page: Page<Opaque = vchordrq::Opaque>,
-    {
-        let Self {
-            traverser,
-            opfamily,
-            keys,
-            sort,
-            mut progress,
-        } = self;
-        let mut index_tuples = 0_u64;
-        let heap_tuples =
-            traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
-                let ctid = tuple.id();
-                let (values, is_nulls) = tuple.build();
-                let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
-                let columns = unsafe { keys.row(values, is_nulls) };
-                let store = value
-                    .and_then(|x| unsafe { opfamily.store(x) })
-                    .unwrap_or_default();
-                for (vector, extra) in store {
-                    let payload = kv_to_pointer((ctid_to_key(ctid), extra));
-                    let bump = bumpalo::Bump::new();
-                    let dispatch = crate::index::vchordrq::dispatch::encode;
-                    sort.put(&dispatch(opfamily, index, payload, &columns, vector, &bump));
-                    index_tuples += 1;
-                }
-                progress();
-            });
-        (heap_tuples, index_tuples)
-    }
+    traverser: &HeapTraverser,
+    keys: &FilterKeys<'_>,
+    sort: &mut Sort,
+    mut progress: impl FnMut(),
+) -> (f64, u64)
+where
+    R: RelationRead,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
+{
+    let encoder = vchordrq::Encoder::new(index);
+    let (mut out, mut index_tuples) = (Vec::new(), 0_u64);
+    let heap_tuples = traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
+        let ctid = tuple.id();
+        let (values, is_nulls) = tuple.build();
+        let value = unsafe { (!is_nulls.add(0).read()).then_some(values.add(0).read()) };
+        let columns = unsafe { keys.row(values, is_nulls) };
+        let store = value
+            .and_then(|x| unsafe { opfamily.store(x) })
+            .unwrap_or_default();
+        for (vector, extra) in store {
+            let payload = kv_to_pointer((ctid_to_key(ctid), extra));
+            let bump = bumpalo::Bump::new();
+            out.clear();
+            let dispatch = crate::index::vchordrq::dispatch::encode;
+            dispatch(
+                opfamily, &encoder, payload, &columns, vector, &bump, &mut out,
+            );
+            sort.put(&out);
+            index_tuples += 1;
+        }
+        progress();
+    });
+    (heap_tuples, index_tuples)
 }
 
 #[pgrx::pg_guard]

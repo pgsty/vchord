@@ -21,6 +21,14 @@ pub fn firsts<R: RelationRead>(index: &R, check: impl Fn()) -> Vec<u32>
 where
     R::Page: Page<Opaque = Opaque>,
 {
+    walk(index, check, |_| ())
+}
+
+/// The lists' jump pages, as `firsts`; `page` sees each page of the tree's tapes, as it is read.
+pub fn walk<R: RelationRead>(index: &R, check: impl Fn(), mut page: impl FnMut(u32)) -> Vec<u32>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
     let meta_guard = index.read(0);
     let meta_tuple = MetaTuple::deserialize_ref(meta_guard.get(1).expect("data corruption"));
     let height_of_root = meta_tuple.height_of_root();
@@ -30,7 +38,7 @@ where
         let mut results = Vec::new();
         for first in state {
             tape::read_h1_tape::<R, _, _>(
-                by_next(index, first),
+                by_next(index, first).inspect(|guard| page(guard.id())),
                 || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                 |(), _, _, first, _| results.push(first),
             );
@@ -140,11 +148,12 @@ pub fn appendable_tuple(branch: Branch<NonZero<u64>>, columns: &[u8]) -> Appenda
 
 /// A list's row, but for its signs, pages and columns.
 #[derive(Clone, Copy)]
-struct Fixed {
-    metadata: [f32; 4],
-    delta: f32,
-    head: u16,
-    payload: NonZero<u64>,
+pub struct Fixed {
+    pub metadata: [f32; 4],
+    pub delta: f32,
+    /// Where its vector's first part is, on the first of its pages.
+    pub head: u16,
+    pub payload: NonZero<u64>,
 }
 
 /// A list's rows, packed, to be written in the order of their keys.
@@ -179,50 +188,24 @@ impl Rows {
     }
     pub fn push(&mut self, row: tape::Row<'_, (rabitq::bit::Code, f32)>, keys: &Keys) {
         let ((m, signs), delta) = row.value;
-        let metadata = [m.dis_u_2, m.factor_cnt, m.factor_ip, m.factor_err];
+        let fixed = Fixed {
+            metadata: [m.dis_u_2, m.factor_cnt, m.factor_ip, m.factor_err],
+            delta,
+            head: row.head,
+            payload: row.payload,
+        };
         // a frozen code is padded to a multiple of 4 signs, with zeros
         let signs = rabitq::bit::binary::pack_code(&signs[..self.dim]);
-        self.fixed(
-            metadata,
-            delta,
-            (row.head, row.payload),
-            &signs,
-            row.prefetch,
-        );
+        self.fixed(fixed, &signs, row.prefetch);
         row.columns.extend(keys, &mut self.columns);
     }
-    /// A row as an appendable tuple stores it, with its vector at `prefetch` and `head`.
-    pub fn push_appendable(
-        &mut self,
-        tuple: AppendableTupleReader<'_>,
-        prefetch: &[u32],
-        head: u16,
-    ) {
-        let payload = tuple.payload().expect("a live row");
-        let fixed = (head, payload);
-        self.fixed(
-            tuple.metadata(),
-            tuple.delta(),
-            fixed,
-            tuple.elements(),
-            prefetch,
-        );
-        self.columns.extend_from_slice(tuple.columns());
+    /// A row from its parts, its signs and columns as an appendable tuple stores them.
+    pub fn push_parts(&mut self, fixed: Fixed, signs: &[u64], prefetch: &[u32], columns: &[u8]) {
+        self.fixed(fixed, signs, prefetch);
+        self.columns.extend_from_slice(columns);
     }
-    fn fixed(
-        &mut self,
-        metadata: [f32; 4],
-        delta: f32,
-        (head, payload): (u16, NonZero<u64>),
-        signs: &[u64],
-        prefetch: &[u32],
-    ) {
-        self.fixed.push(Fixed {
-            metadata,
-            delta,
-            head,
-            payload,
-        });
+    fn fixed(&mut self, fixed: Fixed, signs: &[u64], prefetch: &[u32]) {
+        self.fixed.push(fixed);
         self.signs.extend_from_slice(signs);
         self.prefetch.extend_from_slice(prefetch);
     }

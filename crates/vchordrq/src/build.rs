@@ -8,7 +8,7 @@
 
 use crate::insert::assign;
 use crate::keys::{Columns, Keys};
-use crate::list::{ListWriter, Rows, firsts};
+use crate::list::{Fixed, ListWriter, Rows, firsts};
 use crate::operator::{Operator, Vector};
 use crate::tape::TapeWriter;
 use crate::tape_writer::H1TapeWriter;
@@ -20,7 +20,7 @@ use index::prefetcher::PrefetcherHeapFamily;
 use index::relation::{Page, RelationRead, RelationWrite};
 use std::num::NonZero;
 use vector::{VectorBorrowed, VectorOwned};
-use zerocopy::IntoBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 pub fn build<R: RelationWrite, O: Operator>(
     vector_options: VectorOptions,
@@ -141,53 +141,98 @@ pub fn build<R: RelationWrite, O: Operator>(
     });
 }
 
-/// Rows as `encode` appends them, in the order of their bytes; each is valid until the next.
+/// Rows as `Encoder::encode` lays them out, in the order of their bytes; each is valid until the next.
 pub trait Sorted {
     fn next(&mut self) -> Option<&[u8]>;
 }
 
-/// A row as the build sorts it: by list, then by its keys, then by payload, as `write` lays rows out.
-pub fn encode<'b, R: RelationRead, O: Operator>(
+/// What a build encodes its rows with: the index's filter keys, and whether its vectors are in it.
+pub struct Encoder<'b, R> {
     index: &'b R,
-    payload: NonZero<u64>,
-    columns: &[u8],
-    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
-    projected: <O::Vector as VectorOwned>::Borrowed<'_>,
-    bump: &'b impl Bump,
-    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-) -> Vec<u8>
+    keys: Keys,
+    vectors: bool,
+}
+
+impl<'b, R: RelationRead> Encoder<'b, R>
 where
     R::Page: Page<Opaque = Opaque>,
 {
-    let (first, (code, delta)) = assign::<R, O>(index, projected, bump, prefetch_h1_vectors);
-    let meta_guard = index.read(0);
-    let meta_tuple = MetaTuple::deserialize_ref(meta_guard.get(1).expect("data corruption"));
-    let keys = Keys::of_meta(meta_tuple);
-    let rerank_in_heap = meta_tuple.rerank_in_heap();
-    drop(meta_guard);
-    let mut out = first.to_be_bytes().to_vec();
-    keys.sortable(Columns::row(columns), &mut out);
-    out.extend_from_slice(&payload.get().to_be_bytes());
-    let tuple = AppendableTuple::serialize(&AppendableTuple {
-        metadata: [
+    pub fn new(index: &'b R) -> Self {
+        let meta_guard = index.read(0);
+        let meta_tuple = MetaTuple::deserialize_ref(meta_guard.get(1).expect("data corruption"));
+        Self {
+            index,
+            keys: Keys::of_meta(meta_tuple),
+            vectors: !meta_tuple.rerank_in_heap(),
+        }
+    }
+    pub fn index(&self) -> &'b R {
+        self.index
+    }
+    /// Appends a row as the build sorts it: by list, then by its keys, then by payload, as `write` lays rows out;
+    /// then its code, its columns and its vector. `projected` routes it.
+    pub fn encode<'c, O: Operator>(
+        &'c self,
+        payload: NonZero<u64>,
+        columns: &[u8],
+        (vector, projected): (
+            <O::Vector as VectorOwned>::Borrowed<'_>,
+            <O::Vector as VectorOwned>::Borrowed<'_>,
+        ),
+        bump: &'c impl Bump,
+        prefetch_h1_vectors: impl PrefetcherHeapFamily<'c, R>,
+        out: &mut Vec<u8>,
+    ) {
+        let assigned = assign::<R, O>(self.index, projected, bump, prefetch_h1_vectors);
+        let (code, delta) = assigned.code;
+        out.extend_from_slice(&assigned.first.to_be_bytes());
+        self.keys.sortable(Columns::row(columns), out);
+        out.extend_from_slice(&payload.get().to_be_bytes());
+        let metadata = [
             code.0.dis_u_2,
             code.0.factor_cnt,
             code.0.factor_ip,
             code.0.factor_err,
-        ],
-        delta,
-        payload: Some(payload),
-        prefetch: Vec::new(),
-        head: 0,
-        elements: rabitq::bit::binary::pack_code(&code.1),
-        columns: columns.to_vec(),
-    });
-    out.extend_from_slice(&(tuple.len() as u32).to_ne_bytes());
-    out.extend_from_slice(&tuple);
-    if !rerank_in_heap {
-        vectors::encode::<O::Vector>(vector, &mut out);
+        ];
+        out.extend_from_slice(metadata.as_bytes());
+        out.extend_from_slice(delta.as_bytes());
+        out.extend_from_slice(rabitq::bit::binary::pack_code(&code.1).as_bytes());
+        out.extend_from_slice(columns);
+        if self.vectors {
+            vectors::encode::<O::Vector>(vector, out);
+        }
     }
-    out
+}
+
+/// A row's parts, as `Encoder::encode` lays them out, after its list.
+struct Parts<'a> {
+    fixed: Fixed,
+    signs: &'a [u8],
+    columns: &'a [u8],
+    vector: &'a [u8],
+}
+
+impl<'a> Parts<'a> {
+    fn of(row: &'a [u8], keys: &Keys, dim: u32) -> Self {
+        let (_, row) = row.split_at(size_of::<u32>() + keys.sortable_len());
+        let (payload, row) = row.split_first_chunk().expect("a row");
+        let (metadata, row) = row.split_at(size_of::<[f32; 4]>());
+        let (delta, row) = row.split_first_chunk().expect("a row");
+        let (signs, row) = row.split_at(dim.div_ceil(64) as usize * size_of::<u64>());
+        let (columns, vector) = row.split_at(keys.columns());
+        let fixed = Fixed {
+            metadata: FromBytes::read_from_bytes(metadata).expect("a row"),
+            delta: f32::from_ne_bytes(*delta),
+            head: 0,
+            payload: NonZero::new(u64::from_be_bytes(*payload)).expect("a row"),
+        };
+        Self {
+            fixed,
+            signs,
+            columns,
+            vector,
+        }
+    }
 }
 
 /// Writes every list from `rows`, each in one run of pages: its vectors, its frozen tape, its appendable tape, its directory.
@@ -206,11 +251,10 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
     let keys = Keys::of_meta(meta_tuple);
     let vectors_first = meta_tuple.vectors_first()[0];
     drop(meta_guard);
-    let prefix = size_of::<u32>() + keys.sortable_len() + size_of::<u64>();
     let mut firsts = firsts(index, || ());
     firsts.sort_unstable();
     let mut vectors = None::<TapeWriter<'_, R, VectorTuple<O::Vector>>>;
-    let mut aligned = Vec::<u64>::new();
+    let mut signs = Vec::<u64>::new();
     let mut row = rows.next();
     for first in firsts {
         // Between lists nothing is locked (#28).
@@ -219,29 +263,46 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
         while let Some(bytes) = row
             && bytes[..4] == first.to_be_bytes()
         {
-            let (len, rest) = bytes[prefix..].split_at(size_of::<u32>());
-            let (tuple, vector) = rest.split_at(u32::from_ne_bytes(len.try_into().unwrap()) as _);
-            aligned.clear();
-            aligned.resize(tuple.len().div_ceil(8), 0);
-            aligned.as_mut_bytes()[..tuple.len()].copy_from_slice(tuple);
-            let tuple = AppendableTuple::deserialize_ref(&aligned.as_bytes()[..tuple.len()]);
-            let (prefetch, head) = if rerank_in_heap {
-                (Vec::new(), 0)
+            let Parts {
+                mut fixed,
+                signs: bytes,
+                columns,
+                vector,
+            } = Parts::of(bytes, &keys, dim);
+            signs.clear();
+            signs.extend(bytes.as_chunks().0.iter().map(|&x| u64::from_ne_bytes(x)));
+            let mut moved = false;
+            let prefetch = if rerank_in_heap {
+                Vec::new()
             } else {
                 let tape = vectors.get_or_insert_with(|| TapeWriter::create(index, true));
                 // a list's vectors begin on a page of their own
                 if tuples == 0 {
                     tape.renew();
                 }
-                let payload = tuple.payload().expect("a live row");
+                let last = tape.last();
                 let vector = vectors::decode::<O::Vector>(dim, vector);
-                vectors::write::<O>(vector.as_borrowed(), payload, |x| tape.push(x))
+                let (prefetch, head) =
+                    vectors::write::<O>(vector.as_borrowed(), fixed.payload, |x| tape.push(x));
+                moved = tape.last() != last;
+                fixed.head = head;
+                prefetch
             };
-            pending.push_appendable(tuple, &prefetch, head);
+            pending.push_parts(fixed, &signs, &prefetch, columns);
             tuples += 1;
             if pending.bytes() > memory {
                 let list = list.get_or_insert_with(|| ListWriter::create(index, &keys));
-                pending.flush(&keys, |branch, columns| _ = list.push(branch, columns));
+                pending.flush(&keys, |branch, columns| moved |= list.push(branch, columns));
+            }
+            // interrupts are served where the pages being written are unlocked: as a tape moves on to a page (#28)
+            if moved || rerank_in_heap {
+                if let Some(tape) = vectors.as_mut() {
+                    tape.unlock();
+                }
+                if let Some(list) = list.as_mut() {
+                    list.unlock();
+                }
+                index::interrupt::check();
             }
             row = rows.next();
         }
@@ -249,7 +310,12 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
             tape.unlock();
         }
         let mut list = list.unwrap_or_else(|| ListWriter::create(index, &keys));
-        pending.flush(&keys, |branch, columns| _ = list.push(branch, columns));
+        pending.flush(&keys, |branch, columns| {
+            if list.push(branch, columns) {
+                list.unlock();
+                index::interrupt::check();
+            }
+        });
         let written = list.finish(index::interrupt::check);
         let mut jump_guard = index.write(first, false);
         let mut jump_tuple =
@@ -276,76 +342,245 @@ fn norm<V: Vector>(vector: V::Borrowed<'_>) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::closure_lifetime_binder::{id_0, id_1};
+    use crate::closure_lifetime_binder::id_1;
+    use crate::insert::{InsertChooser, insert, insert_vector};
     use crate::keys::{Summary, Width};
+    use crate::list::unpack_code;
+    use crate::maintain::{Pending, maintain};
     use crate::operator::Op;
     use crate::tape::{by_next, read_appendable_tape, read_directory_words, read_frozen_tape};
+    use crate::{RerankMethod, how};
     use index::relation::PageGuard;
     use index::test_support::{MakePlainPrefetcher, MemoryRelation};
-    use index_accessor::{FunctionalAccessor, L2S};
+    use index_accessor::{FunctionalAccessor, L2S, TryAccessor1};
+    use rabitq::packing::unpack;
+    use std::cell::Cell;
     use vector::vect::VectOwned;
 
     type M = MemoryRelation<Opaque>;
     type O = Op<VectOwned<f32>, L2S>;
+
+    thread_local! {
+        /// The relation a write is checked on, the rows it has taken, and the rows taken at each interrupt check.
+        static CHECKED: Cell<*const M> = const { Cell::new(std::ptr::null()) };
+        static TAKEN: Cell<usize> = const { Cell::new(0) };
+        static CHECKS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    #[allow(unsafe_code)]
+    fn check() {
+        let relation = CHECKED.get();
+        if !relation.is_null() {
+            // Safety: the relation outlives the write that checks it
+            let relation = unsafe { &*relation };
+            for id in 0..relation.pages() {
+                assert!(
+                    relation.page(id).try_borrow_mut().is_ok(),
+                    "page {id} locked at a check"
+                );
+            }
+            CHECKS.with(|x| x.borrow_mut().push(TAKEN.get()));
+        }
+    }
 
     struct Rows(std::vec::IntoIter<Vec<u8>>, Vec<u8>);
 
     impl Sorted for Rows {
         fn next(&mut self) -> Option<&[u8]> {
             self.1 = self.0.next()?;
+            TAKEN.set(TAKEN.get() + 1);
             Some(&self.1)
         }
     }
 
-    fn random(dim: usize) -> VectOwned<f32> {
-        VectOwned::new((0..dim).map(|_| rand::random::<f32>() - 0.5).collect())
+    struct First;
+
+    impl InsertChooser for First {
+        fn choose(&mut self, _: NonZero<usize>) -> usize {
+            0
+        }
     }
 
-    /// Per list: its vectors' pages, in row order, then its frozen, appendable and directory pages and its rows' payloads and keys.
-    fn lists(
-        relation: &M,
+    /// A vector's elements, read back part by part.
+    struct Elements(Vec<f32>);
+
+    impl TryAccessor1<f32, ()> for Elements {
+        type Output = Vec<f32>;
+        fn push(&mut self, input: &[f32]) -> Option<()> {
+            self.0.extend_from_slice(input);
+            Some(())
+        }
+        fn finish(self, _: ()) -> Option<Vec<f32>> {
+            Some(self.0)
+        }
+    }
+
+    /// An index of `lists` lists of `dim` dimensions, as `build` leaves it for `write`.
+    fn index(keys: &Keys, rerank_in_table: bool, dim: usize, lists: usize) -> M {
+        let relation = M::new([]);
+        let options = VchordrqIndexOptions {
+            rerank_in_table,
+            degree_of_parallelism: 2,
+            ..Default::default()
+        };
+        let centroids = (0..lists)
+            .map(|i| VectOwned::new((0..dim).map(|j| ((i * 7 + j) % 11) as f32 - 5.0).collect()))
+            .collect();
+        let mut structures = vec![Structure {
+            centroids,
+            children: vec![Vec::new(); lists],
+        }];
+        if lists > 1 {
+            structures.push(Structure {
+                centroids: vec![VectOwned::new(vec![0.0; dim])],
+                children: vec![(0..lists as u32).collect()],
+            });
+        }
+        let (v, d) = (VectorKind::Vecf32, DistanceKind::L2S);
+        let vector_options = VectorOptions {
+            dim: dim as _,
+            v,
+            d,
+        };
+        build::<_, O>(vector_options, options, keys, &relation, structures);
+        relation
+    }
+
+    /// Rows `payloads`: their columns hold a key of negatives and positives, NULL in every fifth row.
+    fn data(
+        payloads: std::ops::RangeInclusive<u64>,
+        dim: usize,
         keys: &Keys,
-    ) -> Vec<(Vec<u32>, Vec<u32>, Vec<u32>, Vec<u32>, Vec<(u64, u128)>)> {
-        let mut words = Vec::new();
+    ) -> Vec<(NonZero<u64>, Vec<u8>, VectOwned<f32>)> {
+        payloads
+            .map(|p| {
+                let elements = (0..dim)
+                    .map(|j| ((p * 2654435761 + j as u64 * 40503) % 1000) as f32 / 100.0 - 5.0);
+                let columns = if keys.is_empty() {
+                    Vec::new()
+                } else {
+                    let (key, null) = ((p as i64 % 7 - 3) as u64 ^ (1 << 63), (p % 5 == 0) as u32);
+                    [&key.to_le_bytes()[..], &null.to_le_bytes()[..]].concat()
+                };
+                (
+                    NonZero::new(p).unwrap(),
+                    columns,
+                    VectOwned::new(elements.collect()),
+                )
+            })
+            .collect()
+    }
+
+    /// The rows sorted as a build sorts them.
+    fn sorted(relation: &M, rows: &[(NonZero<u64>, Vec<u8>, VectOwned<f32>)]) -> Rows {
+        let encoder = Encoder::new(relation);
+        let mut sorted = rows
+            .iter()
+            .map(|(payload, columns, vector)| {
+                let (mut out, bump) = (Vec::new(), bumpalo::Bump::new());
+                let prefetch = MakePlainPrefetcher { index: relation };
+                let v = vector.as_borrowed();
+                encoder.encode::<O>(*payload, columns, (v, v), &bump, prefetch, &mut out);
+                out
+            })
+            .collect::<Vec<_>>();
+        sorted.sort_unstable();
+        Rows(sorted.into_iter(), Vec::new())
+    }
+
+    /// A row as a list holds it: payload, code, columns and, read back, its vector.
+    #[derive(Debug, PartialEq)]
+    struct Entry {
+        payload: u64,
+        code: ([u32; 4], u32, Vec<bool>),
+        columns: Vec<u8>,
+        vector: Option<Vec<f32>>,
+    }
+
+    /// A list: its pages in the order the search reads them, its directory, its vectors' pages and its rows.
+    struct List {
+        tape: Vec<u32>,
+        directory: Vec<u32>,
+        vectors: Vec<u32>,
+        rows: Vec<Entry>,
+    }
+
+    fn lists(relation: &M, keys: &Keys, dim: usize) -> Vec<List> {
+        let (mut words, rerank) = (Vec::new(), how(relation));
         let mut firsts = firsts(relation, || ());
         firsts.sort_unstable();
-        let accessor = || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _]));
+        let accessor = || {
+            FunctionalAccessor::new(
+                Vec::<[u8; 16]>::new(),
+                Vec::<[u8; 16]>::extend_from_slice,
+                id_1(
+                    |elements: Vec<_>, (metadata, delta): (&[[f32; 32]; 4], &[f32; 32])| {
+                        let unpacked = unpack(&elements);
+                        std::array::from_fn(|i| {
+                            let f = |&x| [x & 1 != 0, x & 2 != 0, x & 4 != 0, x & 8 != 0];
+                            let signs = unpacked[i].iter().flat_map(f).collect::<Vec<_>>();
+                            let m = [0, 1, 2, 3].map(|k| metadata[k][i]);
+                            ((rabitq::bit::CodeMetadata::from_array(m), signs), delta[i])
+                        })
+                    },
+                ),
+            )
+        };
         firsts
             .into_iter()
             .map(|first| {
                 let jump_guard = relation.read(first);
                 let jump_tuple = JumpTuple::deserialize_ref(jump_guard.get(1).unwrap());
-                let directory = by_next(relation, jump_tuple.directory_first()).map(|g| g.id());
-                let pages = read_directory_words::<M>(
-                    by_next(relation, jump_tuple.directory_first()),
-                    &mut words,
-                    false,
-                );
+                let directory = by_next(relation, jump_tuple.directory_first());
+                let pages = read_directory_words::<M>(directory, &mut words, false);
                 let (mut vectors, mut rows) = (Vec::new(), Vec::new());
-                let mut row = |row: crate::tape::Row<'_, ()>| {
+                let mut row = |row: crate::tape::Row<'_, (rabitq::bit::Code, f32)>| {
+                    let ((m, signs), delta) = row.value;
+                    let mut columns = Vec::new();
+                    row.columns.extend(keys, &mut columns);
                     vectors.extend_from_slice(row.prefetch);
-                    let key = keys.as_slice().first().map_or(0, |k| k.get(row.columns));
-                    rows.push((row.payload.get(), key));
+                    let vector = matches!(rerank, RerankMethod::Index).then(|| {
+                        let pages = row.prefetch.iter().map(|&id| relation.read(id));
+                        let read = vectors::read::<M, O, _>(
+                            pages,
+                            row.head,
+                            row.payload,
+                            Elements(Vec::new()),
+                        );
+                        read.expect("a vector that is not found")
+                    });
+                    rows.push(Entry {
+                        payload: row.payload.get(),
+                        code: (
+                            m.into_array().map(f32::to_bits),
+                            delta.to_bits(),
+                            signs[..dim].to_vec(),
+                        ),
+                        columns,
+                        vector,
+                    });
                 };
-                read_frozen_tape::<M, _, _>(
-                    words[..pages].iter().map(|&id| relation.read(id)),
-                    crate::tape::All,
-                    accessor,
-                    (),
-                    &mut row,
-                );
+                let frozen = words[..pages].iter().map(|&id| relation.read(id));
+                read_frozen_tape::<M, _, _>(frozen, crate::tape::All, accessor, (), &mut row);
                 let appendable = by_next(relation, jump_tuple.appendable_first());
-                read_appendable_tape::<M, _>(appendable, 0, |_, _, _| (), (), &mut row);
+                let access = |metadata, elements: &[u64], delta| {
+                    (unpack_code(metadata, elements, dim), delta)
+                };
+                read_appendable_tape::<M, _>(appendable, 0, access, (), &mut row);
                 let appendable = by_next(relation, jump_tuple.appendable_first()).map(|g| g.id());
-                (
+                let directory = by_next(relation, jump_tuple.directory_first()).map(|g| g.id());
+                List {
+                    tape: words[..pages].iter().copied().chain(appendable).collect(),
+                    directory: directory.collect(),
                     vectors,
-                    words[..pages].to_vec(),
-                    appendable.collect(),
-                    directory.collect(),
                     rows,
-                )
+                }
             })
             .collect()
+    }
+
+    fn runs(pages: &[u32]) -> usize {
+        1 + pages.windows(2).filter(|x| x[1] != x[0] + 1).count()
     }
 
     #[test]
@@ -359,66 +594,167 @@ mod tests {
             (keyed, false, 100, 0, 3),
             (Keys::new([]), true, 64, 5, 1),
         ] {
-            let relation = M::new([]);
-            let (v, d) = (VectorKind::Vecf32, DistanceKind::L2S);
-            let options = VchordrqIndexOptions {
-                rerank_in_table,
-                degree_of_parallelism: 4,
-                ..Default::default()
-            };
-            let centroids = (0..lists_n).map(|_| random(dim)).collect::<Vec<_>>();
-            let mut structures = vec![Structure {
-                centroids,
-                children: vec![Vec::new(); lists_n],
-            }];
-            if lists_n > 1 {
-                structures.push(Structure {
-                    centroids: vec![VectOwned::new(vec![0.0; dim])],
-                    children: vec![(0..lists_n as u32).collect()],
-                });
-            }
-            let vector_options = VectorOptions {
-                dim: dim as _,
-                v,
-                d,
-            };
-            build::<_, O>(vector_options, options, &keys, &relation, structures);
-            let mut sorted = (1..=n as u64)
-                .map(|payload| {
-                    let vector = random(dim);
-                    let columns = if keys.is_empty() {
-                        Vec::new()
-                    } else {
-                        [&(payload % 13).to_le_bytes()[..], &[0; 4]].concat()
-                    };
-                    let bump = bumpalo::Bump::new();
-                    let prefetch = MakePlainPrefetcher { index: &relation };
-                    let payload = NonZero::new(payload).unwrap();
-                    let v = vector.as_borrowed();
-                    encode::<_, O>(&relation, payload, &columns, v, v, &bump, prefetch)
-                })
-                .collect::<Vec<_>>();
-            sorted.sort_unstable();
-            write::<_, O>(&relation, Rows(sorted.into_iter(), Vec::new()), 1 << 30);
+            let relation = index(&keys, rerank_in_table, dim, lists_n);
+            write::<_, O>(
+                &relation,
+                sorted(&relation, &data(1..=n, dim, &keys)),
+                1 << 30,
+            );
             let mut payloads = Vec::new();
-            for (vectors, frozen, appendable, directory, rows) in lists(&relation, &keys) {
-                let run = [&frozen[..], &appendable[..1], &directory[..]].concat();
-                assert!(run.windows(2).all(|x| x[1] == x[0] + 1), "{run:?}");
+            for list in lists(&relation, &keys, dim) {
+                let tape = [&list.tape[..], &list.directory[..]].concat();
+                assert_eq!(runs(&tape), 1, "{tape:?}");
+                let order = |e: &Entry| {
+                    let mut out = Vec::new();
+                    keys.sortable(Columns::row(&e.columns), &mut out);
+                    out
+                };
                 assert!(
-                    rows.windows(2).all(|x| x[0].1 <= x[1].1),
+                    list.rows.windows(2).all(|x| order(&x[0]) <= order(&x[1])),
                     "rows out of key order"
                 );
-                if !rerank_in_table && !vectors.is_empty() {
-                    let mut pages = vectors.clone();
+                if !list.vectors.is_empty() {
+                    let mut pages = list.vectors.clone();
                     pages.sort_unstable();
                     pages.dedup();
-                    assert!(pages.windows(2).all(|x| x[1] == x[0] + 1), "{pages:?}");
-                    assert_eq!(pages.last().unwrap() + 1, frozen[0]);
+                    assert_eq!(runs(&pages), 1, "{pages:?}");
+                    assert_eq!(pages.last().unwrap() + 1, list.tape[0]);
                 }
-                payloads.extend(rows.iter().map(|x| x.0));
+                payloads.extend(list.rows.iter().map(|x| x.payload));
             }
             payloads.sort_unstable();
-            assert_eq!(payloads, (1..=n as u64).collect::<Vec<_>>());
+            assert_eq!(payloads, (1..=n).collect::<Vec<_>>());
+        }
+    }
+
+    /// The build writes what inserts and a maintain would; inserts and a VACUUM later find, keep and remove its vectors.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn writes_what_inserts_and_maintain_write() {
+        let keyed = Keys::new([(Width::W8, false, Some(Summary::Bounds))]);
+        // a two-level tree, two-part vectors, a list larger than `memory`, `rerank_in_table`, one list
+        for (keys, rerank_in_table, dim, n, lists_n, memory) in [
+            (Keys::new([]), false, 100, 3000, 7, 1 << 30),
+            (keyed, false, 3000, 300, 3, 1 << 30),
+            (keyed, false, 100, 3000, 3, 1 << 12),
+            (keyed, true, 100, 2000, 5, 1 << 12),
+            (keyed, false, 100, 1000, 1, 1 << 30),
+        ] {
+            let rows = data(1..=n, dim, &keys);
+            let built = index(&keys, rerank_in_table, dim, lists_n);
+            write::<_, O>(&built, sorted(&built, &rows), memory);
+            let inserted = index(&keys, rerank_in_table, dim, lists_n);
+            write::<_, O>(&inserted, Rows(Vec::new().into_iter(), Vec::new()), memory);
+            let add = |relation: &M, rows: &[(NonZero<u64>, Vec<u8>, VectOwned<f32>)]| {
+                for (payload, columns, vector) in rows {
+                    let key =
+                        insert_vector::<_, O>(relation, *payload, vector.as_borrowed(), &mut First);
+                    let (bump, prefetch) = (
+                        bumpalo::Bump::new(),
+                        MakePlainPrefetcher { index: relation },
+                    );
+                    insert::<_, O>(
+                        relation,
+                        *payload,
+                        columns,
+                        vector.as_borrowed(),
+                        key,
+                        &bump,
+                        prefetch,
+                    );
+                }
+            };
+            add(&inserted, &rows);
+            let prefetch = MakePlainPrefetcher { index: &inserted };
+            maintain::<_, O>(&inserted, prefetch, memory, &Pending::default(), || ());
+            let by_payload = |relation: &M| {
+                let mut lists = lists(relation, &keys, dim);
+                lists
+                    .iter_mut()
+                    .for_each(|x| x.rows.sort_by_key(|e| e.payload));
+                lists.into_iter().map(|x| x.rows).collect::<Vec<_>>()
+            };
+            let (a, b) = (by_payload(&built), by_payload(&inserted));
+            for (x, y) in std::iter::zip(&a, &b) {
+                let strip = |e: &Entry| (e.payload, e.code.clone(), e.columns.clone());
+                assert_eq!(
+                    x.iter().map(strip).collect::<Vec<_>>(),
+                    y.iter().map(strip).collect::<Vec<_>>()
+                );
+            }
+            if !rerank_in_table {
+                for e in a.iter().flatten() {
+                    assert_eq!(
+                        e.vector.as_deref(),
+                        Some(rows[e.payload as usize - 1].2.slice())
+                    );
+                }
+            }
+            add(&built, &data(n + 1..=n + 50, dim, &keys));
+            let gone = |payload: NonZero<u64>| payload.get() % 3 == 0;
+            crate::bulkdelete::<_, O>(&built, || (), gone);
+            crate::bulkdelete_vectors::<_, O>(&built, || (), gone);
+            let prefetch = MakePlainPrefetcher { index: &built };
+            maintain::<_, O>(&built, prefetch, memory, &Pending::default(), || ());
+            let mut left = by_payload(&built).into_iter().flatten().collect::<Vec<_>>();
+            left.sort_by_key(|e| e.payload);
+            let kept = (1..=n + 50).filter(|&p| p % 3 != 0).collect::<Vec<_>>();
+            assert_eq!(left.iter().map(|e| e.payload).collect::<Vec<_>>(), kept);
+            if !rerank_in_table {
+                let all = data(1..=n + 50, dim, &keys);
+                for e in &left {
+                    assert_eq!(
+                        e.vector.as_deref(),
+                        Some(all[e.payload as usize - 1].2.slice())
+                    );
+                }
+                let meta_guard = built.read(0);
+                let tapes = MetaTuple::deserialize_ref(meta_guard.get(1).unwrap())
+                    .vectors_first()
+                    .to_vec();
+                drop(meta_guard);
+                let mut stored = Vec::new();
+                for guard in tapes.into_iter().flat_map(|first| by_next(&built, first)) {
+                    for i in 1..=guard.len() {
+                        if let Some(bytes) = guard.get(i) {
+                            let tuple = VectorTuple::<VectOwned<f32>>::deserialize_ref(bytes);
+                            if let (Some(p), Ok(())) = (tuple.payload(), tuple.metadata_or_head()) {
+                                stored.push(p.get());
+                            }
+                        }
+                    }
+                }
+                stored.sort_unstable();
+                assert_eq!(stored, kept, "the vectors that the vector tapes reach");
+            }
+        }
+    }
+
+    /// A write serves interrupts where no page is locked, at most a page's worth of rows apart.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn serves_interrupts_while_it_writes() {
+        index::interrupt::set(check);
+        let keys = Keys::new([]);
+        for rerank_in_table in [false, true] {
+            let (dim, n) = (100, 3000);
+            let relation = index(&keys, rerank_in_table, dim, 1);
+            let rows = sorted(&relation, &data(1..=n, dim, &keys));
+            CHECKED.set(&relation);
+            TAKEN.set(0);
+            CHECKS.with(|x| x.borrow_mut().clear());
+            write::<_, O>(&relation, rows, 1 << 30);
+            CHECKED.set(std::ptr::null());
+            let checks = CHECKS.with(|x| x.take());
+            let apart = std::iter::once(0)
+                .chain(checks.iter().copied())
+                .collect::<Vec<_>>();
+            let most = apart
+                .windows(2)
+                .map(|x| x[1] - x[0])
+                .max()
+                .unwrap_or(n as usize);
+            assert!(most <= 32, "{most} rows between checks, of {n}");
         }
     }
 }
