@@ -6,13 +6,41 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+use crate::closure_lifetime_binder::{id_0, id_1};
 use crate::keys::{Columns, Keys};
 use crate::tape::{Layout, TapeWriter, by_next, paced};
 use crate::tape_writer::{DirectoryTapeWriter, FrozenTapeWriter};
 use crate::tuples::*;
 use crate::{Branch, Opaque, tape};
 use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
+use index_accessor::FunctionalAccessor;
 use std::num::NonZero;
+
+/// The lists' jump pages, in the tree's order; `check` runs after each tape of the tree, where no page is locked.
+pub fn firsts<R: RelationRead>(index: &R, check: impl Fn()) -> Vec<u32>
+where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let meta_guard = index.read(0);
+    let meta_tuple = MetaTuple::deserialize_ref(meta_guard.get(1).expect("data corruption"));
+    let height_of_root = meta_tuple.height_of_root();
+    let mut state = vec![meta_tuple.first()];
+    drop(meta_guard);
+    for _ in (1..height_of_root).rev() {
+        let mut results = Vec::new();
+        for first in state {
+            tape::read_h1_tape::<R, _, _>(
+                by_next(index, first),
+                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
+                |(), _, _, first, _| results.push(first),
+            );
+            // `check` may sleep or serve interrupts, which LWLocks hold off: never under a buffer lock (#30)
+            check();
+        }
+        state = results;
+    }
+    state
+}
 
 /// Writes a list's rows, in the order given, as its frozen tape, then its appendable tape, then its directory.
 pub struct ListWriter<'a, R: RelationWrite + 'a> {

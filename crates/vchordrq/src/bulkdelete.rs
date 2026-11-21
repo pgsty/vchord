@@ -6,13 +6,11 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-use crate::closure_lifetime_binder::{id_0, id_1};
 use crate::operator::Operator;
 use crate::tape::by_next;
 use crate::tuples::*;
 use crate::{Opaque, tape};
 use index::relation::{Page, RelationRead, RelationWrite};
-use index_accessor::FunctionalAccessor;
 use std::num::NonZero;
 
 /// Removes the index tuples whose payload `callback` selects and returns how
@@ -26,33 +24,7 @@ where
     R::Page: Page<Opaque = Opaque>,
 {
     let mut removed = 0_u64;
-    let meta_guard = index.read(0);
-    let meta_bytes = meta_guard.get(1).expect("data corruption");
-    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
-    let height_of_root = meta_tuple.height_of_root();
-
-    type State = Vec<u32>;
-    let mut state: State = vec![meta_tuple.first()];
-
-    drop(meta_guard);
-
-    let step = |state: State| {
-        let mut results = Vec::new();
-        for first in state {
-            tape::read_h1_tape::<R, _, _>(
-                by_next(index, first),
-                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
-                |(), _, _, first, _| results.push(first),
-            );
-            // `check` sleeps for cost-based delay and checks interrupts, which
-            // LWLocks hold off: call it only where no buffer lock is held (#30).
-            check();
-        }
-        results
-    };
-    for _ in (1..height_of_root).rev() {
-        state = step(state);
-    }
+    let state = crate::list::firsts(index, &check);
     let mut words = Vec::new();
     for first in state {
         // The list's jump page stays share-locked while it is processed.

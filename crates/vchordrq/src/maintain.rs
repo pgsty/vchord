@@ -8,7 +8,7 @@
 
 use crate::closure_lifetime_binder::{id_0, id_1, id_2, id_3};
 use crate::keys::Keys;
-use crate::list::{ListWriter, Rows, appendable_tuple, unpack_code};
+use crate::list::{ListWriter, Rows, appendable_tuple, firsts, unpack_code};
 use crate::operator::Operator;
 use crate::tape::paced;
 use crate::tuples::*;
@@ -93,12 +93,8 @@ where
     let meta_bytes = meta_guard.get(1).expect("data corruption");
     let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
     let dim = meta_tuple.dim();
-    let height_of_root = meta_tuple.height_of_root();
     let freepages_first = meta_tuple.freepages_first();
     let keys = Keys::of_meta(meta_tuple);
-
-    type State = Vec<u32>;
-    let mut state: State = vec![meta_tuple.first()];
 
     drop(meta_guard);
 
@@ -112,23 +108,7 @@ where
         number_of_freshly_allocated_pages: 0,
     });
 
-    let step = |state: State| {
-        let mut results = Vec::new();
-        for first in state {
-            tape::read_h1_tape::<R, _, _>(
-                tape::by_next(index, first),
-                || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
-                |(), _, _, first, _| results.push(first),
-            );
-            // `check` may sleep or serve interrupts, which LWLocks hold off: never under a buffer lock (#30)
-            check();
-        }
-        results
-    };
-
-    for _ in (1..height_of_root).rev() {
-        state = step(state);
-    }
+    let state = firsts(index, &check);
 
     let hooked_index = RelationHooked(index, {
         id_3(|index: &R, opaque: Opaque, tracking_freespace: bool| {
