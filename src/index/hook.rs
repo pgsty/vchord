@@ -62,6 +62,12 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                     // whole outer query) (#25).
                     let _switch =
                         crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+                    #[cfg(feature = "pg18")]
+                    let instrument = if (*(*node).ss.ps.state).es_instrument != 0 {
+                        &raw mut (*node).iss_Instrument
+                    } else {
+                        std::ptr::null_mut()
+                    };
                     #[cfg(feature = "pg19")]
                     let flags: u32 = if pgrx::pg_sys::ScanRelIsReadOnly(&raw mut (*node).ss) {
                         pgrx::pg_sys::ScanOptions::SO_HINT_REL_READ_ONLY as _
@@ -72,7 +78,9 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
                         (*(*node).ss.ps.state).es_snapshot,
-                        #[cfg(any(feature = "pg18", feature = "pg19"))]
+                        #[cfg(feature = "pg18")]
+                        instrument,
+                        #[cfg(feature = "pg19")]
                         (*node).iss_Instrument,
                         (*node).iss_NumScanKeys,
                         (*node).iss_NumOrderByKeys,
@@ -103,6 +111,12 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                     // whole outer query) (#25).
                     let _switch =
                         crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+                    #[cfg(feature = "pg18")]
+                    let instrument = if (*(*node).ss.ps.state).es_instrument != 0 {
+                        &raw mut (*node).iss_Instrument
+                    } else {
+                        std::ptr::null_mut()
+                    };
                     #[cfg(feature = "pg19")]
                     let flags: u32 = if pgrx::pg_sys::ScanRelIsReadOnly(&raw mut (*node).ss) {
                         pgrx::pg_sys::ScanOptions::SO_HINT_REL_READ_ONLY as _
@@ -113,7 +127,9 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
                         (*(*node).ss.ps.state).es_snapshot,
-                        #[cfg(any(feature = "pg18", feature = "pg19"))]
+                        #[cfg(feature = "pg18")]
+                        instrument,
+                        #[cfg(feature = "pg19")]
                         (*node).iss_Instrument,
                         (*node).iss_NumScanKeys,
                         (*node).iss_NumOrderByKeys,
