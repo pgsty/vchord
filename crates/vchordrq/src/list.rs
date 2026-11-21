@@ -15,6 +15,7 @@ use crate::{Branch, Opaque, tape};
 use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
 use index_accessor::FunctionalAccessor;
 use std::num::NonZero;
+use zerocopy::{FromBytes, IntoBytes};
 
 /// The lists' jump pages, in the tree's order; `check` runs after each tape of the tree, where no page is locked.
 pub fn firsts<R: RelationRead>(index: &R, check: impl Fn()) -> Vec<u32>
@@ -203,6 +204,62 @@ impl Rows {
     pub fn push_parts(&mut self, fixed: Fixed, signs: &[u64], prefetch: &[u32], columns: &[u8]) {
         self.fixed(fixed, signs, prefetch);
         self.columns.extend_from_slice(columns);
+    }
+    /// Hands the rows to `put` as `load` reads them, a few thousand at a time, and clears them.
+    pub fn save(&mut self, mut put: impl FnMut(&[u8])) {
+        let words = self.dim.div_ceil(64);
+        let n = self.prefetch.len().checked_div(self.len()).unwrap_or(0);
+        let width = self.columns.len().checked_div(self.len()).unwrap_or(0);
+        let mut out = Vec::new();
+        for start in (0..self.len()).step_by(4096) {
+            let end = self.len().min(start + 4096);
+            out.clear();
+            out.extend(((end - start) as u32).to_ne_bytes());
+            for x in &self.fixed[start..end] {
+                out.extend(x.metadata.as_bytes());
+                out.extend(x.delta.to_ne_bytes());
+                out.extend(x.head.to_ne_bytes());
+                out.extend(x.payload.get().to_ne_bytes());
+            }
+            out.extend(self.signs[start * words..end * words].as_bytes());
+            out.extend(self.prefetch[start * n..end * n].as_bytes());
+            out.extend(&self.columns[start * width..end * width]);
+            put(&out);
+        }
+        *self = Self::new(self.dim);
+    }
+    /// The rows `save` wrote, of `width` bytes of columns each.
+    pub fn load(dim: usize, width: usize, bytes: &[u8]) -> Self {
+        let (n, mut bytes) = bytes.split_first_chunk().expect("saved rows");
+        let n = u32::from_ne_bytes(*n) as usize;
+        let mut rows = Self::new(dim);
+        for _ in 0..n {
+            let fixed;
+            (fixed, bytes) = bytes.split_first_chunk::<30>().expect("saved rows");
+            let (metadata, fixed) = fixed.split_first_chunk::<16>().expect("saved rows");
+            let (delta, fixed) = fixed.split_first_chunk().expect("saved rows");
+            let (head, payload) = fixed.split_first_chunk().expect("saved rows");
+            rows.fixed.push(Fixed {
+                metadata: FromBytes::read_from_bytes(metadata).expect("saved rows"),
+                delta: f32::from_ne_bytes(*delta),
+                head: u16::from_ne_bytes(*head),
+                payload: NonZero::new(u64::from_ne_bytes(payload.try_into().expect("saved rows")))
+                    .expect("saved rows"),
+            });
+        }
+        let (signs, rest) = bytes.split_at(n * dim.div_ceil(64) * size_of::<u64>());
+        let (prefetch, columns) = rest.split_at(rest.len() - n * width);
+        rows.signs
+            .extend(signs.as_chunks().0.iter().map(|&x| u64::from_ne_bytes(x)));
+        rows.prefetch.extend(
+            prefetch
+                .as_chunks()
+                .0
+                .iter()
+                .map(|&x| u32::from_ne_bytes(x)),
+        );
+        rows.columns.extend_from_slice(columns);
+        rows
     }
     fn fixed(&mut self, fixed: Fixed, signs: &[u64], prefetch: &[u32]) {
         self.fixed.push(fixed);

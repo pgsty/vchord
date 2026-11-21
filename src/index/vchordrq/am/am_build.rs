@@ -9,7 +9,7 @@
 use crate::datatype::typmod::Typmod;
 use crate::index::fetcher::*;
 use crate::index::sample::{HeapSampler, Sample, Sampler, Tuple};
-use crate::index::sort::Sort;
+use crate::index::sort::{Sort, Spill};
 use crate::index::storage::buffered::BufferedPostgresRelation;
 use crate::index::storage::{PostgresPage, PostgresRelation};
 use crate::index::traverse::{HeapTraverser, Traverser};
@@ -811,8 +811,8 @@ unsafe fn write_lists(
     memory: i32,
 ) {
     let index = unsafe { BufferedPostgresRelation::new(index_relation) };
-    let memory = memory as usize * 1024;
-    crate::index::vchordrq::dispatch::write(opfamily, &index, sort, memory);
+    let (memory, mut spill) = (memory as usize * 1024, Spill::default());
+    crate::index::vchordrq::dispatch::write(opfamily, &index, sort, memory, &mut spill);
     while index.release() {
         vchordrq::consume(&index);
     }

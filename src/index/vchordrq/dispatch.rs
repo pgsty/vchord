@@ -237,36 +237,41 @@ pub fn encode<R>(
     with_vector(opfamily, vector, encode);
 }
 
-/// Writes every list from the rows `encode` appends, sorted, holding at most `memory` bytes of a list's rows.
-pub fn write<R>(opfamily: Opfamily, index: &R, rows: impl vchordrq::Sorted, memory: usize)
-where
+/// Writes every list from the rows `encode` appends, sorted, holding at most `memory` bytes of a list's codes.
+pub fn write<R>(
+    opfamily: Opfamily,
+    index: &R,
+    rows: impl vchordrq::Sorted,
+    memory: usize,
+    spill: &mut impl vchordrq::Spill,
+) where
     R: RelationRead + RelationWrite,
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
-            vchordrq::write::<_, Op<VectOwned<f32>, L2S>>(index, rows, memory)
+            vchordrq::write::<_, Op<VectOwned<f32>, L2S>>(index, rows, memory, spill)
         }
         (VectorKind::Vecf32, DistanceKind::Dot) => {
-            vchordrq::write::<_, Op<VectOwned<f32>, Dot>>(index, rows, memory)
+            vchordrq::write::<_, Op<VectOwned<f32>, Dot>>(index, rows, memory, spill)
         }
         (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordrq::write::<_, Op<VectOwned<f16>, L2S>>(index, rows, memory)
+            vchordrq::write::<_, Op<VectOwned<f16>, L2S>>(index, rows, memory, spill)
         }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
-            vchordrq::write::<_, Op<VectOwned<f16>, Dot>>(index, rows, memory)
+            vchordrq::write::<_, Op<VectOwned<f16>, Dot>>(index, rows, memory, spill)
         }
         (VectorKind::Rabitq8, DistanceKind::Dot) => {
-            vchordrq::write::<_, Op<Rabitq8Owned, Dot>>(index, rows, memory)
+            vchordrq::write::<_, Op<Rabitq8Owned, Dot>>(index, rows, memory, spill)
         }
         (VectorKind::Rabitq8, DistanceKind::L2S) => {
-            vchordrq::write::<_, Op<Rabitq8Owned, L2S>>(index, rows, memory)
+            vchordrq::write::<_, Op<Rabitq8Owned, L2S>>(index, rows, memory, spill)
         }
         (VectorKind::Rabitq4, DistanceKind::Dot) => {
-            vchordrq::write::<_, Op<Rabitq4Owned, Dot>>(index, rows, memory)
+            vchordrq::write::<_, Op<Rabitq4Owned, Dot>>(index, rows, memory, spill)
         }
         (VectorKind::Rabitq4, DistanceKind::L2S) => {
-            vchordrq::write::<_, Op<Rabitq4Owned, L2S>>(index, rows, memory)
+            vchordrq::write::<_, Op<Rabitq4Owned, L2S>>(index, rows, memory, spill)
         }
     }
 }

@@ -146,6 +146,23 @@ pub trait Sorted {
     fn next(&mut self) -> Option<&[u8]>;
 }
 
+/// Where a build keeps the codes of a list larger than its memory until the list's vectors are written.
+pub trait Spill {
+    fn put(&mut self, bytes: &[u8]);
+    /// Each piece put since it was last called, in order.
+    fn take(&mut self, f: impl FnMut(&[u8]));
+}
+
+#[cfg(test)]
+impl Spill for Vec<Vec<u8>> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.push(bytes.to_vec());
+    }
+    fn take(&mut self, mut f: impl FnMut(&[u8])) {
+        std::mem::take(self).iter().for_each(|x| f(x));
+    }
+}
+
 /// What a build encodes its rows with: the index's filter keys, and whether its vectors are in it.
 pub struct Encoder<'b, R> {
     index: &'b R,
@@ -236,11 +253,12 @@ impl<'a> Parts<'a> {
 }
 
 /// Writes every list from `rows`, each in one run of pages: its vectors, its frozen tape, its appendable tape, its directory.
-/// `memory`: the most bytes of a list's rows held before they are written.
+/// `memory`: the most bytes of a list's codes held; past it they go to `spill` until the list's vectors are written.
 pub fn write<R: RelationRead + RelationWrite, O: Operator>(
     index: &R,
     mut rows: impl Sorted,
     memory: usize,
+    spill: &mut impl Spill,
 ) where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -259,7 +277,7 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
     for first in firsts {
         // Between lists nothing is locked (#28).
         index::interrupt::check();
-        let (mut list, mut pending, mut tuples) = (None, Rows::new(dim as _), 0_u64);
+        let (mut pending, mut tuples, mut spilled) = (Rows::new(dim as _), 0_u64, false);
         while let Some(bytes) = row
             && bytes[..4] == first.to_be_bytes()
         {
@@ -290,32 +308,39 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
             };
             pending.push_parts(fixed, &signs, &prefetch, columns);
             tuples += 1;
-            if pending.bytes() > memory {
-                let list = list.get_or_insert_with(|| ListWriter::create(index, &keys));
-                pending.flush(&keys, |branch, columns| moved |= list.push(branch, columns));
-            }
+            let full = pending.bytes() > memory;
             // interrupts are served where the pages being written are unlocked: as a tape moves on to a page (#28)
-            if moved || rerank_in_heap {
+            if moved || full || rerank_in_heap {
                 if let Some(tape) = vectors.as_mut() {
                     tape.unlock();
                 }
-                if let Some(list) = list.as_mut() {
-                    list.unlock();
-                }
                 index::interrupt::check();
+            }
+            // a temporary file is written and read with no page locked
+            if full {
+                pending.save(|piece| spill.put(piece));
+                spilled = true;
             }
             row = rows.next();
         }
         if let Some(tape) = vectors.as_mut() {
             tape.unlock();
         }
-        let mut list = list.unwrap_or_else(|| ListWriter::create(index, &keys));
-        pending.flush(&keys, |branch, columns| {
-            if list.push(branch, columns) {
-                list.unlock();
-                index::interrupt::check();
-            }
-        });
+        let mut list = ListWriter::create(index, &keys);
+        let mut put = |rows: &mut Rows| {
+            rows.flush(&keys, |branch, columns| {
+                if list.push(branch, columns) {
+                    list.unlock();
+                    index::interrupt::check();
+                }
+            });
+            list.unlock();
+        };
+        if spilled {
+            pending.save(|piece| spill.put(piece));
+            spill.take(|piece| put(&mut Rows::load(dim as _, keys.columns(), piece)));
+        }
+        put(&mut pending);
         let written = list.finish(index::interrupt::check);
         let mut jump_guard = index.write(first, false);
         let mut jump_tuple =
@@ -587,19 +612,19 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     fn one_run_per_list() {
         let keyed = Keys::new([(Width::W8, false, Some(Summary::Bounds))]);
-        for (keys, rerank_in_table, dim, n, lists_n) in [
-            (Keys::new([]), false, 100, 3000, 7),
-            (keyed, false, 1500, 2000, 5),
-            (keyed, true, 100, 3000, 7),
-            (keyed, false, 100, 0, 3),
-            (Keys::new([]), true, 64, 5, 1),
+        // and a list larger than `memory`
+        for (keys, rerank_in_table, dim, n, lists_n, memory) in [
+            (Keys::new([]), false, 100, 3000, 7, 1 << 30),
+            (keyed, false, 1500, 2000, 5, 1 << 30),
+            (keyed, true, 100, 3000, 7, 1 << 30),
+            (keyed, false, 100, 0, 3, 1 << 30),
+            (Keys::new([]), true, 64, 5, 1, 1 << 30),
+            (keyed, false, 100, 3000, 1, 1 << 12),
+            (keyed, false, 100, 10000, 1, 1 << 19),
         ] {
             let relation = index(&keys, rerank_in_table, dim, lists_n);
-            write::<_, O>(
-                &relation,
-                sorted(&relation, &data(1..=n, dim, &keys)),
-                1 << 30,
-            );
+            let rows = sorted(&relation, &data(1..=n, dim, &keys));
+            write::<_, O>(&relation, rows, memory, &mut Vec::new());
             let mut payloads = Vec::new();
             for list in lists(&relation, &keys, dim) {
                 let tape = [&list.tape[..], &list.directory[..]].concat();
@@ -639,12 +664,14 @@ mod tests {
             (keyed, false, 100, 3000, 3, 1 << 12),
             (keyed, true, 100, 2000, 5, 1 << 12),
             (keyed, false, 100, 1000, 1, 1 << 30),
+            (keyed, false, 100, 10000, 1, 1 << 19),
         ] {
             let rows = data(1..=n, dim, &keys);
             let built = index(&keys, rerank_in_table, dim, lists_n);
-            write::<_, O>(&built, sorted(&built, &rows), memory);
+            write::<_, O>(&built, sorted(&built, &rows), memory, &mut Vec::new());
             let inserted = index(&keys, rerank_in_table, dim, lists_n);
-            write::<_, O>(&inserted, Rows(Vec::new().into_iter(), Vec::new()), memory);
+            let none = Rows(Vec::new().into_iter(), Vec::new());
+            write::<_, O>(&inserted, none, memory, &mut Vec::new());
             let add = |relation: &M, rows: &[(NonZero<u64>, Vec<u8>, VectOwned<f32>)]| {
                 for (payload, columns, vector) in rows {
                     let key =
@@ -743,7 +770,7 @@ mod tests {
             CHECKED.set(&relation);
             TAKEN.set(0);
             CHECKS.with(|x| x.borrow_mut().clear());
-            write::<_, O>(&relation, rows, 1 << 30);
+            write::<_, O>(&relation, rows, 1 << 30, &mut Vec::new());
             CHECKED.set(std::ptr::null());
             let checks = CHECKS.with(|x| x.take());
             let apart = std::iter::once(0)

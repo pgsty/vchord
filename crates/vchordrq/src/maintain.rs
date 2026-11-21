@@ -628,7 +628,7 @@ mod tests {
             relation,
             vec![structure],
         );
-        crate::write::<_, O>(relation, NoRows, usize::MAX);
+        crate::write::<_, O>(relation, NoRows, usize::MAX, &mut Vec::new());
         let first = meta(relation).0;
         (1..=n).for_each(|payload| append(relation, keys, first, payload));
         first
@@ -800,7 +800,7 @@ mod tests {
         ];
         let vector_options = VectorOptions { dim, v, d };
         crate::build::<_, O>(vector_options, options, keys, relation, structures);
-        crate::write::<_, O>(relation, NoRows, usize::MAX);
+        crate::write::<_, O>(relation, NoRows, usize::MAX, &mut Vec::new());
         let mut firsts = firsts(relation, || ());
         firsts.sort_unstable();
         let mut payload = 0;

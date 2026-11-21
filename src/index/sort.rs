@@ -6,7 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-use pgrx::pg_sys::{Datum, SortCoordinateData, Tuplesortstate, varlena};
+use pgrx::pg_sys::{BufFile, Datum, SortCoordinateData, Tuplesortstate, varlena};
 
 /// Rows sorted by their bytes, through PostgreSQL's tuplesort of `bytea`.
 pub struct Sort {
@@ -112,6 +112,77 @@ impl vchordrq::Sorted for Sort {
         found.then(|| unsafe {
             pgrx::varlena::varlena_to_byte_slice(datum.cast_mut_ptr::<varlena>())
         })
+    }
+}
+
+/// Pieces in a temporary file, read back in the order written.
+pub struct Spill {
+    file: *mut BufFile,
+    pieces: usize,
+    piece: Vec<u8>,
+}
+
+impl Default for Spill {
+    fn default() -> Self {
+        Self {
+            file: std::ptr::null_mut(),
+            pieces: 0,
+            piece: Vec::new(),
+        }
+    }
+}
+
+impl vchordrq::Spill for Spill {
+    fn put(&mut self, bytes: &[u8]) {
+        use pgrx::pg_sys::{BufFileCreateTemp, BufFileWrite};
+        unsafe {
+            if self.file.is_null() {
+                self.file = BufFileCreateTemp(false);
+            }
+            let len = bytes.len().to_ne_bytes();
+            BufFileWrite(self.file, len.as_ptr().cast_mut().cast(), len.len());
+            BufFileWrite(self.file, bytes.as_ptr().cast_mut().cast(), bytes.len());
+        }
+        self.pieces += 1;
+    }
+    fn take(&mut self, mut f: impl FnMut(&[u8])) {
+        use pgrx::pg_sys::{BufFileClose, BufFileRead, BufFileSeekBlock};
+        if self.pieces == 0 {
+            return;
+        }
+        let read = |file, out: &mut [u8]| {
+            let size = unsafe { BufFileRead(file, out.as_mut_ptr().cast(), out.len()) };
+            assert_eq!(size, out.len(), "could not read a temporary file");
+        };
+        unsafe {
+            assert_eq!(
+                BufFileSeekBlock(self.file, 0),
+                0,
+                "could not seek in a temporary file"
+            );
+        }
+        for _ in 0..std::mem::take(&mut self.pieces) {
+            let mut len = [0; size_of::<usize>()];
+            read(self.file, &mut len);
+            self.piece.resize(usize::from_ne_bytes(len), 0);
+            read(self.file, &mut self.piece);
+            f(&self.piece);
+        }
+        self.piece = Vec::new();
+        unsafe {
+            BufFileClose(std::mem::replace(&mut self.file, std::ptr::null_mut()));
+        }
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        // after an error, PostgreSQL closes the file with its resource owner
+        if !self.file.is_null() && crate::index::cleanup::pg_cleanup_allowed() {
+            unsafe {
+                pgrx::pg_sys::BufFileClose(self.file);
+            }
+        }
     }
 }
 

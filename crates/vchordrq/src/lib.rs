@@ -32,7 +32,7 @@ pub mod keys;
 pub mod operator;
 pub mod types;
 
-pub use build::{Encoder, Sorted, build, write};
+pub use build::{Encoder, Sorted, Spill, build, write};
 pub use bulkdelete::{bulkdelete, bulkdelete_vectors};
 pub use cache::cache;
 pub use consume::consume;
