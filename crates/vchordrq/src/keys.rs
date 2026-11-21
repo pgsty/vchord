@@ -240,6 +240,13 @@ impl Keys {
         }
         Ordering::Equal
     }
+    /// Appends the row's keys in bytes that compare as `cmp` orders the rows.
+    pub fn sortable(&self, row: Columns<'_>, out: &mut Vec<u8>) {
+        for key in self.as_slice() {
+            out.push(key.null(row) as u8);
+            out.extend_from_slice(&key.get(row).to_be_bytes()[16 - key.width.bytes()..]);
+        }
+    }
     /// The summaries of a block's live rows that are not NULL, a key's after another's.
     pub fn summarize<'a>(
         &'a self,
@@ -803,6 +810,33 @@ mod tests {
         assert_eq!(Keys::from_descriptors(&[]), None);
         assert_eq!(Keys::from_descriptors(&[0b10000]), None);
         assert_eq!(Keys::from_descriptors(&[0b0000, 0b100000]), None);
+    }
+
+    #[test]
+    fn sortable() {
+        use Width::*;
+        let keys = Keys::new([(W2, false, None), (W16, false, None), (W4, true, None)]);
+        let width = keys.columns();
+        let rows = (0..if cfg!(miri) { 16 } else { 512 })
+            .map(|_| {
+                let mut row = (0..width)
+                    .map(|_| rand::random::<u8>() % 3)
+                    .collect::<Vec<_>>();
+                row[width - 4..].copy_from_slice(&(rand::random::<u32>() & 0b111).to_le_bytes());
+                row
+            })
+            .collect::<Vec<_>>();
+        let sortable = |row: &[u8]| {
+            let mut out = Vec::new();
+            keys.sortable(Columns::row(row), &mut out);
+            out
+        };
+        for a in &rows {
+            for b in &rows {
+                let (x, y) = (Columns::row(a), Columns::row(b));
+                assert_eq!(sortable(a).cmp(&sortable(b)), keys.cmp(x, y));
+            }
+        }
     }
 
     fn stored(key: &Key, row: &[u8]) -> u128 {
