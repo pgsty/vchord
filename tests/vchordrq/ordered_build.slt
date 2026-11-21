@@ -1,0 +1,88 @@
+# A build in one process and a parallel build find the same rows when every list is probed; a statement timeout
+# cancels a one-list build.
+
+statement ok
+CREATE TABLE ob (id int PRIMARY KEY, owner int8, v vector(64));
+
+statement ok
+INSERT INTO ob SELECT i, i % 7 - 3, ARRAY(SELECT sin(i * 0.37 + j * (1 + i % 13)) FROM generate_series(1, 64) j)::real[]::vector
+FROM generate_series(1, 20000) i;
+
+statement ok
+ALTER TABLE ob SET (parallel_workers = 4);
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '16';
+
+statement ok
+SET max_parallel_maintenance_workers = 0;
+
+statement ok
+CREATE INDEX ob_v ON ob USING vchordrq (v vector_l2_ops, owner) WITH (options = $$
+[build.internal]
+lists = [16]
+$$);
+
+statement ok
+CREATE TABLE ob_one AS SELECT q.i, x.id FROM generate_series(1, 20) q(i),
+LATERAL (SELECT id FROM ob WHERE owner = q.i % 7 - 3 ORDER BY v <-> (SELECT v FROM ob WHERE id = q.i * 97) LIMIT 30) x;
+
+statement ok
+DROP INDEX ob_v;
+
+statement ok
+SET max_parallel_maintenance_workers = 4;
+
+statement ok
+CREATE INDEX ob_v ON ob USING vchordrq (v vector_l2_ops, owner) WITH (options = $$
+[build.internal]
+lists = [16]
+$$);
+
+statement ok
+CREATE TABLE ob_parallel AS SELECT q.i, x.id FROM generate_series(1, 20) q(i),
+LATERAL (SELECT id FROM ob WHERE owner = q.i % 7 - 3 ORDER BY v <-> (SELECT v FROM ob WHERE id = q.i * 97) LIMIT 30) x;
+
+query I
+SELECT count(*) FROM ob_one;
+----
+600
+
+query I
+SELECT count(*) FROM (SELECT * FROM ob_one EXCEPT SELECT * FROM ob_parallel) s;
+----
+0
+
+statement ok
+DROP INDEX ob_v;
+
+statement ok
+INSERT INTO ob SELECT i, i % 7 - 3, ARRAY(SELECT sin(i * 0.37 + j * (1 + i % 13)) FROM generate_series(1, 64) j)::real[]::vector
+FROM generate_series(20001, 300000) i;
+
+statement ok
+SET statement_timeout = '300ms';
+
+statement error canceling statement due to statement timeout
+CREATE INDEX ob_list ON ob USING vchordrq (v vector_l2_ops) WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+RESET statement_timeout;
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+DROP TABLE ob, ob_one, ob_parallel;
