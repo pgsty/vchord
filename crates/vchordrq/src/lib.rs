@@ -17,6 +17,7 @@ mod fast_heap;
 mod freepages;
 mod insert;
 mod linked_vec;
+mod list;
 mod maintain;
 mod prewarm;
 mod rerank;

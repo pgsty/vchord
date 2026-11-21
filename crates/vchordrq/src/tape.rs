@@ -152,6 +152,17 @@ where
     }
 }
 
+/// `pages`, with `between` run before each is read.
+pub fn paced<I: Iterator>(
+    mut pages: I,
+    mut between: impl FnMut(),
+) -> impl Iterator<Item = I::Item> {
+    std::iter::from_fn(move || {
+        between();
+        pages.next()
+    })
+}
+
 pub fn by_directory<'b, R>(
     p: &mut impl PrefetcherSequenceFamily<'b, R>,
     iter: impl Iterator<Item = u32>,
