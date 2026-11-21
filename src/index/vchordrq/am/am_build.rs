@@ -10,6 +10,7 @@ use crate::datatype::typmod::Typmod;
 use crate::index::fetcher::*;
 use crate::index::sample::{HeapSampler, Sample, Sampler, Tuple};
 use crate::index::sort::Sort;
+use crate::index::storage::buffered::BufferedPostgresRelation;
 use crate::index::storage::{PostgresPage, PostgresRelation};
 use crate::index::traverse::{HeapTraverser, Traverser};
 use crate::index::vchordrq::am::Reloption;
@@ -357,7 +358,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             };
             let mut sort = Sort::new(memory, Some(coordinate));
             sort.perform();
-            crate::index::vchordrq::dispatch::write(opfamily, &index, sort);
+            write_lists(index_relation, opfamily, sort);
             ((*shared).heap_tuples, (*shared).index_tuples as f64)
         }
     } else {
@@ -382,7 +383,7 @@ pub unsafe extern "C-unwind" fn ambuild(
         reporter.tuples_total(indtuples);
         reporter.phase(BuildPhase::from_code(BuildPhaseCode::Compacting));
         sort.perform();
-        crate::index::vchordrq::dispatch::write(opfamily, &index, sort);
+        unsafe { write_lists(index_relation, opfamily, sort) };
         (heap_tuples, index_tuples as f64)
     };
     let mut result = unsafe { pgrx::pgbox::PgBox::<pgrx::pg_sys::IndexBuildResult>::alloc0() };
@@ -800,6 +801,15 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
     unsafe {
         pgrx::pg_sys::index_close(index, index_lockmode);
         pgrx::pg_sys::table_close(heap, heap_lockmode);
+    }
+}
+
+/// Writes the lists from the sorted rows, extending the index by a batch of pages at a time.
+unsafe fn write_lists(index_relation: pgrx::pg_sys::Relation, opfamily: Opfamily, sort: Sort) {
+    let index = unsafe { BufferedPostgresRelation::new(index_relation) };
+    crate::index::vchordrq::dispatch::write(opfamily, &index, sort);
+    while index.release() {
+        vchordrq::consume(&index);
     }
 }
 

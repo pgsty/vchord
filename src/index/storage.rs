@@ -6,6 +6,8 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+pub mod buffered;
+
 use index::fetch::Fetch;
 use index::relation::{
     Hints, Opaque, Page, PageGuard, ReadStream, Relation, RelationPrefetch, RelationRead,
