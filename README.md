@@ -8,7 +8,7 @@
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/vchord?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/vchord&Date)
 [![PostgreSQL: 15-19](https://img.shields.io/badge/PostgreSQL-15--19-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](#build-from-source)
 
-Disk-friendly vector similarity search for PostgreSQL 15–19, built on [pgvector](https://github.com/pgvector/pgvector).
+Disk-friendly vector similarity search for PostgreSQL 15–19 on `x86_64` and `aarch64`, built on [pgvector](https://github.com/pgvector/pgvector).
 
 [Documentation](https://vchord.pgsty.com/docs/vchord/) · [Releases](https://github.com/pgsty/vchord/releases) · [Issues](https://github.com/pgsty/vchord/issues)
 
@@ -58,7 +58,7 @@ Use `USING vchordg` for a graph index. See [indexing](https://vchord.pgsty.com/d
 
 ## Build from Source
 
-Requires Rust 1.99.1+, PostgreSQL development headers, pgvector, GNU Make, and matching Clang, libclang, and LLVM tools. The project uses pgrx 0.20.0.
+Requires PostgreSQL 15–19 development headers, pgvector, Rust 1.99.1+, GNU Make, and matching Clang, libclang, and LLVM tools on `x86_64` or `aarch64`. Built with pgrx 0.20.0.
 
 ```bash
 git clone https://github.com/pgsty/vchord.git
@@ -84,10 +84,10 @@ See [release notes](https://vchord.pgsty.com/blog/release/) for migration requir
 ```bash
 cargo test --locked --workspace --exclude vchord
 PG_CONFIG=/path/to/pg_config make clippy
-sqllogictest --db "$USER" --user "$USER" './tests/general/*.slt' './tests/vchordg/*.slt' './tests/vchordrq/*.slt'
+sqllogictest --db "$USER" --user "$USER" --label pg19 './tests/general/*.slt' './tests/vchordg/*.slt' './tests/vchordrq/*.slt' './tests/vchordrq/pg17/*.slt'
 ```
 
-The SQL tests require a running PostgreSQL instance with the extension installed. CI covers supported PostgreSQL versions and platforms; additional recovery checks are documented in [devtools/README.md](devtools/README.md).
+Pass the server major version to `--label` (`pg15` through `pg19`), and omit `./tests/vchordrq/pg17/*.slt` on PostgreSQL 15–16. The SQL tests require a running PostgreSQL instance with `vchord` preloaded and installed; additional recovery checks are documented in [devtools/README.md](devtools/README.md).
 
 ## License
 

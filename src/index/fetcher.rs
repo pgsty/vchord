@@ -198,25 +198,26 @@ impl FilterableTuple for HeapTuple<'_> {
             if !this.hack.is_null() {
                 if let Some(qual) = NonNull::new((*this.hack).ss.ps.qual) {
                     use pgrx::datum::FromDatum;
-                    use pgrx::memcxt::PgMemoryContexts;
                     assert!(qual.as_ref().flags & pgrx::pg_sys::EEO_FLAG_IS_QUAL as u8 != 0);
                     let evalfunc = qual.as_ref().evalfunc.expect("no evalfunc for qual");
                     if !(*this.hack).ss.ps.ps_ExprContext.is_null() {
                         let econtext = (*this.hack).ss.ps.ps_ExprContext;
                         (*econtext).ecxt_scantuple = this.slot;
                         pgrx::pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
-                        let result = PgMemoryContexts::For((*econtext).ecxt_per_tuple_memory)
-                            .switch_to(|_| {
-                                let mut is_null = true;
-                                #[allow(
-                                    ffi_unwind_calls,
-                                    reason = "protected by pg_guard_ffi_boundary"
-                                )]
-                                let datum = pg_guard_ffi_boundary(|| {
-                                    evalfunc(qual.as_ptr(), econtext, &mut is_null)
-                                });
-                                bool::from_datum(datum, is_null)
+                        let result = {
+                            let _switch = crate::index::MemoryContextSwitch::new(
+                                (*econtext).ecxt_per_tuple_memory,
+                            );
+                            let mut is_null = true;
+                            #[allow(
+                                ffi_unwind_calls,
+                                reason = "protected by pg_guard_ffi_boundary"
+                            )]
+                            let datum = pg_guard_ffi_boundary(|| {
+                                evalfunc(qual.as_ptr(), econtext, &mut is_null)
                             });
+                            bool::from_datum(datum, is_null)
+                        };
                         if result != Some(true) {
                             return false;
                         }

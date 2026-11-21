@@ -23,6 +23,40 @@ SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('vchordg_stats
 vchordg_stats 2100
 vchordg_stats_idx 2000
 
+# PostgreSQL 18+ EXPLAIN ANALYZE reports Index Searches across scans and rescans.
+statement ok
+SET enable_seqscan = off;
+
+skipif pg15
+skipif pg16
+skipif pg17
+query T
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT id FROM vchordg_stats ORDER BY v <-> '[1, 1, 1]' LIMIT 3;
+----
+Limit (actual rows=3.00 loops=1)
+  ->  Index Scan using vchordg_stats_idx on vchordg_stats (actual rows=3.00 loops=1)
+        Order By: (v <-> '[1,1,1]'::vector)
+        Index Searches: 1
+
+skipif pg15
+skipif pg16
+skipif pg17
+query T
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT s.id FROM (VALUES ('[1,1,1]'::vector), ('[2,2,2]'::vector), ('[3,3,3]'::vector)) AS q(qv)
+CROSS JOIN LATERAL (SELECT id FROM vchordg_stats ORDER BY v <-> q.qv LIMIT 2) AS s;
+----
+Nested Loop (actual rows=6.00 loops=1)
+  ->  Values Scan on "*VALUES*" (actual rows=3.00 loops=1)
+  ->  Limit (actual rows=2.00 loops=3)
+        ->  Index Scan using vchordg_stats_idx on vchordg_stats (actual rows=2.00 loops=3)
+              Order By: (v <-> "*VALUES*".column1)
+              Index Searches: 3
+
+statement ok
+RESET enable_seqscan;
+
 # Ask for a parallel build.
 statement ok
 ALTER TABLE vchordg_stats SET (parallel_workers = 2);

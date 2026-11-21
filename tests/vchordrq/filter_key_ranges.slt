@@ -128,9 +128,25 @@ BEGIN
 END
 $$;
 
+skipif pg15
+skipif pg16
 query T
 SELECT fr_plan('SELECT id FROM fr WHERE c = ANY(''{7,14,70}'') AND c < 50 ORDER BY v <-> ''[0.5,0.5,0.5]''')
-  ~ 'Filter: .*\(c < 50\)';
+  ~ 'Index Cond: \(c = ANY .*Filter: \(c < 50\)';
+----
+t
+
+onlyif pg15
+query T
+SELECT s ~ 'Index Scan using fr_h' AND s !~ 'Index Cond:' AND s ~ 'Filter: .*\(c < 50\)' AND s ~ 'Filter: .*\(c = ANY'
+FROM fr_plan('SELECT id FROM fr WHERE c = ANY(''{7,14,70}'') AND c < 50 ORDER BY v <-> ''[0.5,0.5,0.5]''') AS s;
+----
+t
+
+onlyif pg16
+query T
+SELECT s ~ 'Index Scan using fr_h' AND s !~ 'Index Cond:' AND s ~ 'Filter: .*\(c < 50\)' AND s ~ 'Filter: .*\(c = ANY'
+FROM fr_plan('SELECT id FROM fr WHERE c = ANY(''{7,14,70}'') AND c < 50 ORDER BY v <-> ''[0.5,0.5,0.5]''') AS s;
 ----
 t
 

@@ -62,18 +62,22 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                     // whole outer query) (#25).
                     let _switch =
                         crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+                    #[cfg(feature = "pg19")]
+                    let flags: u32 = if pgrx::pg_sys::ScanRelIsReadOnly(&raw mut (*node).ss) {
+                        pgrx::pg_sys::ScanOptions::SO_HINT_REL_READ_ONLY as _
+                    } else {
+                        pgrx::pg_sys::ScanOptions::SO_NONE as _
+                    };
                     (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
                         (*(*node).ss.ps.state).es_snapshot,
                         #[cfg(any(feature = "pg18", feature = "pg19"))]
-                        std::ptr::null_mut(),
+                        (*node).iss_Instrument,
                         (*node).iss_NumScanKeys,
                         (*node).iss_NumOrderByKeys,
                         #[cfg(feature = "pg19")]
-                        {
-                            pgrx::pg_sys::ScanOptions::SO_NONE as _
-                        },
+                        flags,
                     );
 
                     let scanner = &mut *((*(*node).iss_ScanDesc).opaque as *mut Scanner);
@@ -99,18 +103,22 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
                     // whole outer query) (#25).
                     let _switch =
                         crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+                    #[cfg(feature = "pg19")]
+                    let flags: u32 = if pgrx::pg_sys::ScanRelIsReadOnly(&raw mut (*node).ss) {
+                        pgrx::pg_sys::ScanOptions::SO_HINT_REL_READ_ONLY as _
+                    } else {
+                        pgrx::pg_sys::ScanOptions::SO_NONE as _
+                    };
                     (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
                         (*node).ss.ss_currentRelation,
                         (*node).iss_RelationDesc,
                         (*(*node).ss.ps.state).es_snapshot,
                         #[cfg(any(feature = "pg18", feature = "pg19"))]
-                        std::ptr::null_mut(),
+                        (*node).iss_Instrument,
                         (*node).iss_NumScanKeys,
                         (*node).iss_NumOrderByKeys,
                         #[cfg(feature = "pg19")]
-                        {
-                            pgrx::pg_sys::ScanOptions::SO_NONE as _
-                        },
+                        flags,
                     );
 
                     let scanner = &mut *((*(*node).iss_ScanDesc).opaque as *mut Scanner);

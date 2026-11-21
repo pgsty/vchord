@@ -78,7 +78,7 @@ impl Sampler for HeapSampler {
                 true,
                 #[cfg(feature = "pg19")]
                 {
-                    pgrx::pg_sys::ScanOptions::SO_NONE as _
+                    pgrx::pg_sys::ScanOptions::SO_HINT_REL_READ_ONLY as _
                 },
             );
             let index_info = pgrx::pg_sys::BuildIndexInfo(self.index_relation);

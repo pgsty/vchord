@@ -28,6 +28,46 @@ SELECT relname, reltuples::bigint FROM pg_class WHERE relname IN ('t', 't_idx') 
 t 5100
 t_idx 5000
 
+# PostgreSQL 18+ EXPLAIN ANALYZE reports Index Searches across scans and rescans.
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+SET vchordrq.probes = '4';
+
+skipif pg15
+skipif pg16
+skipif pg17
+query T
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT id FROM t ORDER BY val <-> '[0.5, 0.5, 0.5]' LIMIT 3;
+----
+Limit (actual rows=3.00 loops=1)
+  ->  Index Scan using t_idx on t (actual rows=3.00 loops=1)
+        Order By: (val <-> '[0.5,0.5,0.5]'::vector)
+        Index Searches: 1
+
+skipif pg15
+skipif pg16
+skipif pg17
+query T
+EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF)
+SELECT s.id FROM (VALUES ('[0.1,0.1,0.1]'::vector), ('[0.5,0.5,0.5]'::vector), ('[0.9,0.9,0.9]'::vector)) AS q(qv)
+CROSS JOIN LATERAL (SELECT id FROM t ORDER BY val <-> q.qv LIMIT 2) AS s;
+----
+Nested Loop (actual rows=6.00 loops=1)
+  ->  Values Scan on "*VALUES*" (actual rows=3.00 loops=1)
+  ->  Limit (actual rows=2.00 loops=3)
+        ->  Index Scan using t_idx on t (actual rows=2.00 loops=3)
+              Order By: (val <-> "*VALUES*".column1)
+              Index Searches: 3
+
+statement ok
+RESET vchordrq.probes;
+
+statement ok
+RESET enable_seqscan;
+
 statement ok
 REINDEX INDEX t_idx;
 
