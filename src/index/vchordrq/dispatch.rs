@@ -136,8 +136,7 @@ where
 }
 
 /// Compacts the chosen lists and returns the number of live index tuples in them.
-/// Appends the row as the build sorts it.
-#[allow(clippy::too_many_arguments)]
+/// The row as the build sorts it.
 pub fn encode<R>(
     opfamily: Opfamily,
     index: &R,
@@ -145,8 +144,8 @@ pub fn encode<R>(
     columns: &[u8],
     vector: OwnedVector,
     bump: &impl Bump,
-    out: &mut Vec<u8>,
-) where
+) -> Vec<u8>
+where
     R: RelationRead,
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
@@ -163,7 +162,6 @@ pub fn encode<R>(
                 projected.as_borrowed(),
                 bump,
                 make_h1_plain_prefetcher,
-                out,
             )
         }
         (OwnedVector::Vecf32(vector), DistanceKind::Dot) => {
@@ -177,7 +175,6 @@ pub fn encode<R>(
                 projected.as_borrowed(),
                 bump,
                 make_h1_plain_prefetcher,
-                out,
             )
         }
         (OwnedVector::Vecf16(vector), DistanceKind::L2S) => {
@@ -191,7 +188,6 @@ pub fn encode<R>(
                 projected.as_borrowed(),
                 bump,
                 make_h1_plain_prefetcher,
-                out,
             )
         }
         (OwnedVector::Vecf16(vector), DistanceKind::Dot) => {
@@ -205,7 +201,6 @@ pub fn encode<R>(
                 projected.as_borrowed(),
                 bump,
                 make_h1_plain_prefetcher,
-                out,
             )
         }
         (OwnedVector::Rabitq8(vector), DistanceKind::Dot) => {
@@ -218,7 +213,6 @@ pub fn encode<R>(
                 vector.as_borrowed(),
                 bump,
                 make_h1_plain_prefetcher,
-                out,
             )
         }
         (OwnedVector::Rabitq8(vector), DistanceKind::L2S) => {
@@ -231,7 +225,6 @@ pub fn encode<R>(
                 vector.as_borrowed(),
                 bump,
                 make_h1_plain_prefetcher,
-                out,
             )
         }
         (OwnedVector::Rabitq4(vector), DistanceKind::Dot) => {
@@ -244,7 +237,6 @@ pub fn encode<R>(
                 vector.as_borrowed(),
                 bump,
                 make_h1_plain_prefetcher,
-                out,
             )
         }
         (OwnedVector::Rabitq4(vector), DistanceKind::L2S) => {
@@ -257,7 +249,6 @@ pub fn encode<R>(
                 vector.as_borrowed(),
                 bump,
                 make_h1_plain_prefetcher,
-                out,
             )
         }
     }

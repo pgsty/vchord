@@ -329,18 +329,11 @@ pub unsafe extern "C-unwind" fn ambuild(
         drop(cached);
         leader.wait();
         reporter.phase(BuildPhase::from_code(BuildPhaseCode::Inserting));
-        let shared = leader.vchordrqshared;
+        let shared = leader.shm.vchordrqshared;
         unsafe {
-            participate(
-                index_relation,
-                heap_relation,
-                index_info,
-                shared,
-                leader.tablescandesc,
-                leader.vchordrqcached,
-                leader.sharedsort,
-                |indtuples| reporter.tuples_done(indtuples),
-            );
+            participate(index_relation, heap_relation, index_info, leader.shm, |n| {
+                reporter.tuples_done(n)
+            });
             pgrx::pg_sys::ConditionVariablePrepareToSleep(&raw mut (*shared).done);
             loop {
                 pgrx::pg_sys::SpinLockAcquire(&raw mut (*shared).mutex);
@@ -360,7 +353,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             let coordinate = pgrx::pg_sys::SortCoordinateData {
                 isWorker: false,
                 nParticipants: leader.nparticipants,
-                sharedsort: leader.sharedsort,
+                sharedsort: leader.shm.sharedsort,
             };
             let mut sort = Sort::new(memory, Some(coordinate));
             sort.perform();
@@ -563,10 +556,35 @@ struct VchordrqLeader {
     pcxt: *mut pgrx::pg_sys::ParallelContext,
     nparticipants: i32,
     snapshot: pgrx::pg_sys::Snapshot,
+    shm: Shm,
+}
+
+/// What every participant of a parallel build shares.
+#[derive(Clone, Copy)]
+struct Shm {
     vchordrqshared: *mut VchordrqShared,
     tablescandesc: *mut pgrx::pg_sys::ParallelTableScanDescData,
     vchordrqcached: *const u8,
     sharedsort: *mut pgrx::pg_sys::Sharedsort,
+}
+
+impl Shm {
+    unsafe fn lookup(toc: *mut pgrx::pg_sys::shm_toc) -> Self {
+        let lookup = |key| unsafe { pgrx::pg_sys::shm_toc_lookup(toc, key, false) };
+        Self {
+            vchordrqshared: lookup(0xA000000000000001).cast(),
+            tablescandesc: lookup(0xA000000000000002).cast(),
+            vchordrqcached: lookup(0xA000000000000003).cast::<u8>().cast_const(),
+            sharedsort: lookup(0xA000000000000004).cast(),
+        }
+    }
+    /// The pages pinned for routing, as `ambuild` serialized them.
+    unsafe fn cached<'a>(self) -> &'a [u8] {
+        unsafe {
+            let bytes = (self.vchordrqcached as *const u64).read_unaligned();
+            std::slice::from_raw_parts(self.vchordrqcached.add(8), bytes as _)
+        }
+    }
 }
 
 impl VchordrqLeader {
@@ -716,10 +734,12 @@ impl VchordrqLeader {
             pcxt,
             nparticipants: nworkers_launched + 1,
             snapshot,
-            vchordrqshared,
-            tablescandesc,
-            vchordrqcached,
-            sharedsort,
+            shm: Shm {
+                vchordrqshared,
+                tablescandesc,
+                vchordrqcached,
+                sharedsort,
+            },
         })
     }
 
@@ -752,22 +772,8 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
     toc: *mut pgrx::pg_sys::shm_toc,
 ) {
     let _ = rand::rng().reseed();
-    let vchordrqshared = unsafe {
-        pgrx::pg_sys::shm_toc_lookup(toc, 0xA000000000000001, false).cast::<VchordrqShared>()
-    };
-    let tablescandesc = unsafe {
-        pgrx::pg_sys::shm_toc_lookup(toc, 0xA000000000000002, false)
-            .cast::<pgrx::pg_sys::ParallelTableScanDescData>()
-    };
-    let vchordrqcached = unsafe {
-        pgrx::pg_sys::shm_toc_lookup(toc, 0xA000000000000003, false)
-            .cast::<u8>()
-            .cast_const()
-    };
-    let sharedsort = unsafe {
-        pgrx::pg_sys::shm_toc_lookup(toc, 0xA000000000000004, false)
-            .cast::<pgrx::pg_sys::Sharedsort>()
-    };
+    let shm = unsafe { Shm::lookup(toc) };
+    let vchordrqshared = shm.vchordrqshared;
     let (heap_lockmode, index_lockmode) = if unsafe { !(*vchordrqshared).isconcurrent } {
         (
             pgrx::pg_sys::ShareLock as pgrx::pg_sys::LOCKMODE,
@@ -787,17 +793,8 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
     }
 
     unsafe {
-        pgrx::pg_sys::tuplesort_attach_shared(sharedsort, seg);
-        participate(
-            index,
-            heap,
-            index_info,
-            vchordrqshared,
-            tablescandesc,
-            vchordrqcached,
-            sharedsort,
-            |_| (),
-        );
+        pgrx::pg_sys::tuplesort_attach_shared(shm.sharedsort, seg);
+        participate(index, heap, index_info, shm, |_| ());
     }
 
     unsafe {
@@ -807,26 +804,19 @@ pub unsafe extern "C-unwind" fn vchordrq_parallel_build_main(
 }
 
 /// A participant's share of a parallel build: its part of the table, routed, encoded and sorted.
-#[allow(clippy::too_many_arguments)]
 unsafe fn participate(
     index_relation: pgrx::pg_sys::Relation,
     heap_relation: pgrx::pg_sys::Relation,
     index_info: *mut pgrx::pg_sys::IndexInfo,
-    shared: *mut VchordrqShared,
-    tablescandesc: *mut pgrx::pg_sys::ParallelTableScanDescData,
-    vchordrqcached: *const u8,
-    sharedsort: *mut pgrx::pg_sys::Sharedsort,
+    shm: Shm,
     report: impl Fn(u64),
 ) {
-    let cached = unsafe {
-        let bytes = (vchordrqcached as *const u64).read_unaligned();
-        std::slice::from_raw_parts(vchordrqcached.add(8), bytes as _)
-    };
+    let shared = shm.vchordrqshared;
     let memory = unsafe { pgrx::pg_sys::maintenance_work_mem / (*shared).scantuplesortstates };
     let coordinate = pgrx::pg_sys::SortCoordinateData {
         isWorker: true,
         nParticipants: -1,
-        sharedsort,
+        sharedsort: shm.sharedsort,
     };
     let mut sort = unsafe { Sort::new(memory, Some(coordinate)) };
     let (heap_tuples, index_tuples) = unsafe {
@@ -834,8 +824,8 @@ unsafe fn participate(
             index_relation,
             heap_relation,
             index_info,
-            tablescandesc,
-            cached,
+            shm.tablescandesc,
+            shm.cached(),
             FilterKeys::of_index(index_relation),
             &mut sort,
             || {
@@ -927,7 +917,7 @@ impl<P: FnMut()> Encoder<'_, P> {
             sort,
             mut progress,
         } = self;
-        let (mut out, mut index_tuples) = (Vec::new(), 0_u64);
+        let mut index_tuples = 0_u64;
         let heap_tuples =
             traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
                 let ctid = tuple.id();
@@ -940,11 +930,8 @@ impl<P: FnMut()> Encoder<'_, P> {
                 for (vector, extra) in store {
                     let payload = kv_to_pointer((ctid_to_key(ctid), extra));
                     let bump = bumpalo::Bump::new();
-                    out.clear();
-                    crate::index::vchordrq::dispatch::encode(
-                        opfamily, index, payload, &columns, vector, &bump, &mut out,
-                    );
-                    sort.put(&out);
+                    let dispatch = crate::index::vchordrq::dispatch::encode;
+                    sort.put(&dispatch(opfamily, index, payload, &columns, vector, &bump));
                     index_tuples += 1;
                 }
                 progress();

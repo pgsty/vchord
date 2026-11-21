@@ -146,8 +146,7 @@ pub trait Sorted {
     fn next(&mut self) -> Option<&[u8]>;
 }
 
-/// Appends a row as the build sorts it: by list, then by its keys, then by payload, as `write` lays rows out.
-#[allow(clippy::too_many_arguments)]
+/// A row as the build sorts it: by list, then by its keys, then by payload, as `write` lays rows out.
 pub fn encode<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     payload: NonZero<u64>,
@@ -156,8 +155,8 @@ pub fn encode<'b, R: RelationRead, O: Operator>(
     projected: <O::Vector as VectorOwned>::Borrowed<'_>,
     bump: &'b impl Bump,
     prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-    out: &mut Vec<u8>,
-) where
+) -> Vec<u8>
+where
     R::Page: Page<Opaque = Opaque>,
 {
     let (first, (code, delta)) = assign::<R, O>(index, projected, bump, prefetch_h1_vectors);
@@ -166,8 +165,8 @@ pub fn encode<'b, R: RelationRead, O: Operator>(
     let keys = Keys::of_meta(meta_tuple);
     let rerank_in_heap = meta_tuple.rerank_in_heap();
     drop(meta_guard);
-    out.extend_from_slice(&first.to_be_bytes());
-    keys.sortable(Columns::row(columns), out);
+    let mut out = first.to_be_bytes().to_vec();
+    keys.sortable(Columns::row(columns), &mut out);
     out.extend_from_slice(&payload.get().to_be_bytes());
     let tuple = AppendableTuple::serialize(&AppendableTuple {
         metadata: [
@@ -186,8 +185,9 @@ pub fn encode<'b, R: RelationRead, O: Operator>(
     out.extend_from_slice(&(tuple.len() as u32).to_ne_bytes());
     out.extend_from_slice(&tuple);
     if !rerank_in_heap {
-        vectors::encode::<O::Vector>(vector, out);
+        vectors::encode::<O::Vector>(vector, &mut out);
     }
+    out
 }
 
 /// Writes every list from `rows`, each in one run of pages: its vectors, its frozen tape, its appendable tape, its directory.
@@ -391,14 +391,11 @@ mod tests {
                     } else {
                         [&(payload % 13).to_le_bytes()[..], &[0; 4]].concat()
                     };
-                    let (mut out, bump) = (Vec::new(), bumpalo::Bump::new());
+                    let bump = bumpalo::Bump::new();
                     let prefetch = MakePlainPrefetcher { index: &relation };
                     let payload = NonZero::new(payload).unwrap();
                     let v = vector.as_borrowed();
-                    encode::<_, O>(
-                        &relation, payload, &columns, v, v, &bump, prefetch, &mut out,
-                    );
-                    out
+                    encode::<_, O>(&relation, payload, &columns, v, v, &bump, prefetch)
                 })
                 .collect::<Vec<_>>();
             sorted.sort_unstable();
