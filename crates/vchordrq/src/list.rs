@@ -169,7 +169,7 @@ impl Rows {
             columns: Vec::new(),
         }
     }
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.fixed.len()
     }
     pub fn bytes(&self) -> usize {

@@ -301,6 +301,27 @@ impl WithWriter for FreepagesTuple {
     }
 }
 
+impl WithReader for FreepagesTuple {
+    type Reader<'a> = FreepagesTupleReader<'a>;
+
+    fn deserialize_ref(source: &[u8]) -> FreepagesTupleReader<'_> {
+        let checker = RefChecker::new(source);
+        let header = checker.prefix(0_u16);
+        FreepagesTupleReader { header }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FreepagesTupleReader<'a> {
+    header: &'a FreepagesTupleHeader,
+}
+
+impl FreepagesTupleReader<'_> {
+    pub fn first(self) -> u32 {
+        self.header.first
+    }
+}
+
 pub struct FreepagesTupleWriter<'a> {
     header: &'a mut FreepagesTupleHeader,
 }
@@ -308,6 +329,81 @@ pub struct FreepagesTupleWriter<'a> {
 impl FreepagesTupleWriter<'_> {
     pub fn first(&mut self) -> &mut u32 {
         &mut self.header.first
+    }
+}
+
+/// How many runs of free pages the free pages' page keeps.
+pub const FREE_RUNS: usize = 960;
+
+#[repr(C, align(8))]
+#[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
+struct FreeRunsTupleHeader {
+    len: u32,
+    _padding_0: [Padding; 4],
+    runs: [[u32; 2]; FREE_RUNS],
+}
+
+/// Runs of free pages, each its first page and its end, kept beside the free list for the lists that a maintain places.
+#[derive(Debug, Clone)]
+pub struct FreeRunsTuple {}
+
+impl Tuple for FreeRunsTuple {
+    fn serialize(&self) -> Vec<u8> {
+        FreeRunsTupleHeader {
+            len: 0,
+            _padding_0: Default::default(),
+            runs: [[0; 2]; FREE_RUNS],
+        }
+        .as_bytes()
+        .to_vec()
+    }
+}
+
+impl WithReader for FreeRunsTuple {
+    type Reader<'a> = FreeRunsTupleReader<'a>;
+
+    fn deserialize_ref(source: &[u8]) -> FreeRunsTupleReader<'_> {
+        let checker = RefChecker::new(source);
+        let header = checker.prefix(0_u16);
+        FreeRunsTupleReader { header }
+    }
+}
+
+impl WithWriter for FreeRunsTuple {
+    type Writer<'a> = FreeRunsTupleWriter<'a>;
+
+    fn deserialize_mut(source: &mut [u8]) -> FreeRunsTupleWriter<'_> {
+        let mut checker = MutChecker::new(source);
+        let header = checker.prefix(0_u16);
+        FreeRunsTupleWriter { header }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FreeRunsTupleReader<'a> {
+    header: &'a FreeRunsTupleHeader,
+}
+
+impl<'a> FreeRunsTupleReader<'a> {
+    pub fn runs(self) -> &'a [[u32; 2]] {
+        &self.header.runs[..self.header.len as usize]
+    }
+}
+
+pub struct FreeRunsTupleWriter<'a> {
+    header: &'a mut FreeRunsTupleHeader,
+}
+
+impl FreeRunsTupleWriter<'_> {
+    pub fn runs(&self) -> &[[u32; 2]] {
+        &self.header.runs[..self.header.len as usize]
+    }
+    /// Keeps the first of `runs` that fit; returns how many.
+    pub fn set(&mut self, runs: &[[u32; 2]]) -> usize {
+        let n = runs.len().min(FREE_RUNS);
+        self.header.runs[..n].copy_from_slice(&runs[..n]);
+        self.header.len = n as u32;
+        n
     }
 }
 
