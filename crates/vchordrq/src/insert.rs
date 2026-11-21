@@ -68,9 +68,55 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     key: (Vec<u32>, u16),
     bump: &'b impl Bump,
-    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+    prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
     skip_freespaces: bool,
 ) where
+    R::Page: Page<Opaque = Opaque>,
+{
+    let (first, (code, delta)) = assign::<R, O>(index, vector, bump, prefetch_h1_vectors);
+
+    let meta_guard = index.read(0);
+    let meta_bytes = meta_guard.get(1).expect("data corruption");
+    let freepages_first = MetaTuple::deserialize_ref(meta_bytes).freepages_first();
+    drop(meta_guard);
+
+    let jump_guard = index.read(first);
+    let jump_bytes = jump_guard.get(1).expect("data corruption");
+    let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+
+    let (prefetch, head) = key;
+    let serialized = AppendableTuple::serialize(&AppendableTuple {
+        metadata: [
+            code.0.dis_u_2,
+            code.0.factor_cnt,
+            code.0.factor_ip,
+            code.0.factor_err,
+        ],
+        delta,
+        payload: Some(payload),
+        prefetch,
+        head,
+        elements: rabitq::bit::binary::pack_code(&code.1),
+        columns: columns.to_vec(),
+    });
+
+    tape::append(
+        index,
+        jump_tuple.appendable_first(),
+        &serialized,
+        false,
+        (!skip_freespaces).then_some(freepages_first),
+    );
+}
+
+/// The list that `vector` goes to, as its jump page, and the vector's code there.
+pub fn assign<'b, R: RelationRead, O: Operator>(
+    index: &'b R,
+    vector: <O::Vector as VectorOwned>::Borrowed<'_>,
+    bump: &'b impl Bump,
+    mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
+) -> (u32, (rabitq::bit::Code, f32))
+where
     R::Page: Page<Opaque = Opaque>,
 {
     let meta_guard = index.read(0);
@@ -79,7 +125,6 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     let dim = meta_tuple.dim();
     let is_residual = meta_tuple.is_residual();
     let height_of_root = meta_tuple.height_of_root();
-    let freepages_first = meta_tuple.freepages_first();
     assert_eq!(dim, vector.dim(), "unmatched dimensions");
     let epsilon = 1.9;
 
@@ -166,7 +211,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
     let jump_bytes = jump_guard.get(1).expect("data corruption");
     let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
 
-    let (code, delta) = O::build(
+    let code = O::build(
         vector,
         is_residual.then(|| {
             centroids::read::<R, O, _>(
@@ -186,27 +231,5 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         }),
     );
 
-    let (prefetch, head) = key;
-    let serialized = AppendableTuple::serialize(&AppendableTuple {
-        metadata: [
-            code.0.dis_u_2,
-            code.0.factor_cnt,
-            code.0.factor_ip,
-            code.0.factor_err,
-        ],
-        delta,
-        payload: Some(payload),
-        prefetch,
-        head,
-        elements: rabitq::bit::binary::pack_code(&code.1),
-        columns: columns.to_vec(),
-    });
-
-    tape::append(
-        index,
-        jump_tuple.appendable_first(),
-        &serialized,
-        false,
-        (!skip_freespaces).then_some(freepages_first),
-    );
+    (first, code)
 }
