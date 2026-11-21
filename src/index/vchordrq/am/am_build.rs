@@ -317,7 +317,8 @@ pub unsafe extern "C-unwind" fn ambuild(
         vchordrq_cached::VchordrqCached::_0 {}
     }
     .serialize();
-    let memory = unsafe { pgrx::pg_sys::maintenance_work_mem };
+    // the sort and the lists the writer holds share maintenance_work_mem, as an in-memory sort keeps its rows until it ends
+    let memory = unsafe { pgrx::pg_sys::maintenance_work_mem } / 2;
     let (heap_tuples, index_tuples) = if let Some(leader) = unsafe {
         VchordrqLeader::enter(
             c"vchordrq_parallel_build_main",
