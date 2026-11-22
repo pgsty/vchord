@@ -15,7 +15,7 @@ use crate::{Branch, Opaque, tape};
 use index::relation::{Page, PageGuard, RelationRead, RelationWrite};
 use index_accessor::FunctionalAccessor;
 use std::num::NonZero;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// The lists' jump pages, in the tree's order; `check` runs after each tape of the tree, where no page is locked.
 pub fn firsts<R: RelationRead>(index: &R, check: impl Fn()) -> Vec<u32>
@@ -148,18 +148,35 @@ pub fn appendable_tuple(branch: Branch<NonZero<u64>>, columns: &[u8]) -> Appenda
 }
 
 /// A list's row, but for its signs, pages and columns.
-#[derive(Clone, Copy)]
+#[repr(C)]
+#[derive(Clone, Copy, FromBytes, IntoBytes, Immutable, KnownLayout)]
 pub struct Fixed {
     pub metadata: [f32; 4],
     pub delta: f32,
     /// Where its vector's first part is, on the first of its pages.
     pub head: u16,
-    pub payload: NonZero<u64>,
+    pub _padding: [u8; 2],
+    pub payload: u64,
 }
 
-/// A list's rows, packed, to be written in the order of their keys.
+impl Fixed {
+    /// The row as a list writer takes it.
+    pub fn branch(self, signs: &[u64], prefetch: &[u32], dim: usize) -> Branch<NonZero<u64>> {
+        Branch {
+            code: unpack_code(self.metadata, signs, dim),
+            delta: self.delta,
+            prefetch: prefetch.to_vec(),
+            head: self.head,
+            norm: 0.0,
+            extra: NonZero::new(self.payload).expect("data corruption"),
+        }
+    }
+}
+
+/// A list's rows, packed, to be written in the order of their keys, in at most `memory` bytes.
 pub struct Rows {
     dim: usize,
+    memory: usize,
     fixed: Vec<Fixed>,
     /// per row: the signs of the code, a bit each
     signs: Vec<u64>,
@@ -170,9 +187,10 @@ pub struct Rows {
 }
 
 impl Rows {
-    pub fn new(dim: usize) -> Self {
+    pub fn new(dim: usize, memory: usize) -> Self {
         Self {
             dim,
+            memory,
             fixed: Vec::new(),
             signs: Vec::new(),
             prefetch: Vec::new(),
@@ -182,10 +200,16 @@ impl Rows {
     pub fn len(&self) -> usize {
         self.fixed.len()
     }
-    pub fn bytes(&self) -> usize {
-        let fixed = size_of::<Fixed>() + size_of::<u32>();
-        let words = self.signs.len() * size_of::<u64>() + self.prefetch.len() * 4;
-        self.len() * fixed + words + self.columns.len()
+    /// Whether they take their memory, with what `flush` adds.
+    pub fn is_full(&self) -> bool {
+        !self.fixed.is_empty() && self.len() >= self.most()
+    }
+    /// As many rows as `memory` holds, of the size of those it has.
+    fn most(&self) -> usize {
+        let words = self.signs.len() * size_of::<u64>() + self.prefetch.len() * size_of::<u32>();
+        let bytes =
+            self.len() * (size_of::<Fixed>() + size_of::<u32>()) + words + self.columns.len();
+        (self.memory / bytes.div_ceil(self.len())).max(1)
     }
     pub fn push(&mut self, row: tape::Row<'_, (rabitq::bit::Code, f32)>, keys: &Keys) {
         let ((m, signs), delta) = row.value;
@@ -193,17 +217,37 @@ impl Rows {
             metadata: [m.dis_u_2, m.factor_cnt, m.factor_ip, m.factor_err],
             delta,
             head: row.head,
-            payload: row.payload,
+            _padding: [0; 2],
+            payload: row.payload.get(),
         };
         // a frozen code is padded to a multiple of 4 signs, with zeros
         let signs = rabitq::bit::binary::pack_code(&signs[..self.dim]);
-        self.fixed(fixed, &signs, row.prefetch);
+        self.grow();
+        self.fixed.push(fixed);
+        self.signs.extend_from_slice(&signs);
+        self.prefetch.extend_from_slice(row.prefetch);
         row.columns.extend(keys, &mut self.columns);
     }
     /// A row from its parts, its signs and columns as an appendable tuple stores them.
     pub fn push_parts(&mut self, fixed: Fixed, signs: &[u64], prefetch: &[u32], columns: &[u8]) {
-        self.fixed(fixed, signs, prefetch);
+        self.grow();
+        self.fixed.push(fixed);
+        self.signs.extend_from_slice(signs);
+        self.prefetch.extend_from_slice(prefetch);
         self.columns.extend_from_slice(columns);
+    }
+    /// Room for one more row: they grow by doubling, but past their memory only by a few rows at a time.
+    fn grow(&mut self) {
+        let n = self.len();
+        if n == 0 || n < self.fixed.capacity() {
+            return;
+        }
+        let more = n.min(self.most().saturating_sub(n)).max(64);
+        self.fixed.reserve_exact(more);
+        self.signs.reserve_exact(more * (self.signs.len() / n));
+        self.prefetch
+            .reserve_exact(more * (self.prefetch.len() / n));
+        self.columns.reserve_exact(more * (self.columns.len() / n));
     }
     /// Hands the rows to `put` as `load` reads them, a few thousand at a time, and clears them.
     pub fn save(&mut self, mut put: impl FnMut(&[u8])) {
@@ -215,56 +259,40 @@ impl Rows {
             let end = self.len().min(start + 4096);
             out.clear();
             out.extend(((end - start) as u32).to_ne_bytes());
-            for x in &self.fixed[start..end] {
-                out.extend(x.metadata.as_bytes());
-                out.extend(x.delta.to_ne_bytes());
-                out.extend(x.head.to_ne_bytes());
-                out.extend(x.payload.get().to_ne_bytes());
-            }
+            out.extend(self.fixed[start..end].as_bytes());
             out.extend(self.signs[start * words..end * words].as_bytes());
             out.extend(self.prefetch[start * n..end * n].as_bytes());
             out.extend(&self.columns[start * width..end * width]);
             put(&out);
         }
-        *self = Self::new(self.dim);
+        *self = Self::new(self.dim, self.memory);
     }
     /// The rows `save` wrote, of `width` bytes of columns each.
     pub fn load(dim: usize, width: usize, bytes: &[u8]) -> Self {
-        let (n, mut bytes) = bytes.split_first_chunk().expect("saved rows");
+        let (n, bytes) = bytes.split_first_chunk().expect("saved rows");
         let n = u32::from_ne_bytes(*n) as usize;
-        let mut rows = Self::new(dim);
-        for _ in 0..n {
-            let fixed;
-            (fixed, bytes) = bytes.split_first_chunk::<30>().expect("saved rows");
-            let (metadata, fixed) = fixed.split_first_chunk::<16>().expect("saved rows");
-            let (delta, fixed) = fixed.split_first_chunk().expect("saved rows");
-            let (head, payload) = fixed.split_first_chunk().expect("saved rows");
-            rows.fixed.push(Fixed {
-                metadata: FromBytes::read_from_bytes(metadata).expect("saved rows"),
-                delta: f32::from_ne_bytes(*delta),
-                head: u16::from_ne_bytes(*head),
-                payload: NonZero::new(u64::from_ne_bytes(payload.try_into().expect("saved rows")))
-                    .expect("saved rows"),
-            });
-        }
-        let (signs, rest) = bytes.split_at(n * dim.div_ceil(64) * size_of::<u64>());
-        let (prefetch, columns) = rest.split_at(rest.len() - n * width);
-        rows.signs
-            .extend(signs.as_chunks().0.iter().map(|&x| u64::from_ne_bytes(x)));
-        rows.prefetch.extend(
-            prefetch
+        let (fixed, bytes) = bytes.split_at(n * size_of::<Fixed>());
+        let (signs, bytes) = bytes.split_at(n * dim.div_ceil(64) * size_of::<u64>());
+        let (prefetch, columns) = bytes.split_at(bytes.len() - n * width);
+        let read = |x: &[u8; size_of::<Fixed>()]| Fixed::read_from_bytes(x).expect("saved rows");
+        Self {
+            dim,
+            memory: usize::MAX,
+            fixed: fixed.as_chunks().0.iter().map(read).collect(),
+            signs: signs
                 .as_chunks()
                 .0
                 .iter()
-                .map(|&x| u32::from_ne_bytes(x)),
-        );
-        rows.columns.extend_from_slice(columns);
-        rows
-    }
-    fn fixed(&mut self, fixed: Fixed, signs: &[u64], prefetch: &[u32]) {
-        self.fixed.push(fixed);
-        self.signs.extend_from_slice(signs);
-        self.prefetch.extend_from_slice(prefetch);
+                .map(|&x| u64::from_ne_bytes(x))
+                .collect(),
+            prefetch: prefetch
+                .as_chunks()
+                .0
+                .iter()
+                .map(|&x| u32::from_ne_bytes(x))
+                .collect(),
+            columns: columns.to_vec(),
+        }
     }
     /// Writes the rows to `sink` in the order of their keys, stable, and clears them.
     pub fn flush(&mut self, keys: &Keys, mut sink: impl FnMut(Branch<NonZero<u64>>, &[u8])) {
@@ -272,32 +300,21 @@ impl Rows {
         let row = |i: u32| Columns::row(&self.columns[i as usize * width..][..width]);
         let mut order = (0..self.len() as u32).collect::<Vec<_>>();
         order.sort_unstable_by(|&i, &j| keys.cmp(row(i), row(j)).then(i.cmp(&j)));
-        for i in order {
-            let (branch, columns) = self.branch(i as _);
-            sink(branch, columns);
+        let (words, n) = (
+            self.dim.div_ceil(64),
+            self.prefetch.len() / self.len().max(1),
+        );
+        for i in order.into_iter().map(|i| i as usize) {
+            let (signs, prefetch) = (
+                &self.signs[i * words..][..words],
+                &self.prefetch[i * n..][..n],
+            );
+            sink(
+                self.fixed[i].branch(signs, prefetch, self.dim),
+                &self.columns[i * width..][..width],
+            );
         }
-        *self = Self::new(self.dim);
-    }
-    fn branch(&self, i: usize) -> (Branch<NonZero<u64>>, &[u8]) {
-        let Fixed {
-            metadata,
-            delta,
-            head,
-            payload,
-            ..
-        } = self.fixed[i];
-        let words = self.dim.div_ceil(64);
-        let n = self.prefetch.len() / self.len();
-        let width = self.columns.len() / self.len();
-        let branch = Branch {
-            code: unpack_code(metadata, &self.signs[i * words..][..words], self.dim),
-            delta,
-            prefetch: self.prefetch[i * n..][..n].to_vec(),
-            head,
-            norm: 0.0,
-            extra: payload,
-        };
-        (branch, &self.columns[i * width..][..width])
+        *self = Self::new(self.dim, self.memory);
     }
 }
 
@@ -309,4 +326,42 @@ pub fn unpack_code(metadata: [f32; 4], words: &[u64], dim: usize) -> rabitq::bit
         .take(dim)
         .collect();
     (rabitq::bit::CodeMetadata::from_array(metadata), signs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Rows grow to their memory, and past it by no more than a few rows.
+    #[test]
+    fn rows_stay_within_their_memory() {
+        let (signs, prefetch, columns) = ([u64::MAX; 12], [7_u32], [3_u8; 9]);
+        let fixed = Fixed {
+            metadata: [1.0; 4],
+            delta: 0.5,
+            head: 3,
+            _padding: [0; 2],
+            payload: 1,
+        };
+        let row = size_of::<Fixed>() + size_of::<u32>() + size_of_val(&signs) + 4 + columns.len();
+        for memory in [1000, 1 << 16, (1 << 20) + 1, 5 << 20] {
+            let mut rows = Rows::new(768, memory);
+            for _ in 0..2 {
+                while !rows.is_full() {
+                    rows.push_parts(fixed, &signs, &prefetch, &columns);
+                }
+                let held = rows.fixed.capacity() * (size_of::<Fixed>() + size_of::<u32>())
+                    + rows.signs.capacity() * size_of::<u64>()
+                    + rows.prefetch.capacity() * size_of::<u32>()
+                    + rows.columns.capacity();
+                assert!(
+                    held <= memory.max(row) + 64 * row,
+                    "{held} bytes held for {memory}"
+                );
+                let mut n = 0;
+                rows.flush(&Keys::new([]), |_, _| n += 1);
+                assert_eq!(n, (memory / row).max(1));
+            }
+        }
+    }
 }

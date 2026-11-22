@@ -243,7 +243,8 @@ impl<'a> Parts<'a> {
             metadata: FromBytes::read_from_bytes(metadata).expect("a row"),
             delta: f32::from_ne_bytes(*delta),
             head: 0,
-            payload: NonZero::new(u64::from_be_bytes(*payload)).expect("a row"),
+            _padding: [0; 2],
+            payload: u64::from_be_bytes(*payload),
         };
         Self {
             fixed,
@@ -256,6 +257,7 @@ impl<'a> Parts<'a> {
 
 /// Writes every list from `rows`, each in one run of pages: its vectors, its frozen tape, its appendable tape, its directory.
 /// `memory`: the most bytes of a list's codes held; past it they go to `spill` until the list's vectors are written.
+/// Without vectors in the index, a list's rows go straight to its tapes.
 pub fn write<R: RelationRead + RelationWrite, O: Operator>(
     index: &R,
     mut rows: impl Sorted,
@@ -279,7 +281,8 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
     for first in firsts {
         // Between lists nothing is locked (#28).
         index::interrupt::check();
-        let (mut pending, mut tuples, mut spilled) = (Rows::new(dim as _), 0_u64, false);
+        let mut list = rerank_in_heap.then(|| ListWriter::create(index, &keys));
+        let (mut pending, mut tuples, mut spilled) = (Rows::new(dim as _, memory), 0_u64, false);
         while let Some(bytes) = row
             && bytes[..4] == first.to_be_bytes()
         {
@@ -291,44 +294,43 @@ pub fn write<R: RelationRead + RelationWrite, O: Operator>(
             } = Parts::of(bytes, &keys, dim);
             signs.clear();
             signs.extend(bytes.as_chunks().0.iter().map(|&x| u64::from_ne_bytes(x)));
-            let mut moved = false;
-            let prefetch = if rerank_in_heap {
-                Vec::new()
+            tuples += 1;
+            // interrupts are served where the pages being written are unlocked: as a tape moves on to a page (#28)
+            if let Some(list) = list.as_mut() {
+                if list.push(fixed.branch(&signs, &[], dim as _), columns) {
+                    list.unlock();
+                    index::interrupt::check();
+                }
             } else {
                 let tape = vectors.get_or_insert_with(|| TapeWriter::create(index, true));
                 // a list's vectors begin on a page of their own
-                if tuples == 0 {
+                if tuples == 1 {
                     tape.renew();
                 }
                 let last = tape.last();
                 let vector = vectors::decode::<O::Vector>(dim, vector);
+                let payload = NonZero::new(fixed.payload).expect("a row");
                 let (prefetch, head) =
-                    vectors::write::<O>(vector.as_borrowed(), fixed.payload, |x| tape.push(x));
-                moved = tape.last() != last;
+                    vectors::write::<O>(vector.as_borrowed(), payload, |x| tape.push(x));
                 fixed.head = head;
-                prefetch
-            };
-            pending.push_parts(fixed, &signs, &prefetch, columns);
-            tuples += 1;
-            let full = pending.bytes() > memory;
-            // interrupts are served where the pages being written are unlocked: as a tape moves on to a page (#28)
-            if moved || full || rerank_in_heap {
-                if let Some(tape) = vectors.as_mut() {
+                pending.push_parts(fixed, &signs, &prefetch, columns);
+                let full = pending.is_full();
+                if tape.last() != last || full {
                     tape.unlock();
+                    index::interrupt::check();
                 }
-                index::interrupt::check();
-            }
-            // a temporary file is written and read with no page locked
-            if full {
-                pending.save(|piece| spill.put(piece));
-                spilled = true;
+                // a temporary file is written and read with no page locked
+                if full {
+                    pending.save(|piece| spill.put(piece));
+                    spilled = true;
+                }
             }
             row = rows.next();
         }
         if let Some(tape) = vectors.as_mut() {
             tape.unlock();
         }
-        let mut list = ListWriter::create(index, &keys);
+        let mut list = list.unwrap_or_else(|| ListWriter::create(index, &keys));
         let mut put = |rows: &mut Rows| {
             rows.flush(&keys, |branch, columns| {
                 if list.push(branch, columns) {
@@ -783,7 +785,9 @@ mod tests {
                 .map(|x| x[1] - x[0])
                 .max()
                 .unwrap_or(n as usize);
-            assert!(most <= 32, "{most} rows between checks, of {n}");
+            // vectors move on to a page every few rows; frozen rows, every few blocks of 32
+            let bound = if rerank_in_table { 32 * 8 } else { 32 };
+            assert!(most <= bound, "{most} rows between checks, of {n}");
         }
     }
 

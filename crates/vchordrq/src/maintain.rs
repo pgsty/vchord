@@ -216,7 +216,7 @@ where
         // the pages that the new list is placed for, as many as the old one took until its rows are counted
         let estimate = Cell::new(0);
         let mut tuples = 0_u64;
-        let rows = RefCell::new(Rows::new(dim as _));
+        let rows = RefCell::new(Rows::new(dim as _, memory));
         let mut push = id_2(|row| {
             rows.borrow_mut().push(row, &keys);
             tuples += 1;
@@ -237,7 +237,7 @@ where
         let mut list = None;
         let mut between = || {
             // a list larger than `memory` is written as sorted runs
-            if rows.borrow().bytes() > memory {
+            if rows.borrow().is_full() {
                 rows.borrow_mut()
                     .flush(&keys, |branch, columns| freeze(&mut list, branch, columns));
             }
