@@ -125,7 +125,7 @@ where
     let mut guard = index.write(freepages_first, false);
     if guard.get(2).is_none() {
         // as many runs as the page holds
-        let capacity = FreeRunsTuple::capacity(guard.freespace() as usize - 8);
+        let capacity = FreeRunsTuple::capacity((guard.freespace() as usize).saturating_sub(8));
         let bytes = FreeRunsTuple::serialize(&FreeRunsTuple { capacity });
         assert_eq!(guard.alloc(&bytes), Some(2), "data corruption");
     }
