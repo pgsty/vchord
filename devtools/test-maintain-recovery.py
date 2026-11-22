@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import time
 
@@ -33,6 +34,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--pg-bin', type=Path, required=True)
 parser.add_argument('--work', type=Path, required=True)
 parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[1])
+# a lifecycle (assets.npz, life.npz, emb.npy, as stdbench's life-b16-530k): the `take` cases run on a slice of it
+parser.add_argument('--life', type=Path)
 args = parser.parse_args()
 root = args.work.resolve()
 root.mkdir(exist_ok=False)
@@ -251,13 +254,66 @@ def pages(c, idx):
     return where, count, max(lists.values(), default=0)
 
 
-def found(c, table, lists=None):
+def found(c, table, lists=None, op='<->'):
     c.execute('SET enable_seqscan = off')
     if lists:
         c.execute(f"SET vchordrq.probes = '{lists}'")
-    sql = f'SELECT count(*), sum(id) FROM (SELECT id FROM {table} ORDER BY v <-> (SELECT v FROM {table} LIMIT 1) LIMIT 100000000) s'
+    sql = f'SELECT count(*), sum(id) FROM (SELECT id FROM {table} ORDER BY v {op} (SELECT v FROM {table} LIMIT 1) LIMIT 100000000) s'
     assert any('Index Scan' in r[0] for r in c.execute('EXPLAIN ' + sql)), 'not an index scan'
     return c.execute(sql).fetchone() == c.execute(f'SELECT count(*), sum(id) FROM {table}').fetchone()
+
+
+def copy_rows(c, table, ids, owners, vectors):
+    """binary COPY of (id int4, owner int8, v halfvec) rows"""
+    import numpy as np
+    out = bytearray(b'PGCOPY\n\xff\r\n\0' + struct.pack('>ii', 0, 0))
+    halves = np.asarray(vectors, np.float32).astype('>f2')
+    head = struct.pack('>hh', halves.shape[1], 0)
+    for i, o, h in zip(ids, owners, halves):
+        data = head + h.tobytes()
+        out += struct.pack('>hiiiq', 3, 4, int(i), 8, int(o)) + struct.pack('>i', len(data)) + data
+    out += struct.pack('>h', -1)
+    with c.cursor().copy(f'COPY {table} FROM STDIN (FORMAT binary)') as cp:
+        cp.write(bytes(out))
+
+
+def life_slice(c, table, idx):
+    """A few-list index of the lifecycle's first 15 sessions' uploads; then sessions until it grows by a third, their
+    permanent deletes, and a VACUUM, which keeps the lists' old pages as runs; then as many sessions again, for the
+    VACUUM under test to place each list in a run another left. (A single list cannot take its own old run, freed
+    only after its swap, and the run from the VACUUM before is less than half of a list grown by a third twice.)"""
+    import numpy as np
+    a, s = np.load(args.life / 'assets.npz'), np.load(args.life / 'life.npz')
+    emb = np.load(args.life / 'emb.npy', mmap_mode='r')
+    sd, st, up = s['sess_day'], s['sess_start'], s['up_order']
+    smart = (a['vis'] != 2) & (a['emb_row'] >= 0)
+    c.execute(f'DROP TABLE IF EXISTS {table}, {table}_stage')
+    c.execute(f'CREATE TABLE {table} (id int PRIMARY KEY, owner int8, v halfvec(768))')
+    c.execute(f'CREATE UNLOGGED TABLE {table}_stage (id int, owner int8, v halfvec(768))')
+
+    def apply(x0, x1):
+        ups = up[st[x0]:st[x1]]
+        ups = ups[smart[ups]]
+        for k in range(0, len(ups), 20000):
+            r = ups[k:k + 20000]
+            copy_rows(c, f'{table}_stage', r, a['owner'][r], emb[a['emb_row'][r]])
+            c.execute(f'INSERT INTO {table} SELECT * FROM {table}_stage ON CONFLICT (id) DO UPDATE SET v = excluded.v')
+            c.execute(f'TRUNCATE {table}_stage')
+        gone = np.flatnonzero(np.isin(s['del_day'], np.unique(sd[x0:x1])) & ~s['user_del'])
+        c.execute(f'DELETE FROM {table} WHERE id = ANY(%s)', (gone.tolist(),))
+        return c.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
+
+    def grown(x0, rows):
+        x = x0 + 1
+        while x < len(sd) and len(np.flatnonzero(smart[up[st[x0]:st[x]]])) < rows // 3:
+            x += 1
+        return x
+    rows = apply(0, 15)
+    c.execute(f"CREATE INDEX {idx} ON {table} USING vchordrq (v halfvec_cosine_ops, owner) WITH (options = $$\n[build.internal]\nlists = [4]\n$$)")
+    x = grown(15, rows)
+    rows = apply(15, x)
+    c.execute(f'VACUUM {table}')
+    apply(x, grown(x, rows))
 
 
 LISTS, DIM = 1100, 16
@@ -268,26 +324,32 @@ try:
         c.execute('CREATE EXTENSION IF NOT EXISTS vchord CASCADE')
         c.execute("CREATE FUNCTION _vchordrq_page_map(oid) RETURNS SETOF text STRICT LANGUAGE c AS 'vchord', '_vchordrq_page_map_wrapper'")
     standby_up()
-    for n, (stage, mode) in enumerate([(s, m) for s in ['swap', 'evict', 'take'] for m in ['crash', 'promote']]):
+    stages = ['swap', 'evict'] + (['take'] if args.life else [])
+    for n, (stage, mode) in enumerate([(s, m) for s in stages for m in ['crash', 'promote']]):
         table, idx = f'runs_{n}', f'runs_{n}_idx'
+        op = '<=>' if stage == 'take' else '<->'
         with connect(primary) as c:
-            # a list's rows near its own centroid. For `evict`, one row each at the build, then lists that outgrow
-            # their pages, so that the VACUUM extends for each and keeps more freed runs than fit; else all rows at
-            # the build, a tenth deleted, so that the VACUUM places each list in the run the one before it left
-            c.execute(f'DROP TABLE IF EXISTS {table}, {table}_c')
-            c.execute(f'CREATE TABLE {table}_c (id int PRIMARY KEY, parent int, vector vector({DIM}))')
-            c.execute(f"SELECT setseed({0.1 + n / 100})")
-            c.execute(f'INSERT INTO {table}_c SELECT i - 1, NULL, ARRAY(SELECT random() FROM generate_series(1, {DIM}))::real[]::vector FROM generate_series(1, {LISTS}) i')
-            c.execute(f'CREATE TABLE {table} (id int PRIMARY KEY, v vector({DIM}))')
-            near = f'unnest((SELECT vector::real[] FROM {table}_c WHERE id = g % {LISTS}))'
-            fill = lambda a, b: c.execute(f'INSERT INTO {table} SELECT g, ARRAY(SELECT x + 0.0001 * (g % 97) FROM {near} x)::vector FROM generate_series({a}, {b}) g')
-            fill(1, LISTS if stage == 'evict' else LISTS * 200)
-            c.execute(f"CREATE INDEX {idx} ON {table} USING vchordrq (v vector_l2_ops) WITH (options = $$\nbuild.external.table = 'public.{table}_c'\n$$)")
-            if stage == 'evict':
-                fill(LISTS + 1, LISTS * 200)
+            if stage == 'take':
+                life_slice(c, table, idx)
             else:
-                c.execute(f'DELETE FROM {table} WHERE id % 10 = 3')
+                # a list's rows near its own centroid. For `evict`, one row each at the build, then lists that outgrow
+                # their pages, so that the VACUUM extends for each and keeps more freed runs than fit; else all rows at
+                # the build, a tenth deleted, so that the VACUUM places each list in the run the one before it left
+                c.execute(f'DROP TABLE IF EXISTS {table}, {table}_c')
+                c.execute(f'CREATE TABLE {table}_c (id int PRIMARY KEY, parent int, vector vector({DIM}))')
+                c.execute(f"SELECT setseed({0.1 + n / 100})")
+                c.execute(f'INSERT INTO {table}_c SELECT i - 1, NULL, ARRAY(SELECT random() FROM generate_series(1, {DIM}))::real[]::vector FROM generate_series(1, {LISTS}) i')
+                c.execute(f'CREATE TABLE {table} (id int PRIMARY KEY, v vector({DIM}))')
+                near = f'unnest((SELECT vector::real[] FROM {table}_c WHERE id = g % {LISTS}))'
+                fill = lambda a, b: c.execute(f'INSERT INTO {table} SELECT g, ARRAY(SELECT x + 0.0001 * (g % 97) FROM {near} x)::vector FROM generate_series({a}, {b}) g')
+                fill(1, LISTS if stage == 'evict' else LISTS * 200)
+                c.execute(f"CREATE INDEX {idx} ON {table} USING vchordrq (v vector_l2_ops) WITH (options = $$\nbuild.external.table = 'public.{table}_c'\n$$)")
+                if stage == 'evict':
+                    fill(LISTS + 1, LISTS * 200)
+                else:
+                    c.execute(f'DELETE FROM {table} WHERE id % 10 = 3')
             before = pages(c, idx)
+
             c.execute('CHECKPOINT')
         with connect(primary) as a, ThreadPoolExecutor() as pool:
             marker.unlink(missing_ok=True)
@@ -324,12 +386,12 @@ try:
             where, count, largest = pages(c, idx)
             lost = count - len(where)
             assert lost <= 2 * before[2], f'{lost} pages lost, more than a list ({before[2]})'
-            assert found(c, table, LISTS), 'a row is not found'
-            c.execute(f'DELETE FROM {table} WHERE id % 10 = 7')
+            assert found(c, table, LISTS if stage != 'take' else 4, op), 'a row is not found'
+            c.execute(f'DELETE FROM {table} WHERE id % 10 = 7 AND id <> (SELECT id FROM {table} LIMIT 1)')
             c.execute(f'VACUUM {table}')
             where2, count2, _ = pages(c, idx)
             assert count2 - len(where2) <= lost, 'the second VACUUM lost pages'
-            assert found(c, table, LISTS), 'a row is not found after a second VACUUM'
+            assert found(c, table, LISTS if stage != 'take' else 4, op), 'a row is not found after a second VACUUM'
             kept = sum(1 for kind, l in where.values() if kind == 'free' and l == -2)
             results.append(dict(stage=stage, mode=mode, pages=count, lost=lost, largest_list=before[2],
                                 kept_run_pages=kept, second_vacuum_lost=count2 - len(where2)))
