@@ -276,9 +276,6 @@ jobs:
           tar -xzf "$d/sqllogictest.tar.gz" -C "$d" ./sqllogictest
           install -m 755 "$d/sqllogictest" /usr/local/bin/sqllogictest
 
-      - name: Install Rust
-        run: rustup update
-
       - name: Install Clang
         run: |
           d=$(mktemp -d)
@@ -328,6 +325,17 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust
+        env:
+          PG_MAJOR: ${{ matrix.version }}
+        run: |
+          toolchain=stable
+          if [ "$PG_MAJOR" = 15 ]; then
+            toolchain=$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "vchord") | .rust_version')
+          fi
+          rustup toolchain install "$toolchain" --profile minimal --component clippy
+          echo "RUSTUP_TOOLCHAIN=$toolchain" >> "$GITHUB_ENV"
 
       - name: Clippy
         run: make PROFILE=dev clippy

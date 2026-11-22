@@ -62,7 +62,7 @@ When an ordered scan can expand, RQ reranks the eligible lists and sorts their c
 
 ## Build from Source
 
-Requires PostgreSQL 15–19 development headers, pgvector, Rust 1.99.1+, GNU Make, and matching Clang, libclang, and LLVM tools on `x86_64` or `aarch64`. Built with pgrx 0.20.0.
+Requires PostgreSQL 15–19 development headers, pgvector, Rust 1.100.0+, GNU Make, and matching Clang, libclang, and LLVM tools on `x86_64` or `aarch64`. Built with pgrx 0.20.0.
 
 ```bash
 git clone https://github.com/pgsty/vchord.git
