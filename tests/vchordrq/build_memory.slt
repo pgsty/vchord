@@ -1,0 +1,83 @@
+# A one-list build of keyed, two-part vectors whose codes do not fit its memory finds what a build in ample memory
+# finds; a build over temp_file_limit fails and leaves no temporary file.
+
+statement ok
+CREATE TABLE bm (id int PRIMARY KEY, owner int8, v vector(3000));
+
+statement ok
+INSERT INTO bm SELECT i, i % 7 - 3, ARRAY(SELECT sin(i * 0.37 + j * (1 + i % 13)) FROM generate_series(1, 3000) j)::real[]::vector
+FROM generate_series(1, 4000) i;
+
+statement ok
+SET max_parallel_maintenance_workers = 0;
+
+statement ok
+SET enable_seqscan = off;
+
+statement ok
+CREATE INDEX bm_v ON bm USING vchordrq (v vector_l2_ops, owner) WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+CREATE TABLE bm_ample AS SELECT q.i, x.id FROM generate_series(1, 10) q(i),
+LATERAL (SELECT id FROM bm WHERE owner = q.i % 7 - 3 ORDER BY v <-> (SELECT v FROM bm WHERE id = q.i * 37) LIMIT 20) x;
+
+statement ok
+DROP INDEX bm_v;
+
+statement ok
+SET maintenance_work_mem = '1MB';
+
+statement ok
+CREATE INDEX bm_v ON bm USING vchordrq (v vector_l2_ops, owner) WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+CREATE TABLE bm_small AS SELECT q.i, x.id FROM generate_series(1, 10) q(i),
+LATERAL (SELECT id FROM bm WHERE owner = q.i % 7 - 3 ORDER BY v <-> (SELECT v FROM bm WHERE id = q.i * 37) LIMIT 20) x;
+
+query I
+SELECT count(*) FROM bm_small;
+----
+200
+
+query I
+SELECT count(*) FROM (SELECT * FROM bm_ample EXCEPT SELECT * FROM bm_small) s;
+----
+0
+
+statement ok
+DROP INDEX bm_v;
+
+statement ok
+SET temp_file_limit = '1MB';
+
+statement error temporary file size exceeds "temp_file_limit"
+CREATE INDEX bm_v ON bm USING vchordrq (v vector_l2_ops, owner) WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+statement ok
+RESET temp_file_limit;
+
+query I
+SELECT count(*) FROM pg_ls_tmpdir();
+----
+0
+
+statement ok
+RESET maintenance_work_mem;
+
+statement ok
+RESET max_parallel_maintenance_workers;
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE bm, bm_ample, bm_small;
