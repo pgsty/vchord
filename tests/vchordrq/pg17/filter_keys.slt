@@ -26,9 +26,10 @@ EXPLAIN (COSTS OFF) SELECT id FROM fc_any WHERE b = ANY('{00000000-0000-0000-000
   AND a = ANY('{1,2}') ORDER BY v <-> '[0.5,0.5,0.5]' LIMIT 10;
 ----
 Limit
-  ->  Index Scan using fc_any_v on fc_any
-        Index Cond: ((a = ANY ('{1,2}'::integer[])) AND (b = ANY ('{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004}'::uuid[])))
-        Order By: (v <-> '[0.5,0.5,0.5]'::vector)
+  ->  Custom Scan (VchordrqScan)
+        ->  Index Scan using fc_any_v on fc_any
+              Index Cond: ((a = ANY ('{1,2}'::integer[])) AND (b = ANY ('{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004}'::uuid[])))
+              Order By: (v <-> '[0.5,0.5,0.5]'::vector)
 
 query T
 SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM fc_any WHERE b = ANY('{00000000-0000-0000-0000-000000000003,00000000-0000-0000-0000-000000000004}'))

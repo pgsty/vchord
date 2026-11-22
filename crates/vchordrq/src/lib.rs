@@ -16,6 +16,7 @@ mod cost;
 mod fast_heap;
 mod freepages;
 mod insert;
+mod khint;
 mod linked_vec;
 mod maintain;
 mod prewarm;
@@ -38,6 +39,7 @@ pub use consume::consume;
 pub use cost::cost;
 pub use fast_heap::FastHeap;
 pub use insert::{InsertChooser, insert, insert_vector};
+pub use khint::{KHint, KKind};
 pub use maintain::{MaintainChooser, Pending, maintain};
 pub use prewarm::prewarm;
 pub use rerank::{

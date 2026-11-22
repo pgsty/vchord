@@ -205,7 +205,7 @@ CREATE FUNCTION rf_recheck(q text) RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE plan json;
 BEGIN
   EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) ' || q INTO plan;
-  RETURN (plan -> 0 -> 'Plan' -> 'Plans' -> 0 ->> 'Rows Removed by Index Recheck')::bigint;
+  RETURN jsonb_path_query_first(plan::jsonb, '$.**."Rows Removed by Index Recheck"')::bigint;
 END
 $$;
 

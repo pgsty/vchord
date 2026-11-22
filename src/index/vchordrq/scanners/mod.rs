@@ -55,6 +55,8 @@ pub struct SearchOptions {
     pub io_rerank: Io,
     pub prefilter: bool,
     pub table: crate::index::fetcher::TablePrefetch,
+    /// The scan node above owns the sphere around the vector.
+    pub owned: bool,
 }
 
 /// An opfamily's own vector type, taken out of an `OwnedVector` or read in place from a datum.

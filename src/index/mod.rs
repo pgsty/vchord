@@ -23,6 +23,7 @@ pub fn init() {
     gucs::init();
     hook::init();
     vchordrq::am::init();
+    vchordrq::node::init();
     vchordg::am::init();
     ::index::interrupt::set(check_for_interrupts);
 }

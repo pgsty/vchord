@@ -10,6 +10,7 @@ pub mod am;
 mod build;
 pub mod dispatch;
 pub mod filter_key;
+pub mod node;
 pub mod opclass;
 mod scanners;
 pub mod types;

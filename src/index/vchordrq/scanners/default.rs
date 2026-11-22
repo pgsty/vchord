@@ -25,6 +25,7 @@ use simd::f16;
 use std::borrow::Borrow;
 use std::num::NonZero;
 use std::rc::Rc;
+use vchordrq::KKind;
 use vchordrq::operator::{Operator, Vector};
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
 use vchordrq::{
@@ -89,7 +90,7 @@ impl SearchBuilder for DefaultBuilder {
     fn build<'b, R>(
         self,
         index: &'b R,
-        options: SearchOptions,
+        mut options: SearchOptions,
         fetcher: impl Fetcher + 'b,
         bump: &'b impl Bump,
         recorder: impl Recorder,
@@ -100,10 +101,9 @@ impl SearchBuilder for DefaultBuilder {
     {
         let mut vector = None;
         let mut threshold = None;
-        // PostgreSQL rechecks spheres, as for vchordg; only the first one around the search vector
-        // bounds the search.
-        let recheck = !self.spheres.is_empty()
-            || (options.search.filter.as_ref()).is_some_and(|filter| !filter.exact());
+        // Only the first sphere around the search vector bounds the search. PostgreSQL rechecks
+        // the others, and that one too unless the scan node owns it and nothing else is rechecked.
+        let mut others = (options.search.filter.as_ref()).is_some_and(|filter| !filter.exact());
         let opfamily = self.opfamily;
         // each vector as the index takes it, and as given
         let input = |raw: OwnedVector| (opfamily.normalized(&raw), raw);
@@ -114,14 +114,26 @@ impl SearchBuilder for DefaultBuilder {
                 pgrx::error!("vector search with multiple vectors is not supported");
             }
         }
-        for Sphere { center, radius } in self.spheres.into_iter().flatten() {
-            let center = input(center);
-            if vector.is_none() {
-                (vector, threshold) = (Some(center), Some(radius));
-            } else if threshold.is_none() && vector.as_ref().map(|x| &x.0) == Some(&center.0) {
-                threshold = Some(radius);
+        for sphere in self.spheres {
+            match sphere.map(|Sphere { center, radius }| (input(center), radius)) {
+                Some((center, radius)) if vector.is_none() => {
+                    (vector, threshold) = (Some(center), Some(radius));
+                }
+                Some((center, radius))
+                    if threshold.is_none() && vector.as_ref().map(|x| &x.0) == Some(&center.0) =>
+                {
+                    threshold = Some(radius);
+                }
+                _ => others = true,
             }
         }
+        let owned = options.owned && !others;
+        let recheck = others || (threshold.is_some() && !owned);
+        if recheck {
+            options.table.k = options.table.k.and(KKind::AtLeast);
+        }
+        #[cfg(debug_assertions)]
+        crate::index::vchordrq::node::record(options.table.k);
         let bound = threshold.map(|radius| opfamily.bound(radius));
         let Some((vector, raw)) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
@@ -249,11 +261,12 @@ impl SearchBuilder for DefaultBuilder {
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
             };
-        // `<=`: the index's distance may round up to the radius where the operator's is under it.
-        let iter = if let Some(threshold) = threshold {
-            Box::new(iter.take_while(move |(x, _)| *x <= threshold))
-        } else {
-            iter
+        // Owned, the sphere is the operator's `<` on the scan's distance; else `<=`, as the
+        // index's distance may round up to the radius where the operator's is under it.
+        let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> = match threshold {
+            Some(threshold) if owned => Box::new(iter.take_while(move |(x, _)| *x < threshold)),
+            Some(threshold) => Box::new(iter.take_while(move |(x, _)| *x <= threshold)),
+            None => iter,
         };
         let iter = if let Some(max_scan_tuples) = options.max_scan_tuples {
             Box::new(iter.take(max_scan_tuples as _))

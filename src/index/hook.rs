@@ -6,6 +6,25 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+pub unsafe fn dirty_check_vchordrq(
+    index_relation: *mut pgrx::pg_sys::RelationData,
+) -> Option<bool> {
+    type FnPtr = unsafe extern "C-unwind" fn(
+        *mut pgrx::pg_sys::RelationData,
+        i32,
+        i32,
+    ) -> *mut pgrx::pg_sys::IndexScanDescData;
+    unsafe {
+        let index_relation = index_relation.as_ref()?;
+        let indam = index_relation.rd_indam.as_ref()?;
+        let ambeginscan = indam.ambeginscan.as_ref()?;
+        Some(core::ptr::fn_addr_eq::<FnPtr, FnPtr>(
+            *ambeginscan,
+            crate::index::vchordrq::am::ambeginscan,
+        ))
+    }
+}
+
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn rewrite_plan_state(
     node: *mut pgrx::pg_sys::PlanState,
@@ -28,131 +47,77 @@ unsafe extern "C-unwind" fn rewrite_plan_state(
         }
     }
 
-    unsafe fn dirty_check_vchordrq(
-        index_relation: *mut pgrx::pg_sys::RelationData,
-    ) -> Option<bool> {
-        type FnPtr = unsafe extern "C-unwind" fn(
-            *mut pgrx::pg_sys::RelationData,
-            i32,
-            i32,
-        ) -> *mut pgrx::pg_sys::IndexScanDescData;
-        unsafe {
-            let index_relation = index_relation.as_ref()?;
-            let indam = index_relation.rd_indam.as_ref()?;
-            let ambeginscan = indam.ambeginscan.as_ref()?;
-            Some(core::ptr::fn_addr_eq::<FnPtr, FnPtr>(
-                *ambeginscan,
-                crate::index::vchordrq::am::ambeginscan,
-            ))
-        }
-    }
-
     unsafe {
         if (*node).type_ == pgrx::pg_sys::NodeTag::T_IndexScanState {
             let node = node as *mut pgrx::pg_sys::IndexScanState;
             let index_relation = (*node).iss_RelationDesc;
             if (*node).iss_ScanDesc.is_null() {
                 if Some(true) == dirty_check_vchordg(index_relation) {
-                    use crate::index::vchordg::am::Scanner;
-
-                    // `standard_ExecutorStart` has switched back to the caller's
-                    // context. Begin the scan in the query's context, as
-                    // `IndexNext` would; otherwise the Scanner lives as long as
-                    // the caller's context (for an SQL function on PG14-17, the
-                    // whole outer query) (#25).
-                    let _switch =
-                        crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
-                    #[cfg(feature = "pg18")]
-                    let instrument = if (*(*node).ss.ps.state).es_instrument != 0 {
-                        &raw mut (*node).iss_Instrument
-                    } else {
-                        std::ptr::null_mut()
-                    };
-                    #[cfg(feature = "pg19")]
-                    let flags: u32 = if pgrx::pg_sys::ScanRelIsReadOnly(&raw mut (*node).ss) {
-                        pgrx::pg_sys::ScanOptions::SO_HINT_REL_READ_ONLY as _
-                    } else {
-                        pgrx::pg_sys::ScanOptions::SO_NONE as _
-                    };
-                    (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
-                        (*node).ss.ss_currentRelation,
-                        (*node).iss_RelationDesc,
-                        (*(*node).ss.ps.state).es_snapshot,
-                        #[cfg(feature = "pg18")]
-                        instrument,
-                        #[cfg(feature = "pg19")]
-                        (*node).iss_Instrument,
-                        (*node).iss_NumScanKeys,
-                        (*node).iss_NumOrderByKeys,
-                        #[cfg(feature = "pg19")]
-                        flags,
-                    );
-
-                    let scanner = &mut *((*(*node).iss_ScanDesc).opaque as *mut Scanner);
-                    scanner.hack = std::ptr::NonNull::new(node);
-
-                    if (*node).iss_NumRuntimeKeys == 0 || (*node).iss_RuntimeKeysReady {
-                        pgrx::pg_sys::index_rescan(
-                            (*node).iss_ScanDesc,
-                            (*node).iss_ScanKeys,
-                            (*node).iss_NumScanKeys,
-                            (*node).iss_OrderByKeys,
-                            (*node).iss_NumOrderByKeys,
-                        );
-                    }
+                    let scanner = begin_scan(node).cast::<crate::index::vchordg::am::Scanner>();
+                    (*scanner).hack = std::ptr::NonNull::new(node);
+                    start_scan(node);
                 }
                 if Some(true) == dirty_check_vchordrq(index_relation) {
-                    use crate::index::vchordrq::am::Scanner;
-
-                    // `standard_ExecutorStart` has switched back to the caller's
-                    // context. Begin the scan in the query's context, as
-                    // `IndexNext` would; otherwise the Scanner lives as long as
-                    // the caller's context (for an SQL function on PG14-17, the
-                    // whole outer query) (#25).
-                    let _switch =
-                        crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
-                    #[cfg(feature = "pg18")]
-                    let instrument = if (*(*node).ss.ps.state).es_instrument != 0 {
-                        &raw mut (*node).iss_Instrument
-                    } else {
-                        std::ptr::null_mut()
-                    };
-                    #[cfg(feature = "pg19")]
-                    let flags: u32 = if pgrx::pg_sys::ScanRelIsReadOnly(&raw mut (*node).ss) {
-                        pgrx::pg_sys::ScanOptions::SO_HINT_REL_READ_ONLY as _
-                    } else {
-                        pgrx::pg_sys::ScanOptions::SO_NONE as _
-                    };
-                    (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
-                        (*node).ss.ss_currentRelation,
-                        (*node).iss_RelationDesc,
-                        (*(*node).ss.ps.state).es_snapshot,
-                        #[cfg(feature = "pg18")]
-                        instrument,
-                        #[cfg(feature = "pg19")]
-                        (*node).iss_Instrument,
-                        (*node).iss_NumScanKeys,
-                        (*node).iss_NumOrderByKeys,
-                        #[cfg(feature = "pg19")]
-                        flags,
-                    );
-
-                    let scanner = &mut *((*(*node).iss_ScanDesc).opaque as *mut Scanner);
-                    scanner.hack = std::ptr::NonNull::new(node);
-
-                    if (*node).iss_NumRuntimeKeys == 0 || (*node).iss_RuntimeKeysReady {
-                        pgrx::pg_sys::index_rescan(
-                            (*node).iss_ScanDesc,
-                            (*node).iss_ScanKeys,
-                            (*node).iss_NumScanKeys,
-                            (*node).iss_OrderByKeys,
-                            (*node).iss_NumOrderByKeys,
-                        );
-                    }
+                    let scanner = begin_scan(node).cast::<crate::index::vchordrq::am::Scanner>();
+                    (*scanner).hack = std::ptr::NonNull::new(node);
+                    start_scan(node);
                 }
             }
         }
         pgrx::pg_sys::planstate_tree_walker(node, Some(rewrite_plan_state), context)
+    }
+}
+
+/// Begins the index scan of `node` and returns its opaque state.
+pub unsafe fn begin_scan(node: *mut pgrx::pg_sys::IndexScanState) -> *mut core::ffi::c_void {
+    unsafe {
+        // `standard_ExecutorStart` has switched back to the caller's
+        // context. Begin the scan in the query's context, as
+        // `IndexNext` would; otherwise the Scanner lives as long as
+        // the caller's context (for an SQL function on PG14-17, the
+        // whole outer query) (#25).
+        let _switch = crate::index::MemoryContextSwitch::new((*(*node).ss.ps.state).es_query_cxt);
+        #[cfg(feature = "pg18")]
+        let instrument = if (*(*node).ss.ps.state).es_instrument != 0 {
+            &raw mut (*node).iss_Instrument
+        } else {
+            std::ptr::null_mut()
+        };
+        #[cfg(feature = "pg19")]
+        let flags: u32 = if pgrx::pg_sys::ScanRelIsReadOnly(&raw mut (*node).ss) {
+            pgrx::pg_sys::ScanOptions::SO_HINT_REL_READ_ONLY as _
+        } else {
+            pgrx::pg_sys::ScanOptions::SO_NONE as _
+        };
+        (*node).iss_ScanDesc = pgrx::pg_sys::index_beginscan(
+            (*node).ss.ss_currentRelation,
+            (*node).iss_RelationDesc,
+            (*(*node).ss.ps.state).es_snapshot,
+            #[cfg(feature = "pg18")]
+            instrument,
+            #[cfg(feature = "pg19")]
+            (*node).iss_Instrument,
+            (*node).iss_NumScanKeys,
+            (*node).iss_NumOrderByKeys,
+            #[cfg(feature = "pg19")]
+            flags,
+        );
+        (*(*node).iss_ScanDesc).opaque
+    }
+}
+
+/// Starts the scan as `IndexNext` would, unless its runtime keys wait for `ExecReScan`.
+unsafe fn start_scan(node: *mut pgrx::pg_sys::IndexScanState) {
+    unsafe {
+        if (*node).iss_NumRuntimeKeys == 0 || (*node).iss_RuntimeKeysReady {
+            pgrx::pg_sys::index_rescan(
+                (*node).iss_ScanDesc,
+                (*node).iss_ScanKeys,
+                (*node).iss_NumScanKeys,
+                (*node).iss_OrderByKeys,
+                (*node).iss_NumOrderByKeys,
+            );
+        }
     }
 }
 

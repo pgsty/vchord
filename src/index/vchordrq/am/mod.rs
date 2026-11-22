@@ -14,7 +14,7 @@ use crate::index::gucs;
 use crate::index::scanners::SearchBuilder;
 use crate::index::storage::PostgresRelation;
 use crate::index::vchordrq::filter_key::FilterKeys;
-use crate::index::vchordrq::opclass::{Opfamily, opfamily};
+use crate::index::vchordrq::opclass::{Opfamily, OrderByValue, opfamily};
 use crate::index::vchordrq::scanners::*;
 use crate::recorder::DefaultRecorder;
 use pgrx::pg_sys::Datum;
@@ -25,7 +25,7 @@ use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
-use vchordrq::{InsertChooser, SearchParams};
+use vchordrq::{InsertChooser, KHint, KKind, SearchParams};
 
 #[repr(C)]
 pub struct Reloption {
@@ -636,8 +636,19 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     use pgrx::memcxt::PgMemoryContexts::CurrentMemoryContext;
 
     let scan = unsafe { pgrx::pg_sys::RelationGetIndexScan(index_relation, n_keys, n_orderbys) };
+    let opfamily = unsafe { opfamily(index_relation) };
+    unsafe {
+        // `amgettuple` returns each row's distance as its ORDER BY value.
+        let n = n_orderbys.max(1) as usize;
+        (*scan).xs_orderbyvals = pgrx::pg_sys::palloc0(n * size_of::<Datum>()).cast();
+        (*scan).xs_orderbynulls = pgrx::pg_sys::palloc0(n).cast();
+    }
     let scanner: Scanner = Scanner {
         hack: None,
+        opfamily,
+        value: opfamily.value(),
+        owned: false,
+        k: KHint::UNKNOWN,
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         searched: false,
         scanning: None,
@@ -731,7 +742,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             return;
         }
         let filter = filter.flatten();
-        let opfamily = opfamily((*scan).indexRelation);
+        let opfamily = scanner.opfamily;
         let index = PostgresRelation::new((*scan).indexRelation);
         let probes = gucs::vchordrq_probes((*scan).indexRelation);
         {
@@ -746,7 +757,7 @@ pub unsafe extern "C-unwind" fn amrescan(
                 );
             }
         }
-        let options = SearchOptions {
+        let mut options = SearchOptions {
             search: SearchParams {
                 probes,
                 epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),
@@ -760,6 +771,14 @@ pub unsafe extern "C-unwind" fn amrescan(
             io_rerank: gucs::vchordrq_io_rerank(),
             prefilter: gucs::vchordrq_prefilter() && prefilter_safe(scanner.hack),
             table: TablePrefetch::new(scan),
+            owned: scanner.owned,
+        };
+        // The executor drops rows that fail a qual the scan does not evaluate itself.
+        let qual = (scanner.hack).is_some_and(|hack| !(*hack.as_ptr()).ss.ps.qual.is_null());
+        options.table.k = if qual && !options.prefilter {
+            scanner.k.and(KKind::AtLeast)
+        } else {
+            scanner.k
         };
         let fetcher = {
             let hack = scanner.hack;
@@ -880,11 +899,12 @@ pub unsafe extern "C-unwind" fn amgettuple(
             }
         }
     }
-    if let Some((_, key, recheck)) = scanning.deref_mut().next() {
+    if let Some((distance, key, recheck)) = scanning.deref_mut().next() {
         unsafe {
             (*scan).xs_heaptid = key_to_ctid(key);
             (*scan).xs_recheck = recheck;
             (*scan).xs_recheckorderby = false;
+            *(*scan).xs_orderbyvals = scanner.value.datum(distance);
         }
         true
     } else {
@@ -907,6 +927,12 @@ type Iter = Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
 
 pub struct Scanner {
     pub hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>,
+    opfamily: Opfamily,
+    value: OrderByValue,
+    /// The scan node above owns the sphere around the vector.
+    pub owned: bool,
+    /// How many rows the scan node above will take.
+    pub k: KHint,
     #[cfg(any(feature = "pg18", feature = "pg19"))]
     searched: bool,
     scanning: Option<LazyCell<Iter, Box<dyn FnOnce() -> Iter>>>,

@@ -112,6 +112,8 @@ static mut VCHORDRQ_MAXSIM_THRESHOLD_CONFIG: *mut pgrx::pg_sys::config_generic =
 
 static VCHORDRQ_PREFILTER: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+static VCHORDRQ_SCAN_NODE: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 static VCHORDRQ_IO_SEARCH: GucSetting<PostgresIoSearch> = GucSetting::<PostgresIoSearch>::new(
     #[cfg(any(feature = "pg15", feature = "pg16"))]
     PostgresIoSearch::PrefetchBuffer,
@@ -191,6 +193,14 @@ pub fn init() {
         &VCHORDRQ_MAXSIM_THRESHOLD,
         0,
         i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"vchordrq.scan_node",
+        c"`scan_node` argument of vchordrq.",
+        c"Whether a scan node hands up each vchordrq scan's distance and passes it the Limit.",
+        &VCHORDRQ_SCAN_NODE,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -554,6 +564,10 @@ pub fn vchordrq_maxsim_threshold(index: pgrx::pg_sys::Relation) -> u32 {
 
 pub fn vchordrq_prefilter() -> bool {
     VCHORDRQ_PREFILTER.get()
+}
+
+pub fn vchordrq_scan_node() -> bool {
+    VCHORDRQ_SCAN_NODE.get()
 }
 
 /// Whether `io_method` is `worker`, which hands every read of a read stream to an I/O worker.

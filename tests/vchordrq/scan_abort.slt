@@ -38,7 +38,7 @@ DO $$
 DECLARE plan json;
 BEGIN
   EXECUTE 'EXPLAIN (FORMAT JSON) SELECT id FROM vchordrq_scan_abort ORDER BY v <-> ''[0,0,0]'' LIMIT 10' INTO plan;
-  IF plan->0->'Plan'->'Plans'->0->>'Index Name' IS DISTINCT FROM 'vchordrq_scan_abort_idx' THEN
+  IF NOT jsonb_path_exists(plan::jsonb, '$.** ? (@."Index Name" == "vchordrq_scan_abort_idx")') THEN
     RAISE EXCEPTION 'expected vector index scan: %', plan;
   END IF;
 END $$;

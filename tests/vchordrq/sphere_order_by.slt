@@ -36,9 +36,10 @@ SELECT id FROM rq_sphere_order WHERE v <<->> sphere('[0.5, 0.5, 0.5]'::vector, 0
 ORDER BY v <-> '[0.5, 0.5, 0.5]' LIMIT 5;
 ----
 Limit
-  ->  Index Scan using rq_sphere_order_l2 on rq_sphere_order
-        Index Cond: (v <<->> '("[0.5,0.5,0.5]",0.2)'::sphere_vector)
-        Order By: (v <-> '[0.5,0.5,0.5]'::vector)
+  ->  Custom Scan (VchordrqScan)
+        ->  Index Scan using rq_sphere_order_l2 on rq_sphere_order
+              Index Cond: (v <<->> '("[0.5,0.5,0.5]",0.2)'::sphere_vector)
+              Order By: (v <-> '[0.5,0.5,0.5]'::vector)
 
 query T
 SELECT ARRAY(SELECT id FROM rq_sphere_order WHERE v <<->> sphere('[0.5, 0.5, 0.5]'::vector, 0.2)

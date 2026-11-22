@@ -28,9 +28,10 @@ EXPLAIN (COSTS OFF) EXECUTE rq_sphere_null_q(NULL);
 ----
 Aggregate
   ->  Limit
-        ->  Index Scan using rq_sphere_null_v on rq_sphere_null
-              Index Cond: (v <<->> $1)
-              Order By: (v <-> '[1,1,1]'::vector)
+        ->  Custom Scan (VchordrqScan)
+              ->  Index Scan using rq_sphere_null_v on rq_sphere_null
+                    Index Cond: (v <<->> $1)
+                    Order By: (v <-> '[1,1,1]'::vector)
 
 # The ORDER BY vector drives the scan; the null sphere must still exclude all.
 query T

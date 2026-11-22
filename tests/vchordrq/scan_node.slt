@@ -1,0 +1,370 @@
+# The scan node (src/index/vchordrq/node): above a vchordrq index scan, `col <op> q` is the
+# distance the scan computed and the scan owns the sphere around q. Rows equal those without
+# the node; where the node does not apply, the plan is PostgreSQL's.
+
+statement ok
+CREATE TABLE sn (id int PRIMARY KEY, owner int, v vector(3));
+INSERT INTO sn SELECT i, i % 7, ARRAY[sin(i), cos(i), sin(i * 0.7)]::real[]::vector
+FROM generate_series(1, 3000) i;
+CREATE TABLE sn_asset (id int PRIMARY KEY, owner int, visible bool);
+INSERT INTO sn_asset SELECT i, i % 7, i % 3 <> 0 FROM generate_series(1, 3000) i;
+CREATE TABLE sn_tag (id int, tag int);
+INSERT INTO sn_tag SELECT i, j FROM generate_series(1, 3000) i, generate_series(1, 2) j;
+CREATE INDEX sn_v ON sn USING vchordrq (v vector_cosine_ops);
+ANALYZE sn, sn_asset, sn_tag;
+
+statement ok
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET max_parallel_workers_per_gather = 0;
+
+# Rows of `q` with the node and without: the same ids in the same order, distances within
+# rounding.
+statement ok
+CREATE FUNCTION sn_same(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE a int[]; b int[]; x float8[]; y float8[];
+BEGIN
+  PERFORM set_config('vchordrq.scan_node', 'on', true);
+  EXECUTE format('SELECT array_agg(id), array_agg(d) FROM (%s) r', q) INTO a, x;
+  PERFORM set_config('vchordrq.scan_node', 'off', true);
+  EXECUTE format('SELECT array_agg(id), array_agg(d) FROM (%s) r', q) INTO b, y;
+  RETURN cardinality(a) > 0 AND a = b
+    AND (SELECT bool_and(abs(i - j) < 1e-6) FROM unnest(x, y) u(i, j));
+END $$;
+
+# The plan of `q`, run.
+statement ok
+CREATE FUNCTION sn_explain(q text) RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) ' || q INTO plan;
+  RETURN plan::jsonb;
+END $$;
+
+# The scan returns the distance; the index scan below no longer computes it.
+query T
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3;
+----
+Limit
+  Output: id, ((v <=> '[1,0,0]'::vector))
+  ->  Custom Scan (VchordrqScan)
+        Output: id, ((v <=> '[1,0,0]'::vector))
+        ->  Index Scan using sn_v on public.sn
+              Output: id
+              Order By: (sn.v <=> '[1,0,0]'::vector)
+
+query B
+SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 50$$);
+----
+t
+
+# above joins, subqueries and sorts, as Immich's statements have it
+query B
+SELECT sn_same($$SELECT s.id, s.v <=> '[0,1,0]' AS d FROM sn s JOIN sn_asset a ON a.id = s.id
+  WHERE a.visible AND a.owner = ANY('{1,2,3}') ORDER BY s.v <=> '[0,1,0]' LIMIT 20 OFFSET 30$$);
+----
+t
+
+query B
+SELECT sn_same($$SELECT s.id, s.v <=> '[0,1,0]' AS d FROM sn s
+  WHERE NOT EXISTS (SELECT FROM sn_asset a WHERE a.id = s.id AND NOT a.visible)
+  ORDER BY s.v <=> '[0,1,0]' LIMIT 20$$);
+----
+t
+
+query B
+SELECT sn_same($$SELECT s.id, s.v <=> '[0,0,1]' AS d FROM sn s ORDER BY s.v <=> '[0,0,1]', s.id LIMIT 20$$);
+----
+t
+
+query B
+SELECT sn_same($$SELECT n.id * 10000 + x.id AS id, x.d FROM sn n CROSS JOIN LATERAL
+  (SELECT s.id, s.v <=> n.v AS d FROM sn s WHERE s.id <> n.id ORDER BY s.v <=> n.v LIMIT 3) x
+  WHERE n.id <= 20 AND x.d < 0.01$$);
+----
+t
+
+query B
+SELECT sn_same($$SELECT id, d FROM (SELECT s.id, t.tag, s.v <=> '[1,1,0]' AS d FROM sn s
+  LEFT JOIN sn_tag t ON t.id = s.id ORDER BY s.v <=> '[1,1,0]' LIMIT 30) p WHERE tag = 1$$);
+----
+t
+
+# through a subquery scan that carries the distance only for the join above
+query B
+SELECT sn_same($$SELECT x.id, x.v <=> '[1,1,0]' AS d FROM (SELECT id, v FROM sn ORDER BY v <=> '[1,1,0]' LIMIT 30) x
+  JOIN sn_asset a ON a.id = x.id WHERE a.visible AND x.id % 2 = 0$$);
+----
+t
+
+statement ok
+EXPLAIN (VERBOSE) SELECT x.id, x.v <=> '[1,1,0]' FROM (SELECT id, v FROM sn ORDER BY v <=> '[1,1,0]' LIMIT 30) x
+JOIN sn_asset a ON a.id = x.id WHERE a.visible AND x.id % 2 = 0;
+
+# spheres: membership by the scan's distance, without a recheck
+query B
+SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.02)$$);
+----
+t
+
+query B
+SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.05)
+  ORDER BY v <=> '[1,0,0]'$$);
+----
+t
+
+statement ok
+CREATE TABLE sn_del1 AS SELECT * FROM sn;
+CREATE TABLE sn_del2 AS SELECT * FROM sn;
+CREATE INDEX ON sn_del1 USING vchordrq (v vector_cosine_ops);
+CREATE INDEX ON sn_del2 USING vchordrq (v vector_cosine_ops);
+
+statement ok
+SET vchordrq.scan_node = off;
+
+query II
+WITH d AS (DELETE FROM sn_del1 WHERE v <<=>> sphere('[0,1,0]'::vector, 0.05) RETURNING id)
+SELECT count(*), sum(id) FROM d;
+----
+48 70403
+
+statement ok
+RESET vchordrq.scan_node;
+
+query II
+WITH d AS (DELETE FROM sn_del2 WHERE v <<=>> sphere('[0,1,0]'::vector, 0.05) RETURNING id)
+SELECT count(*), sum(id) FROM d;
+----
+48 70403
+
+query B
+SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM sn_del1) FROM sn_del2;
+----
+t
+
+# generic plans and cursors
+statement ok
+SET plan_cache_mode = force_generic_plan;
+SET vchordrq.scan_node = off;
+PREPARE sn_off(vector, int, int) AS SELECT s.id FROM sn s JOIN sn_asset a ON a.id = s.id
+WHERE a.visible ORDER BY s.v <=> $1 LIMIT $2 OFFSET $3;
+SET vchordrq.scan_node = on;
+PREPARE sn_on(vector, int, int) AS SELECT s.id FROM sn s JOIN sn_asset a ON a.id = s.id
+WHERE a.visible ORDER BY s.v <=> $1 LIMIT $2 OFFSET $3;
+
+query I
+EXECUTE sn_off('[1,0,1]', 5, 3);
+----
+1277
+523
+146
+2452
+209
+
+query I
+EXECUTE sn_on('[1,0,1]', 5, 3);
+----
+1277
+523
+146
+2452
+209
+
+statement ok
+DEALLOCATE sn_off;
+DEALLOCATE sn_on;
+RESET plan_cache_mode;
+
+statement ok
+BEGIN;
+SET LOCAL vchordrq.scan_node = off;
+DECLARE sn_c1 CURSOR FOR SELECT id FROM sn ORDER BY v <=> '[0,1,1]';
+SET LOCAL vchordrq.scan_node = on;
+DECLARE sn_c2 CURSOR FOR SELECT id FROM sn ORDER BY v <=> '[0,1,1]';
+
+query I
+FETCH 4 FROM sn_c1;
+----
+1753
+1797
+1420
+2130
+
+query I
+FETCH 4 FROM sn_c1;
+----
+1376
+2174
+1043
+2507
+
+query I
+FETCH 4 FROM sn_c2;
+----
+1753
+1797
+1420
+2130
+
+query I
+FETCH 4 FROM sn_c2;
+----
+1376
+2174
+1043
+2507
+
+statement ok
+COMMIT;
+
+# a cursor's current row
+statement ok
+BEGIN;
+DECLARE sn_c3 CURSOR FOR SELECT id FROM sn_del2 ORDER BY v <=> '[0,1,1]';
+FETCH 2 FROM sn_c3;
+UPDATE sn_del2 SET owner = -1 WHERE CURRENT OF sn_c3;
+COMMIT;
+
+query I
+SELECT id FROM sn_del2 WHERE owner = -1;
+----
+1797
+
+# The distance is pgvector's range for cosine, [0, 2]: a row within rounding of its query
+# reports 0.
+query B
+SELECT bool_and(x.d >= 0 AND x.d <= 2) FROM sn q CROSS JOIN LATERAL
+  (SELECT v <=> q.v AS d FROM sn ORDER BY v <=> q.v LIMIT 1) x WHERE q.id <= 300;
+----
+t
+
+# Partitions: each one's scan is wrapped below the Append or Merge Append.
+statement ok
+CREATE TABLE sn_part (id int, v vector(3)) PARTITION BY RANGE (id);
+CREATE TABLE sn_part1 PARTITION OF sn_part FOR VALUES FROM (0) TO (1500);
+CREATE TABLE sn_part2 PARTITION OF sn_part FOR VALUES FROM (1500) TO (5000);
+INSERT INTO sn_part SELECT id, v FROM sn;
+CREATE INDEX ON sn_part USING vchordrq (v vector_cosine_ops);
+ANALYZE sn_part;
+
+query T
+EXPLAIN (COSTS OFF) SELECT id, v <=> '[1,0,0]' FROM sn_part ORDER BY v <=> '[1,0,0]' LIMIT 5;
+----
+Limit
+  ->  Merge Append
+        Sort Key: ((sn_part.v <=> '[1,0,0]'::vector))
+        ->  Custom Scan (VchordrqScan)
+              ->  Index Scan using sn_part1_v_idx on sn_part1 sn_part_1
+                    Order By: (v <=> '[1,0,0]'::vector)
+        ->  Custom Scan (VchordrqScan)
+              ->  Index Scan using sn_part2_v_idx on sn_part2 sn_part_2
+                    Order By: (v <=> '[1,0,0]'::vector)
+
+query B
+SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn_part ORDER BY v <=> '[1,0,0]' LIMIT 40$$);
+----
+t
+
+# Left alone: the setting off, vchordg and maxsim.
+statement ok
+SET vchordrq.scan_node = off;
+
+query T
+EXPLAIN (COSTS OFF) SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3;
+----
+Limit
+  ->  Index Scan using sn_v on sn
+        Order By: (v <=> '[1,0,0]'::vector)
+
+statement ok
+RESET vchordrq.scan_node;
+
+statement ok
+CREATE TABLE sn_g AS SELECT id, v FROM sn;
+CREATE INDEX ON sn_g USING vchordg (v vector_cosine_ops);
+
+query T
+EXPLAIN (COSTS OFF) SELECT id FROM sn_g ORDER BY v <=> '[1,0,0]' LIMIT 3;
+----
+Limit
+  ->  Index Scan using sn_g_v_idx on sn_g
+        Order By: (v <=> '[1,0,0]'::vector)
+
+statement ok
+CREATE TABLE sn_m (id int, m vector(3)[]);
+INSERT INTO sn_m SELECT id, ARRAY[v, v] FROM sn;
+CREATE INDEX ON sn_m USING vchordrq (m vector_maxsim_ops);
+
+query T
+EXPLAIN (COSTS OFF) SELECT id FROM sn_m ORDER BY m @# ARRAY['[1,0,0]'::vector] LIMIT 3;
+----
+Limit
+  ->  Index Scan using sn_m_m_idx on sn_m
+        Order By: (m @# '{"[1,0,0]"}'::vector[])
+
+# Parallel plans: workers run the node below a Gather.
+statement ok
+SET max_parallel_workers_per_gather = 2;
+SELECT set_config(CASE WHEN current_setting('server_version_num')::int >= 160000
+  THEN 'debug_parallel_query' ELSE 'force_parallel_mode' END, 'on', false);
+
+query T
+EXPLAIN (COSTS OFF) SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3;
+----
+Gather
+  Workers Planned: 1
+  Single Copy: true
+  ->  Limit
+        ->  Custom Scan (VchordrqScan)
+              ->  Index Scan using sn_v on sn
+                    Order By: (v <=> '[1,0,0]'::vector)
+
+query B
+SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 20$$);
+----
+t
+
+query B
+SELECT jsonb_path_query_first(sn_explain($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3$$),
+  '$.**."Workers Launched"')::int > 0;
+----
+t
+
+statement ok
+SELECT set_config(CASE WHEN current_setting('server_version_num')::int >= 160000
+  THEN 'debug_parallel_query' ELSE 'force_parallel_mode' END, 'off', false);
+
+# a hashed subplan that each worker runs
+statement ok
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET enable_seqscan = on;
+SET enable_sort = off;
+
+query BB
+SELECT jsonb_path_exists(p, '$.** ? (@."Node Type" == "Gather").** ? (@."Custom Plan Provider" == "VchordrqScan")'),
+  jsonb_path_query_first(p, '$.**."Workers Launched"')::int > 0
+FROM sn_explain($$SELECT a.id FROM sn_asset a
+  WHERE a.id IN (SELECT s.id FROM sn s ORDER BY s.v <=> '[1,0,0]' LIMIT 50) OR a.id < 0$$) p;
+----
+t t
+
+query B
+SELECT sn_same($$SELECT a.id, 0::float8 AS d FROM sn_asset a
+  WHERE a.id IN (SELECT s.id FROM sn s ORDER BY s.v <=> '[1,0,0]' LIMIT 50) OR a.id < 0 ORDER BY a.id$$);
+----
+t
+
+statement ok
+RESET max_parallel_workers_per_gather;
+RESET enable_sort;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+
+statement ok
+DROP FUNCTION sn_same, sn_explain;
+DROP TABLE sn, sn_asset, sn_tag, sn_del1, sn_del2, sn_part, sn_g, sn_m;

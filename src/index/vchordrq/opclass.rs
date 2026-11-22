@@ -334,6 +334,25 @@ impl Opfamily {
             | Self::Rabitq4Maxsim => x.to_f32(),
         }
     }
+    /// How [`Self::output`] becomes the ORDER BY operator's value.
+    pub fn value(self) -> OrderByValue {
+        match self {
+            Self::VectorCosine | Self::HalfvecCosine => OrderByValue::Cosine,
+            Self::VectorL2 | Self::HalfvecL2 | Self::VectorIp | Self::HalfvecIp => {
+                OrderByValue::Double
+            }
+            Self::Rabitq8L2
+            | Self::Rabitq8Ip
+            | Self::Rabitq8Cosine
+            | Self::Rabitq4L2
+            | Self::Rabitq4Ip
+            | Self::Rabitq4Cosine
+            | Self::VectorMaxsim
+            | Self::HalfvecMaxsim
+            | Self::Rabitq8Maxsim
+            | Self::Rabitq4Maxsim => OrderByValue::Real,
+        }
+    }
     /// The inverse of [`Self::output`] at a sphere's radius, rounded up.
     pub fn bound(self, radius: f32) -> Distance {
         match self {
@@ -391,6 +410,25 @@ impl Opfamily {
             Self::Rabitq4L2 | Self::Rabitq4Ip | Self::Rabitq4Cosine | Self::Rabitq4Maxsim => {
                 VectorKind::Rabitq4
             }
+        }
+    }
+}
+
+/// The ORDER BY operator's result type, and the range pgvector's cosine distance keeps.
+#[derive(Debug, Clone, Copy)]
+pub enum OrderByValue {
+    Double,
+    Cosine,
+    Real,
+}
+
+impl OrderByValue {
+    #[inline(always)]
+    pub fn datum(self, distance: f32) -> Datum {
+        match self {
+            Self::Double => Datum::from(f64::from(distance).to_bits() as usize),
+            Self::Cosine => Datum::from(f64::from(distance.clamp(0.0, 2.0)).to_bits() as usize),
+            Self::Real => Datum::from(distance.to_bits() as usize),
         }
     }
 }

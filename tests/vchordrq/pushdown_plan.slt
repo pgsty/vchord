@@ -23,9 +23,10 @@ query I
 EXPLAIN (COSTS FALSE, TIMING FALSE) 
 SELECT val0 FROM t WHERE val0 <<->> sphere('[0, 0, 0]'::vector, 1) ORDER BY val0 <-> '[0, 0, 0]';
 ----
- Index Scan using ind0 on t
-   Index Cond: (val0 <<->> '("[0,0,0]",1)'::sphere_vector)
-   Order By: (val0 <-> '[0,0,0]'::vector)
+Custom Scan (VchordrqScan)
+  ->  Index Scan using ind0 on t
+        Index Cond: (val0 <<->> '("[0,0,0]",1)'::sphere_vector)
+        Order By: (val0 <-> '[0,0,0]'::vector)
 
 # 1 vector key + 0 order_by key + original style
 
@@ -76,16 +77,18 @@ query I
 EXPLAIN (COSTS FALSE, TIMING FALSE) 
 SELECT val0 FROM t WHERE val0 <<->> sphere('[0, 0, 0]'::vector, 1);
 ----
- Index Scan using ind0 on t
-   Index Cond: (val0 <<->> '("[0,0,0]",1)'::sphere_vector)
+Custom Scan (VchordrqScan)
+  ->  Index Scan using ind0 on t
+        Index Cond: (val0 <<->> '("[0,0,0]",1)'::sphere_vector)
 
 # 0 vector key + 1 order_by key
 query I
 EXPLAIN (COSTS FALSE, TIMING FALSE) 
 SELECT val0 FROM t ORDER BY val0 <-> '[0, 0, 0]';
 ----
- Index Scan using ind0 on t
-   Order By: (val0 <-> '[0,0,0]'::vector)
+Custom Scan (VchordrqScan)
+  ->  Index Scan using ind0 on t
+        Order By: (val0 <-> '[0,0,0]'::vector)
 
 # 2 vector key(1 of them is corresponding) + 1 order_by key + original style
 # query I
@@ -156,9 +159,10 @@ EXPLAIN (COSTS FALSE, TIMING FALSE)
 SELECT val0 FROM t WHERE val0 <<#>> sphere('[0, 0, 0]'::vector, 1) 
 ORDER BY val0 <-> '[0, 0, 0]';
 ----
- Index Scan using ind0 on t
-   Order By: (val0 <-> '[0,0,0]'::vector)
-   Filter: (val0 <<#>> '("[0,0,0]",1)'::sphere_vector)
+Custom Scan (VchordrqScan)
+  ->  Index Scan using ind0 on t
+        Order By: (val0 <-> '[0,0,0]'::vector)
+        Filter: (val0 <<#>> '("[0,0,0]",1)'::sphere_vector)
 
 # 1 vector key + 1 not corresponding order_by key(variable) + sphere style
 # query I

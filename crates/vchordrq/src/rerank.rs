@@ -9,7 +9,7 @@
 use crate::closure_lifetime_binder::id_4;
 use crate::operator::*;
 use crate::tuples::{MetaTuple, WithReader};
-use crate::{RerankMethod, vectors};
+use crate::{KHint, RerankMethod, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use index::fetch::BorrowedIter;
@@ -43,12 +43,18 @@ pub fn how(index: &impl RelationRead) -> RerankMethod {
 pub trait Table {
     /// The most rows to read ahead; zero reads none.
     fn window(&self) -> usize;
+    /// How many rows will be fetched, as the executor hints it.
+    fn k(&self) -> KHint;
     fn prefetch(&mut self, payload: NonZero<u64>);
 }
 
 impl Table for () {
     fn window(&self) -> usize {
         0
+    }
+
+    fn k(&self) -> KHint {
+        KHint::UNKNOWN
     }
 
     fn prefetch(&mut self, _: NonZero<u64>) {}
@@ -340,6 +346,10 @@ mod tests {
     impl Table for Recorder<'_> {
         fn window(&self) -> usize {
             self.0
+        }
+
+        fn k(&self) -> KHint {
+            KHint::UNKNOWN
         }
 
         fn prefetch(&mut self, payload: NonZero<u64>) {
