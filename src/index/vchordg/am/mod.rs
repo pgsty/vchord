@@ -482,7 +482,6 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     let scan = unsafe { pgrx::pg_sys::RelationGetIndexScan(index_relation, n_keys, n_orderbys) };
     let scanner: Scanner = Scanner {
         hack: None,
-        #[cfg(any(feature = "pg18", feature = "pg19"))]
         searched: false,
         scanning: None,
         bump: Box::new(bumpalo::Bump::new()),
@@ -515,10 +514,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             );
         }
         let scanner = &mut *(*scan).opaque.cast::<Scanner>();
-        #[cfg(any(feature = "pg18", feature = "pg19"))]
-        {
-            scanner.searched = false;
-        }
+        scanner.searched = false;
         drop(scanner.scanning.take());
         scanner.bump.reset();
         let opfamily = opfamily((*scan).indexRelation);
@@ -614,10 +610,11 @@ pub unsafe extern "C-unwind" fn amgettuple(
     let Some(scanning) = scanner.scanning.as_mut() else {
         return false;
     };
-    #[cfg(any(feature = "pg18", feature = "pg19"))]
     if !scanner.searched {
         scanner.searched = true;
         unsafe {
+            crate::index::count_index_scan((*scan).indexRelation);
+            #[cfg(any(feature = "pg18", feature = "pg19"))]
             if !(*scan).instrument.is_null() {
                 (*(*scan).instrument).nsearches += 1;
             }
@@ -638,10 +635,7 @@ pub unsafe extern "C-unwind" fn amgettuple(
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn amendscan(scan: pgrx::pg_sys::IndexScanDesc) {
     let scanner = unsafe { &mut *(*scan).opaque.cast::<Scanner>() };
-    #[cfg(any(feature = "pg18", feature = "pg19"))]
-    {
-        scanner.searched = false;
-    }
+    scanner.searched = false;
     drop(scanner.scanning.take());
     scanner.bump.reset();
 }
@@ -650,7 +644,6 @@ type Iter = Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
 
 pub struct Scanner {
     pub hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>,
-    #[cfg(any(feature = "pg18", feature = "pg19"))]
     searched: bool,
     scanning: Option<LazyCell<Iter, Box<dyn FnOnce() -> Iter>>>,
     bump: Box<bumpalo::Bump>,

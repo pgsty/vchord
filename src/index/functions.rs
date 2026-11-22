@@ -163,6 +163,7 @@ fn open_checked(indexrelid: Oid, access: IndexAccess) -> Index {
 fn _vchordg_prewarm(indexrelid: Oid) -> String {
     validate_index(indexrelid, c"vchordg", "vchordg");
     let relation = open_checked(indexrelid, IndexAccess::Prewarm);
+    relation.check_valid("_vchordg_prewarm");
     let opfamily = unsafe { crate::index::vchordg::opclass::opfamily(relation.raw()) };
     let index = unsafe { PostgresRelation::new(relation.raw()) };
     crate::index::vchordg::dispatch::prewarm(opfamily, &index)
@@ -172,6 +173,7 @@ fn _vchordg_prewarm(indexrelid: Oid) -> String {
 fn _vchordrq_prewarm(indexrelid: Oid, height: i32) -> String {
     validate_index(indexrelid, c"vchordrq", "vchordrq");
     let relation = open_checked(indexrelid, IndexAccess::Prewarm);
+    relation.check_valid("_vchordrq_prewarm");
     let opfamily = unsafe { crate::index::vchordrq::opclass::opfamily(relation.raw()) };
     let index = unsafe { PostgresRelation::new(relation.raw()) };
     crate::index::vchordrq::dispatch::prewarm(opfamily, &index, height)
@@ -192,12 +194,34 @@ impl Index {
     fn raw(&self) -> *mut pgrx::pg_sys::RelationData {
         self.raw
     }
+    fn is_valid(&self) -> bool {
+        unsafe { (*(*self.raw).rd_index).indisvalid }
+    }
+    fn check_valid(&self, func: &'static str) {
+        if !self.is_valid() {
+            let name = unsafe {
+                CStr::from_ptr((*(*self.raw).rd_rel).relname.data.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            pgrx::pg_sys::panic::ErrorReport::new(
+                pgrx::PgSqlErrorCode::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+                format!("index \"{name}\" is not valid"),
+                func,
+            )
+            .set_hint("REINDEX the index or drop it.")
+            .report(pgrx::PgLogLevel::ERROR);
+            unreachable!();
+        }
+    }
 }
 
 impl Drop for Index {
     fn drop(&mut self) {
-        unsafe {
-            pgrx::pg_sys::index_close(self.raw, self.lockmode);
+        if crate::index::cleanup::pg_cleanup_allowed() {
+            unsafe {
+                pgrx::pg_sys::index_close(self.raw, self.lockmode);
+            }
         }
     }
 }

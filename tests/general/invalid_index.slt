@@ -1,0 +1,82 @@
+# Prewarm must reject invalid indexes (left by a failed CREATE INDEX CONCURRENTLY)
+# cleanly with SQLSTATE 55000 before reading any index pages.
+
+statement ok
+CREATE TABLE invalid_prewarm (id int, val vector(3));
+
+statement ok
+INSERT INTO invalid_prewarm VALUES (1, '[1, 2, 3]'), (2, '[4, 5, 6]');
+
+statement ok
+CREATE FUNCTION invalid_prewarm_vec(id int, val vector(3)) RETURNS vector(3) IMMUTABLE LANGUAGE plpgsql AS $$
+BEGIN
+    IF id = 2 THEN
+        RAISE EXCEPTION 'cannot index row %', id;
+    END IF;
+    RETURN val;
+END
+$$;
+
+statement error cannot index row 2
+CREATE INDEX CONCURRENTLY invalid_prewarm_rq ON invalid_prewarm USING vchordrq ((invalid_prewarm_vec(id, val)::vector(3)) vector_l2_ops);
+
+statement error cannot index row 2
+CREATE INDEX CONCURRENTLY invalid_prewarm_g ON invalid_prewarm USING vchordg ((invalid_prewarm_vec(id, val)::vector(3)) vector_l2_ops);
+
+query II
+SELECT indisvalid::int, indisready::int FROM pg_index WHERE indexrelid = 'invalid_prewarm_rq'::regclass;
+----
+0 0
+
+query II
+SELECT indisvalid::int, indisready::int FROM pg_index WHERE indexrelid = 'invalid_prewarm_g'::regclass;
+----
+0 0
+
+statement error index "invalid_prewarm_rq" is not valid
+SELECT vchordrq_prewarm('invalid_prewarm_rq', 0);
+
+statement error index "invalid_prewarm_g" is not valid
+SELECT vchordg_prewarm('invalid_prewarm_g');
+
+statement ok
+CREATE FUNCTION invalid_prewarm_sqlstate(fn text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    IF fn = 'rq' THEN
+        PERFORM vchordrq_prewarm('invalid_prewarm_rq', 0);
+    ELSE
+        PERFORM vchordg_prewarm('invalid_prewarm_g');
+    END IF;
+    RETURN 'no error';
+EXCEPTION WHEN OTHERS THEN
+    RETURN SQLSTATE;
+END
+$$;
+
+query TT
+SELECT invalid_prewarm_sqlstate('rq'), invalid_prewarm_sqlstate('g');
+----
+55000 55000
+
+statement ok
+DELETE FROM invalid_prewarm WHERE id = 2;
+
+statement ok
+REINDEX INDEX invalid_prewarm_rq;
+
+statement ok
+REINDEX INDEX invalid_prewarm_g;
+
+query TT
+SELECT invalid_prewarm_sqlstate('rq'), invalid_prewarm_sqlstate('g');
+----
+no error no error
+
+statement ok
+DROP TABLE invalid_prewarm;
+
+statement ok
+DROP FUNCTION invalid_prewarm_sqlstate(text);
+
+statement ok
+DROP FUNCTION invalid_prewarm_vec(int, vector);

@@ -42,6 +42,28 @@ fn check_for_interrupts() {
 /// structural exclusion (#32).
 pub const UNUSABLE_PATH_COST: f64 = 1.0e30;
 
+/// Mirror PostgreSQL's `pgstat_count_index_scan(rel)` macro so
+/// `pg_stat_user_indexes.idx_scan` tracks index searches across PG 15–19.
+#[inline]
+pub(crate) unsafe fn count_index_scan(rel: pgrx::pg_sys::Relation) {
+    unsafe {
+        if (*rel).pgstat_info.is_null() {
+            if !(*rel).pgstat_enabled {
+                return;
+            }
+            pgrx::pg_sys::pgstat_assoc_relation(rel);
+        }
+        #[cfg(feature = "pg15")]
+        {
+            (*(*rel).pgstat_info).t_counts.t_numscans += 1;
+        }
+        #[cfg(any(feature = "pg16", feature = "pg17", feature = "pg18", feature = "pg19"))]
+        {
+            (*(*rel).pgstat_info).counts.numscans += 1;
+        }
+    }
+}
+
 /// A handler's C entry points without pgrx's guard: the planner calls it per operator class member.
 macro_rules! am_handler {
     ($name:ident, $routine:expr) => {

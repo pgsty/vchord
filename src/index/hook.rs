@@ -172,7 +172,9 @@ unsafe extern "C-unwind" fn executor_start(
         } else {
             pgrx::pg_sys::standard_ExecutorStart(query_desc, eflags)
         }
-        pg_guard_ffi_boundary(|| rewrite_plan_state((*query_desc).planstate, null_mut()));
+        if eflags & pgrx::pg_sys::EXEC_FLAG_EXPLAIN_ONLY as core::ffi::c_int == 0 {
+            pg_guard_ffi_boundary(|| rewrite_plan_state((*query_desc).planstate, null_mut()));
+        }
     }
 }
 

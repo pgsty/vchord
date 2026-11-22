@@ -54,6 +54,41 @@ Nested Loop (actual rows=6.00 loops=1)
               Order By: (v <-> "*VALUES*".column1)
               Index Searches: 3
 
+# pg_stat_user_indexes.idx_scan tracks vchordg index scans and rescans across PG 15-19.
+statement ok
+DO $$
+DECLARE
+    before_scans bigint;
+    after_single bigint;
+    after_lateral bigint;
+BEGIN
+    before_scans := pg_stat_get_xact_numscans('vchordg_stats_idx'::regclass);
+    PERFORM id FROM vchordg_stats ORDER BY v <-> '[1, 1, 1]' LIMIT 3;
+    after_single := pg_stat_get_xact_numscans('vchordg_stats_idx'::regclass);
+    IF after_single - before_scans <> 1 THEN
+        RAISE EXCEPTION 'expected +1 xact numscans for single scan, got %', after_single - before_scans;
+    END IF;
+    PERFORM s.id
+    FROM (VALUES ('[1,1,1]'::vector), ('[2,2,2]'::vector), ('[3,3,3]'::vector)) AS q(qv)
+    CROSS JOIN LATERAL (SELECT id FROM vchordg_stats ORDER BY v <-> q.qv LIMIT 2) AS s;
+    after_lateral := pg_stat_get_xact_numscans('vchordg_stats_idx'::regclass);
+    IF after_lateral - after_single <> 3 THEN
+        RAISE EXCEPTION 'expected +3 xact numscans for lateral rescan, got %', after_lateral - after_single;
+    END IF;
+END
+$$;
+
+statement ok
+SELECT pg_stat_force_next_flush();
+
+statement ok
+SELECT pg_stat_clear_snapshot();
+
+query B
+SELECT pg_stat_get_numscans('vchordg_stats_idx'::regclass) >= 4;
+----
+t
+
 statement ok
 RESET enable_seqscan;
 
