@@ -49,9 +49,6 @@ jobs:
         arch: ["x86_64", "aarch64"]
     runs-on: ${{ matrix.arch == 'x86_64' && 'ubuntu-22.04' || 'ubuntu-22.04-arm' }}
 
-    permissions:
-      contents: write
-
     # Warnings are enforced by the Check workflow; a new rustc lint on release
     # day must not fail an already-validated tag.
     env:
@@ -74,9 +71,11 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-all-errors -o "$d/llvm.sh" "https://apt.llvm.org/llvm.sh"
           sudo bash "$d/llvm.sh" 18
           sudo apt-get install -y --no-install-recommends llvm-18 libclang-18-dev
-          echo CC=clang-18 >> $GITHUB_ENV
-          echo CLANG_PATH=/usr/bin/clang-18 >> $GITHUB_ENV
-          echo LIBCLANG_PATH=/usr/lib/llvm-18/lib >> $GITHUB_ENV
+          {
+            echo CC=clang-18
+            echo CLANG_PATH=/usr/bin/clang-18
+            echo LIBCLANG_PATH=/usr/lib/llvm-18/lib
+          } >> "$GITHUB_ENV"
 
       - name: Install PostgreSQL
         run: |
@@ -104,26 +103,23 @@ jobs:
 
       - name: Package (binary package)
         env:
-          GH_TOKEN: ${{ github.token }}
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
           VERSION: ${{ matrix.version }}
         run: |
           ARCH=$(uname -m)
           ASSET=postgresql-${VERSION}-vchord_${SEMVER}_${ARCH}-linux-gnu.zip
+          mkdir -p dist
           cp LICENSE ./build/LICENSE
-          (cd ./build && zip -r ~/${ASSET} .)
-          (cd ~ && sha256sum ${ASSET} > ${ASSET}.sha256)
-          # No --clobber: published assets must never be replaced silently.
-          gh release upload $SEMVER ~/${ASSET} ~/${ASSET}.sha256
+          (cd build && zip -r "../dist/$ASSET" .)
+          (cd dist && sha256sum "$ASSET" > "$ASSET.sha256")
 
       - name: Package (debian package)
         env:
-          GH_TOKEN: ${{ github.token }}
           SEMVER: ${{ needs.semver.outputs.SEMVER }}
           VERSION: ${{ matrix.version }}
         run: |
           make DESTDIR="$HOME/debian" install
-          mkdir -p ~/debian/usr/share/doc/postgresql-${VERSION}-vchord/
+          mkdir -p "$HOME/debian/usr/share/doc/postgresql-${VERSION}-vchord/"
           echo "Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
           Upstream-Name: vchord
           Source: https://github.com/pgsty/vchord
@@ -136,8 +132,7 @@ jobs:
           License: AGPL-3.0-only
            $(cat ./LICENSE | sed 's/^$/./' | sed 's/^/ /')
           " \
-          >> ~/debian/usr/share/doc/postgresql-${VERSION}-vchord/copyright
-          ARCH=$(uname -m)
+          >> "$HOME/debian/usr/share/doc/postgresql-${VERSION}-vchord/copyright"
           PLATFORM=$(dpkg --print-architecture)
           mkdir -p ~/debian/DEBIAN
           echo "Package: postgresql-${VERSION}-vchord
@@ -155,13 +150,47 @@ jobs:
           > ~/debian/DEBIAN/control
           (cd ~/debian && find usr -type f -print0 | xargs -0 md5sum) > ~/debian/DEBIAN/md5sums
           DEB=postgresql-${VERSION}-vchord_${SEMVER}-1_${PLATFORM}.deb
-          dpkg-deb --root-owner-group -Zxz --build ~/debian ~/${DEB}
-          (cd ~ && sha256sum ${DEB} > ${DEB}.sha256)
-          gh release upload $SEMVER ~/${DEB} ~/${DEB}.sha256
+          dpkg-deb --root-owner-group -Zxz --build ~/debian "dist/$DEB"
+          (cd dist && sha256sum "$DEB" > "$DEB.sha256")
+
+      - name: Save packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: packages-${{ matrix.version }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+
+  upload:
+    needs: ["semver", "build"]
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: refs/tags/${{ needs.semver.outputs.SEMVER }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: packages-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and upload packages to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEMVER: ${{ needs.semver.outputs.SEMVER }}
+        working-directory: dist
+        run: |
+          packages=(*.deb *.zip)
+          test "${#packages[@]}" -eq 20
+          for package in "${packages[@]}"; do
+            sha256sum "$package" | cmp - "$package.sha256"
+          done
+          bash ../.github/scripts/upload-draft-assets.sh "$SEMVER" "${packages[@]}" ./*.sha256
 
   pgxn:
     runs-on: "ubuntu-latest"
-    needs: ["semver", "build"]
+    needs: ["semver", "upload"]
     env:
       SEMVER: ${{ needs.semver.outputs.SEMVER }}
       PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
