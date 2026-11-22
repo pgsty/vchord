@@ -48,6 +48,12 @@ def run(name, cmd):
                        stderr=subprocess.STDOUT, check=True)
 
 
+def set_control(value):
+    staged = control.with_suffix('.tmp')
+    staged.write_text(value)
+    staged.replace(control)
+
+
 for name in subprocess.check_output(['git', 'ls-files'], cwd=args.source, text=True).splitlines():
     target = src / name
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -58,7 +64,9 @@ hook = r'''
 fn recovery_probe(stage: &str, first: u32, fresh: u32) {
     let expected = format!("{}:{}", stage, std::process::id());
     if std::fs::read_to_string(CONTROL).ok().as_deref() != Some(&expected) { return; }
-    std::fs::write(MARKER, format!("{first},{fresh}")).unwrap();
+    let staged = std::path::Path::new(MARKER).with_extension("tmp");
+    std::fs::write(&staged, format!("{first},{fresh}")).unwrap();
+    std::fs::rename(staged, MARKER).unwrap();
     let start = std::time::Instant::now();
     while std::fs::read_to_string(CONTROL).ok().as_deref() == Some(&expected) {
         assert!(start.elapsed().as_secs() < 60, "recovery probe timed out");
@@ -219,7 +227,7 @@ try:
             wal_start = c.execute('SELECT pg_current_wal_insert_lsn()::text').fetchone()[0]
             with connect() as a, connect() as b, ThreadPoolExecutor() as pool:
                 marker.unlink(missing_ok=True)
-                control.write_text(f'{stage}:{a.info.backend_pid}')
+                set_control(f'{stage}:{a.info.backend_pid}')
                 af = pool.submit(execute, a, f'INSERT INTO {table} SELECT i,array_fill(i::real/100,ARRAY[256])::vector FROM generate_series(1001,1020)i')
                 deadline = time.monotonic() + 30
                 while not marker.exists():
@@ -235,11 +243,15 @@ try:
                     assert bf.result(timeout=5), 'independent writer failed to commit'
                     b_ctid = c.execute(f'SELECT ctid::text FROM {table} WHERE id=2000').fetchone()[0]
                     assert b_ctid in vector_ctids(c, idx, [fresh]), 'writer did not use the newly published page'
+                wait = None
                 while stage != 'unlocked':
-                    wait = c.execute('SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s', (b.info.backend_pid,)).fetchone()
-                    if wait == ('LWLock',):
+                    wait = c.execute('SELECT wait_event_type, wait_event FROM pg_stat_activity WHERE pid=%s',
+                                     (b.info.backend_pid,)).fetchone()
+                    if wait in (('LWLock', 'BufferContent'), ('Buffer', 'BufferShared'),
+                                ('Buffer', 'BufferShareExclusive'), ('Buffer', 'BufferExclusive')):
                         break
-                    assert not bf.done() and time.monotonic() < deadline, 'writer bypassed unpublished page'
+                    assert not bf.done(), ('writer bypassed unpublished page', wait)
+                    assert time.monotonic() < deadline, ('timed out waiting for a buffer content lock', wait)
                     time.sleep(.02)
                 if mode in ['crash', 'unflushed']:
                     saved_fsm = None
@@ -267,7 +279,7 @@ try:
                             f.flush()
                             os.fsync(f.fileno())
                 elif mode == 'error':
-                    control.write_text('error')
+                    set_control('error')
                 else:
                     control.unlink()
                 a_ok, b_ok = af.result(timeout=30), bf.result(timeout=30)
@@ -293,7 +305,7 @@ try:
             assert vector_ctids(c, idx) == heap_ctids, 'VACUUM missed a vector or a committed vector is outside the tape'
             c.execute(f'REINDEX INDEX CONCURRENTLY {idx}')
             assert ids(c, table) == [i for i in expected if i != 2000]
-            results.append(dict(stage=stage, mode=mode, rows=len(expected), fsm=free,
+            results.append(dict(stage=stage, mode=mode, rows=len(expected), fsm=free, writer_wait=wait,
                                 tail=tail, fresh=fresh, vector_pages=reachable, paired_wal=pair,
                                 recovered_ids_match=True, vacuum_and_reindex=True))
             (root / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
@@ -317,7 +329,7 @@ try:
 
         marker.unlink(missing_ok=True)
         with connect() as a, ThreadPoolExecutor() as pool:
-            control.write_text(f'{graph_stage}:{a.info.backend_pid}')
+            set_control(f'{graph_stage}:{a.info.backend_pid}')
             af = pool.submit(
                 execute, a, f'INSERT INTO {graph_table} '
                 "SELECT i, array_fill((i::real / 1000), ARRAY[128])::vector "
