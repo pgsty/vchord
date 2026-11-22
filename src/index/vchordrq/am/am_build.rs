@@ -909,8 +909,7 @@ where
     R: RelationRead,
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
-    let encoder = vchordrq::Encoder::new(index);
-    let (mut out, mut index_tuples) = (Vec::new(), 0_u64);
+    let (mut encoder, mut index_tuples) = (vchordrq::Encoder::new(index), 0_u64);
     let heap_tuples = traverser.traverse(true, |tuple: &mut dyn crate::index::traverse::Tuple| {
         let ctid = tuple.id();
         let (values, is_nulls) = tuple.build();
@@ -922,12 +921,9 @@ where
         for (vector, extra) in store {
             let payload = kv_to_pointer((ctid_to_key(ctid), extra));
             let bump = bumpalo::Bump::new();
-            out.clear();
             let dispatch = crate::index::vchordrq::dispatch::encode;
-            dispatch(
-                opfamily, &encoder, payload, &columns, vector, &bump, &mut out,
-            );
-            sort.put(&out);
+            dispatch(opfamily, &mut encoder, payload, &columns, vector, &bump);
+            sort.put(encoder.row());
             index_tuples += 1;
         }
         progress();

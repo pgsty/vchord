@@ -169,6 +169,8 @@ pub struct Encoder<'b, R> {
     root: Root,
     keys: Keys,
     vectors: bool,
+    /// The row last encoded.
+    row: Vec<u8>,
 }
 
 impl<'b, R: RelationRead> Encoder<'b, R>
@@ -183,15 +185,20 @@ where
             root: Root::of(meta_tuple),
             keys: Keys::of_meta(meta_tuple),
             vectors: !meta_tuple.rerank_in_heap(),
+            row: Vec::new(),
         }
     }
     pub fn index(&self) -> &'b R {
         self.index
     }
-    /// Appends a row as the build sorts it: by list, then by its keys, then by payload, as `write` lays rows out;
+    /// The row last encoded.
+    pub fn row(&self) -> &[u8] {
+        &self.row
+    }
+    /// Encodes a row as the build sorts it: by list, then by its keys, then by payload, as `write` lays rows out;
     /// then its code, its columns and its vector. `projected` routes it.
     pub fn encode<'c, O: Operator>(
-        &'c self,
+        &mut self,
         payload: NonZero<u64>,
         columns: &[u8],
         (vector, projected): (
@@ -200,8 +207,11 @@ where
         ),
         bump: &'c impl Bump,
         prefetch_h1_vectors: impl PrefetcherHeapFamily<'c, R>,
-        out: &mut Vec<u8>,
-    ) {
+    ) where
+        'b: 'c,
+    {
+        let out = &mut self.row;
+        out.clear();
         let assigned = assign::<R, O>(self.index, &self.root, projected, bump, prefetch_h1_vectors);
         let (code, delta) = assigned.code;
         out.extend_from_slice(&assigned.first.to_be_bytes());
@@ -502,15 +512,15 @@ mod tests {
 
     /// The rows sorted as a build sorts them.
     fn sorted(relation: &M, rows: &[(NonZero<u64>, Vec<u8>, VectOwned<f32>)]) -> Rows {
-        let encoder = Encoder::new(relation);
+        let mut encoder = Encoder::new(relation);
         let mut sorted = rows
             .iter()
             .map(|(payload, columns, vector)| {
-                let (mut out, bump) = (Vec::new(), bumpalo::Bump::new());
+                let bump = bumpalo::Bump::new();
                 let prefetch = MakePlainPrefetcher { index: relation };
                 let v = vector.as_borrowed();
-                encoder.encode::<O>(*payload, columns, (v, v), &bump, prefetch, &mut out);
-                out
+                encoder.encode::<O>(*payload, columns, (v, v), &bump, prefetch);
+                encoder.row().to_vec()
             })
             .collect::<Vec<_>>();
         sorted.sort_unstable();

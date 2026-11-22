@@ -39,7 +39,7 @@ pub use consume::consume;
 pub use cost::cost;
 pub use fast_heap::FastHeap;
 pub use insert::{InsertChooser, insert, insert_vector};
-pub use maintain::{Pending, maintain};
+pub use maintain::{Maintain, Pending, maintain};
 pub use prewarm::prewarm;
 pub use rerank::{
     Table, TableAhead, exact_distance, how, rerank_heap, rerank_index, unit_distance,

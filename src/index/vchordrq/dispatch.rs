@@ -185,25 +185,23 @@ fn with_vector(opfamily: Opfamily, vector: OwnedVector, f: impl WithVector) {
     }
 }
 
-/// Appends the row as the build sorts it.
+/// Encodes the row as the build sorts it.
 pub fn encode<R>(
     opfamily: Opfamily,
-    encoder: &vchordrq::Encoder<'_, R>,
+    encoder: &mut vchordrq::Encoder<'_, R>,
     payload: NonZero<u64>,
     columns: &[u8],
     vector: OwnedVector,
     bump: &impl Bump,
-    out: &mut Vec<u8>,
 ) where
     R: RelationRead,
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
     struct Encode<'a, 'b, R, B> {
-        encoder: &'a vchordrq::Encoder<'b, R>,
+        encoder: &'a mut vchordrq::Encoder<'b, R>,
         payload: NonZero<u64>,
         columns: &'a [u8],
         bump: &'a B,
-        out: &'a mut Vec<u8>,
     }
     impl<R: RelationRead, B: Bump> WithVector for Encode<'_, '_, R, B>
     where
@@ -217,14 +215,13 @@ pub fn encode<R>(
             let index = self.encoder.index();
             let prefetch = MakeH1PlainPrefetcherForInsertion { index };
             let vectors = (vector, projected);
-            self.encoder.encode::<O>(
-                self.payload,
-                self.columns,
-                vectors,
-                self.bump,
-                prefetch,
-                self.out,
-            );
+            let Self {
+                encoder,
+                payload,
+                columns,
+                bump,
+            } = self;
+            encoder.encode::<O>(payload, columns, vectors, bump, prefetch);
         }
     }
     let encode = Encode {
@@ -232,9 +229,27 @@ pub fn encode<R>(
         payload,
         columns,
         bump,
-        out,
     };
     with_vector(opfamily, vector, encode);
+}
+
+/// What is done as an opfamily's operator.
+trait WithOperator {
+    type Output;
+    fn with<O: Operator>(self) -> Self::Output;
+}
+
+fn with_operator<F: WithOperator>(opfamily: Opfamily, f: F) -> F::Output {
+    match (opfamily.vector_kind(), opfamily.distance_kind()) {
+        (VectorKind::Vecf32, DistanceKind::L2S) => f.with::<Op<VectOwned<f32>, L2S>>(),
+        (VectorKind::Vecf32, DistanceKind::Dot) => f.with::<Op<VectOwned<f32>, Dot>>(),
+        (VectorKind::Vecf16, DistanceKind::L2S) => f.with::<Op<VectOwned<f16>, L2S>>(),
+        (VectorKind::Vecf16, DistanceKind::Dot) => f.with::<Op<VectOwned<f16>, Dot>>(),
+        (VectorKind::Rabitq8, DistanceKind::Dot) => f.with::<Op<Rabitq8Owned, Dot>>(),
+        (VectorKind::Rabitq8, DistanceKind::L2S) => f.with::<Op<Rabitq8Owned, L2S>>(),
+        (VectorKind::Rabitq4, DistanceKind::Dot) => f.with::<Op<Rabitq4Owned, Dot>>(),
+        (VectorKind::Rabitq4, DistanceKind::L2S) => f.with::<Op<Rabitq4Owned, L2S>>(),
+    }
 }
 
 /// Writes every list from the rows `encode` appends, sorted, holding at most `memory` bytes of a list's codes.
@@ -248,32 +263,29 @@ pub fn write<R>(
     R: RelationRead + RelationWrite,
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
-    match (opfamily.vector_kind(), opfamily.distance_kind()) {
-        (VectorKind::Vecf32, DistanceKind::L2S) => {
-            vchordrq::write::<_, Op<VectOwned<f32>, L2S>>(index, rows, memory, spill)
-        }
-        (VectorKind::Vecf32, DistanceKind::Dot) => {
-            vchordrq::write::<_, Op<VectOwned<f32>, Dot>>(index, rows, memory, spill)
-        }
-        (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordrq::write::<_, Op<VectOwned<f16>, L2S>>(index, rows, memory, spill)
-        }
-        (VectorKind::Vecf16, DistanceKind::Dot) => {
-            vchordrq::write::<_, Op<VectOwned<f16>, Dot>>(index, rows, memory, spill)
-        }
-        (VectorKind::Rabitq8, DistanceKind::Dot) => {
-            vchordrq::write::<_, Op<Rabitq8Owned, Dot>>(index, rows, memory, spill)
-        }
-        (VectorKind::Rabitq8, DistanceKind::L2S) => {
-            vchordrq::write::<_, Op<Rabitq8Owned, L2S>>(index, rows, memory, spill)
-        }
-        (VectorKind::Rabitq4, DistanceKind::Dot) => {
-            vchordrq::write::<_, Op<Rabitq4Owned, Dot>>(index, rows, memory, spill)
-        }
-        (VectorKind::Rabitq4, DistanceKind::L2S) => {
-            vchordrq::write::<_, Op<Rabitq4Owned, L2S>>(index, rows, memory, spill)
+    struct Write<'a, R, S, P> {
+        index: &'a R,
+        rows: S,
+        memory: usize,
+        spill: &'a mut P,
+    }
+    impl<R, S: vchordrq::Sorted, P: vchordrq::Spill> WithOperator for Write<'_, R, S, P>
+    where
+        R: RelationRead + RelationWrite,
+        R::Page: Page<Opaque = vchordrq::Opaque>,
+    {
+        type Output = ();
+        fn with<O: Operator>(self) {
+            vchordrq::write::<_, O>(self.index, self.rows, self.memory, self.spill)
         }
     }
+    let write = Write {
+        index,
+        rows,
+        memory,
+        spill,
+    };
+    with_operator(opfamily, write)
 }
 
 /// What a list's rows may take to be sorted: maintenance memory, as a vacuum reads it.
@@ -300,74 +312,35 @@ where
     R: RelationRead + RelationWrite,
     R::Page: Page<Opaque = vchordrq::Opaque>,
 {
-    let make_h0_plain_prefetcher = MakeH0PlainPrefetcher { index };
-    let memory = memory();
-    let maintain = match (opfamily.vector_kind(), opfamily.distance_kind()) {
-        (VectorKind::Vecf32, DistanceKind::L2S) => {
-            vchordrq::maintain::<_, Op<VectOwned<f32>, L2S>>(
+    struct Maintain<'a, R, C> {
+        index: &'a R,
+        pending: &'a vchordrq::Pending,
+        check: C,
+    }
+    impl<'a, R, C: Fn()> WithOperator for Maintain<'a, R, C>
+    where
+        R: RelationRead + RelationWrite,
+        R::Page: Page<Opaque = vchordrq::Opaque>,
+    {
+        type Output = vchordrq::Maintain;
+        fn with<O: Operator>(self) -> vchordrq::Maintain {
+            let Self {
                 index,
-                make_h0_plain_prefetcher,
-                memory,
                 pending,
                 check,
-            )
+            } = self;
+            let prefetch = MakeH0PlainPrefetcher { index };
+            vchordrq::maintain::<_, O>(index, prefetch, memory(), pending, check)
         }
-        (VectorKind::Vecf32, DistanceKind::Dot) => {
-            vchordrq::maintain::<_, Op<VectOwned<f32>, Dot>>(
-                index,
-                make_h0_plain_prefetcher,
-                memory,
-                pending,
-                check,
-            )
-        }
-        (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordrq::maintain::<_, Op<VectOwned<f16>, L2S>>(
-                index,
-                make_h0_plain_prefetcher,
-                memory,
-                pending,
-                check,
-            )
-        }
-        (VectorKind::Vecf16, DistanceKind::Dot) => {
-            vchordrq::maintain::<_, Op<VectOwned<f16>, Dot>>(
-                index,
-                make_h0_plain_prefetcher,
-                memory,
-                pending,
-                check,
-            )
-        }
-        (VectorKind::Rabitq8, DistanceKind::L2S) => vchordrq::maintain::<_, Op<Rabitq8Owned, L2S>>(
+    }
+    let maintain = with_operator(
+        opfamily,
+        Maintain {
             index,
-            make_h0_plain_prefetcher,
-            memory,
             pending,
             check,
-        ),
-        (VectorKind::Rabitq8, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq8Owned, Dot>>(
-            index,
-            make_h0_plain_prefetcher,
-            memory,
-            pending,
-            check,
-        ),
-        (VectorKind::Rabitq4, DistanceKind::L2S) => vchordrq::maintain::<_, Op<Rabitq4Owned, L2S>>(
-            index,
-            make_h0_plain_prefetcher,
-            memory,
-            pending,
-            check,
-        ),
-        (VectorKind::Rabitq4, DistanceKind::Dot) => vchordrq::maintain::<_, Op<Rabitq4Owned, Dot>>(
-            index,
-            make_h0_plain_prefetcher,
-            memory,
-            pending,
-            check,
-        ),
-    };
+        },
+    );
     pgrx::debug1!(
         "maintain: number_of_formerly_allocated_pages = {}",
         maintain.number_of_formerly_allocated_pages
