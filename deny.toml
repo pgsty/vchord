@@ -2,6 +2,8 @@
 all-features = true
 
 [advisories]
+unmaintained = "all"
+unsound = "all"
 ignore = [
     "RUSTSEC-2021-0127", # serde_cbor is unmaintained
     "RUSTSEC-2024-0436", # paste - no longer maintained

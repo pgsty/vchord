@@ -1,0 +1,2 @@
+[type.rust.extend-identifiers]
+table_beginscan_strat = "table_beginscan_strat"
