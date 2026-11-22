@@ -58,24 +58,27 @@ impl Pending {
     where
         R::Page: Page<Opaque = Opaque>,
     {
-        let mut ids = self.0.borrow().clone();
-        ids.sort_unstable();
-        let mut runs = Vec::<[u32; 2]>::new();
-        for &id in &ids {
-            match runs.last_mut() {
-                Some(run) if run[1] == id => run[1] += 1,
-                _ => runs.push([id, id + 1]),
-            }
-        }
+        let runs = self
+            .0
+            .borrow()
+            .iter()
+            .map(|&id| Run {
+                start: id,
+                end: id + 1,
+            })
+            .collect::<Vec<_>>();
         let rest = freepages::put_runs(index, freepages_first, &runs);
-        let mut rest = rest.into_iter().flat_map(|[s, e]| s..e).collect::<Vec<_>>();
+        let mut rest = rest
+            .into_iter()
+            .flat_map(|run| run.start..run.end)
+            .collect::<Vec<_>>();
         rest.sort_unstable();
         *self.0.borrow_mut() = rest;
         while let Some(id) = { self.0.borrow_mut().pop() } {
             freepages::free(index, freepages_first, id);
             between();
         }
-        ids.len()
+        runs.len()
     }
 }
 
@@ -127,9 +130,9 @@ where
     // it fits, else the longest kept run or else the head if it takes at least half of them, else an extension
     let choose = |index: &R, n: usize| {
         let runs = freepages::runs(index, freepages_first);
-        let len = |run: &&[u32; 2]| (run[1] - run[0]) as usize;
-        if let Some(&[start, _]) = runs.iter().filter(|x| len(x) >= n).min_by_key(len) {
-            return Source::Runs(start);
+        let len = |run: &&Run| run.len();
+        if let Some(run) = runs.iter().filter(|x| x.len() >= n).min_by_key(len) {
+            return Source::Runs(run.start);
         }
         let head = freepages::head(index, freepages_first, n);
         let free = head.first().map_or(0..0, |&id| id..id + head.len() as u32);
@@ -137,8 +140,8 @@ where
             return Source::Free(free);
         }
         let least = n.div_ceil(2).max(free.len() + 1);
-        match runs.iter().filter(|x| len(x) >= least).max_by_key(len) {
-            Some(&[start, _]) => Source::Runs(start),
+        match runs.iter().filter(|x| x.len() >= least).max_by_key(len) {
+            Some(run) => Source::Runs(run.start),
             None if free.len() >= n.div_ceil(2) => Source::Free(free),
             None => Source::Extend,
         }
@@ -771,6 +774,166 @@ mod tests {
         }
     }
 
+    /// Each list's pages, the free list's and the kept runs', asserting that no page is in two of them; then the
+    /// lists' payloads, sorted.
+    fn account(relation: &M, firsts: &[u32]) -> (usize, usize, usize, Vec<u64>) {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut live = 0;
+        for &first in firsts {
+            let (tape, directory) = pages(relation, first);
+            for id in tape.into_iter().chain(directory) {
+                assert!(seen.insert(id), "page {id} is twice in use");
+                live += 1;
+            }
+        }
+        let guard = relation.read(meta(relation).1);
+        let mut id = FreepagesTuple::deserialize_ref(guard.get(1).unwrap()).first();
+        let kept = guard
+            .get(2)
+            .map(|x| FreeRunsTuple::deserialize_ref(x).runs().to_vec());
+        drop(guard);
+        let mut free = 0;
+        while id != u32::MAX {
+            assert!(
+                seen.insert(id),
+                "free-list page {id} is also in use or free twice"
+            );
+            free += 1;
+            id = relation.read(id).get_opaque().next;
+        }
+        let mut runs = 0;
+        for run in kept.unwrap_or_default() {
+            assert!(
+                run.start < run.end && run.end <= relation.pages(),
+                "bad run {run:?}"
+            );
+            for id in run.start..run.end {
+                assert!(
+                    seen.insert(id),
+                    "run page {id} is also in use or free elsewhere"
+                );
+                runs += 1;
+            }
+        }
+        let mut payloads = firsts
+            .iter()
+            .flat_map(|&first| list(relation, first).0)
+            .collect::<Vec<_>>();
+        payloads.sort_unstable();
+        (live, free, runs, payloads)
+    }
+
+    /// Maintains of more lists than the runs that are kept, with rows appended at every delay point and a free list
+    /// as older binaries leave it: no page is in two places and no row is lost (the reviewer's stress test).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn more_runs_than_kept() {
+        let keys = Keys::new([]);
+        let relation = M::new([]);
+        let firsts = lists(&relation, &keys, &[0; 1200]);
+        let freepages_first = meta(&relation).1;
+        let mut payload = 0;
+        for _ in 0..4 {
+            for _ in 0..300 {
+                for &first in &firsts {
+                    payload += 1;
+                    append(&relation, &keys, first, payload);
+                }
+            }
+            // pages freed one at a time, some in order, as older binaries leave them
+            for k in 0..3000 {
+                let opaque = Opaque {
+                    next: u32::MAX,
+                    skip: u32::MAX,
+                };
+                let id = relation.extend(opaque, false).id();
+                if k % 7 != 0 {
+                    freepages::free(&relation, freepages_first, id);
+                }
+            }
+            account(&relation, &firsts);
+            let (next, calls) = (Cell::new(payload), Cell::new(0_usize));
+            let check = || {
+                calls.set(calls.get() + 1);
+                for k in 0..3 {
+                    let first = firsts[(calls.get() * 7 + k * 13) % firsts.len()];
+                    next.set(next.get() + 1);
+                    append(&relation, &keys, first, next.get());
+                }
+            };
+            let prefetch = MakePlainPrefetcher { index: &relation };
+            maintain::<_, O>(&relation, prefetch, 1 << 14, &Pending::default(), check);
+            payload = next.get();
+            let (.., payloads) = account(&relation, &firsts);
+            assert_eq!(payloads, (1..=payload).collect::<Vec<_>>());
+        }
+    }
+
+    /// The longest runs are kept, as many as the free pages' page holds, and the others handed back.
+    #[test]
+    fn longest_runs_kept() {
+        let relation = M::new([]);
+        lists(&relation, &Keys::new([]), &[0]);
+        let freepages_first = meta(&relation).1;
+        let base = relation.pages();
+        for _ in 0..3 * 1200 {
+            relation.extend(
+                Opaque {
+                    next: u32::MAX,
+                    skip: u32::MAX,
+                },
+                false,
+            );
+        }
+        let runs = (0..1200)
+            .map(|i| Run {
+                start: base + 3 * i,
+                end: base + 3 * i + 1 + i % 2,
+            })
+            .collect::<Vec<_>>();
+        let rest = freepages::put_runs(&relation, freepages_first, &runs);
+        let kept = freepages::runs(&relation, freepages_first);
+        assert_eq!(kept.len() + rest.len(), runs.len());
+        assert!(!rest.is_empty() && kept.len() > 900, "{} kept", kept.len());
+        let shortest = kept.iter().map(|run| run.len()).min().unwrap();
+        assert!(rest.iter().all(|run| run.len() <= shortest));
+    }
+
+    /// A run that overlaps one kept is a page freed twice: it is refused, not kept.
+    #[test]
+    #[should_panic(expected = "a page is freed twice")]
+    fn overlapping_runs_are_refused() {
+        let relation = M::new([]);
+        lists(&relation, &Keys::new([]), &[0]);
+        let freepages_first = meta(&relation).1;
+        for _ in 0..8 {
+            relation.extend(
+                Opaque {
+                    next: u32::MAX,
+                    skip: u32::MAX,
+                },
+                false,
+            );
+        }
+        let n = relation.pages();
+        freepages::put_runs(
+            &relation,
+            freepages_first,
+            &[Run {
+                start: n - 8,
+                end: n - 2,
+            }],
+        );
+        freepages::put_runs(
+            &relation,
+            freepages_first,
+            &[Run {
+                start: n - 3,
+                end: n,
+            }],
+        );
+    }
+
     /// Lists of `sizes` rows, appended one list after another; returns their jump pages.
     fn lists(relation: &M, keys: &Keys, sizes: &[u64]) -> Vec<u32> {
         let (dim, v, d) = (DIM as _, VectorKind::Vecf32, DistanceKind::L2S);
@@ -832,7 +995,11 @@ mod tests {
             ids.push(id);
             id = relation.read(id).get_opaque().next;
         }
-        ids.extend(kept.unwrap_or_default().into_iter().flat_map(|[s, e]| s..e));
+        ids.extend(
+            kept.unwrap_or_default()
+                .into_iter()
+                .flat_map(|run| run.start..run.end),
+        );
         ids
     }
 
@@ -862,8 +1029,7 @@ mod tests {
                 .runs()
                 .to_vec();
             assert!(
-                kept.windows(2)
-                    .all(|x| x[0][1] - x[0][0] >= x[1][1] - x[1][0]),
+                kept.windows(2).all(|x| x[0].len() >= x[1].len()),
                 "the longest runs first: {kept:?}"
             );
         }

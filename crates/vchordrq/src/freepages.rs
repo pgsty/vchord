@@ -27,17 +27,29 @@ where
         // else the last page of the shortest kept run, which leaves the longest for the lists a maintain places
         let mut tuple = FreeRunsTuple::deserialize_mut(freepages_guard.get_mut(2)?);
         let mut runs = tuple.runs().to_vec();
-        let i = (0..runs.len()).min_by_key(|&i| runs[i][1] - runs[i][0])?;
-        runs[i][1] -= 1;
-        let id = runs[i][1];
-        if runs[i][0] == runs[i][1] {
-            runs.remove(i);
-        }
+        let i = (0..runs.len()).min_by_key(|&i| runs[i].len())?;
+        let id = shrink(&mut runs, i, false);
         tuple.set(&runs);
         let guard = index.write(id, false);
         drop(freepages_guard); // write log of freespaces_guard
         Some(guard)
     }
+}
+
+/// Takes the first page or else the last of the `i`th run.
+fn shrink(runs: &mut Vec<Run>, i: usize, first: bool) -> u32 {
+    let run = &mut runs[i];
+    let id = if first {
+        run.start += 1;
+        run.start - 1
+    } else {
+        run.end -= 1;
+        run.end
+    };
+    if run.len() == 0 {
+        runs.remove(i);
+    }
+    id
 }
 
 // the page must be inaccessible in the graph
@@ -73,7 +85,7 @@ where
 }
 
 /// The runs of free pages that the free pages' page keeps.
-pub fn runs<R: RelationRead>(index: &R, freepages_first: u32) -> Vec<[u32; 2]>
+pub fn runs<R: RelationRead>(index: &R, freepages_first: u32) -> Vec<Run>
 where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -90,11 +102,8 @@ where
     let mut freepages_guard = index.write(freepages_first, false);
     let mut tuple = FreeRunsTuple::deserialize_mut(freepages_guard.get_mut(2)?);
     let mut runs = tuple.runs().to_vec();
-    let i = runs.iter().position(|&[start, _]| start == id)?;
-    runs[i][0] += 1;
-    if runs[i][0] == runs[i][1] {
-        runs.remove(i);
-    }
+    let i = runs.iter().position(|run| run.start == id)?;
+    shrink(&mut runs, i, true);
     tuple.set(&runs);
     let guard = index.write(id, false);
     drop(freepages_guard); // write log of freespaces_guard
@@ -105,8 +114,8 @@ where
 pub fn put_runs<R: RelationRead + RelationWrite>(
     index: &R,
     freepages_first: u32,
-    runs: &[[u32; 2]],
-) -> Vec<[u32; 2]>
+    runs: &[Run],
+) -> Vec<Run>
 where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -115,20 +124,27 @@ where
     }
     let mut guard = index.write(freepages_first, false);
     if guard.get(2).is_none() {
-        let bytes = FreeRunsTuple::serialize(&FreeRunsTuple {});
+        // as many runs as the page holds
+        let capacity = FreeRunsTuple::capacity(guard.freespace() as usize - 8);
+        let bytes = FreeRunsTuple::serialize(&FreeRunsTuple { capacity });
         assert_eq!(guard.alloc(&bytes), Some(2), "data corruption");
     }
     let mut tuple = FreeRunsTuple::deserialize_mut(guard.get_mut(2).expect("data corruption"));
     let mut all = [tuple.runs(), runs].concat();
     all.sort_unstable();
-    let mut joined = Vec::<[u32; 2]>::new();
-    for [start, end] in all {
+    let mut joined = Vec::<Run>::new();
+    for run in all {
+        let end = joined.last().map(|last| last.end);
+        assert!(
+            end.is_none_or(|end| end <= run.start),
+            "data corruption: a page is freed twice"
+        );
         match joined.last_mut() {
-            Some(run) if run[1] == start => run[1] = end,
-            _ => joined.push([start, end]),
+            Some(last) if last.end == run.start => last.end = run.end,
+            _ => joined.push(run),
         }
     }
-    joined.sort_by_key(|&[start, end]| std::cmp::Reverse(end - start));
+    joined.sort_by_key(|run| std::cmp::Reverse(run.len()));
     let kept = tuple.set(&joined);
     joined.split_off(kept)
 }

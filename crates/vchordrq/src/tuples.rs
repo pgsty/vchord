@@ -333,29 +333,51 @@ impl FreepagesTupleWriter<'_> {
 }
 
 /// How many runs of free pages the free pages' page keeps.
-pub const FREE_RUNS: usize = 960;
+/// Free pages `start..end`.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, FromBytes, IntoBytes, Immutable, KnownLayout,
+)]
+pub struct Run {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl Run {
+    pub fn len(self) -> usize {
+        (self.end - self.start) as usize
+    }
+}
 
 #[repr(C, align(8))]
 #[derive(Debug, Clone, FromBytes, IntoBytes, Immutable, KnownLayout)]
 struct FreeRunsTupleHeader {
     len: u32,
-    _padding_0: [Padding; 4],
-    runs: [[u32; 2]; FREE_RUNS],
+    capacity: u32,
 }
 
-/// Runs of free pages, each its first page and its end, kept beside the free list for the lists that a maintain places.
+/// Runs of free pages, as many as `capacity`, kept beside the free list for the lists that a maintain places.
 #[derive(Debug, Clone)]
-pub struct FreeRunsTuple {}
+pub struct FreeRunsTuple {
+    pub capacity: usize,
+}
+
+impl FreeRunsTuple {
+    /// The capacity of a tuple of at most `size` bytes.
+    pub fn capacity(size: usize) -> usize {
+        size.saturating_sub(size_of::<FreeRunsTupleHeader>()) / size_of::<Run>()
+    }
+}
 
 impl Tuple for FreeRunsTuple {
     fn serialize(&self) -> Vec<u8> {
-        FreeRunsTupleHeader {
+        let header = FreeRunsTupleHeader {
             len: 0,
-            _padding_0: Default::default(),
-            runs: [[0; 2]; FREE_RUNS],
-        }
-        .as_bytes()
-        .to_vec()
+            capacity: self.capacity as u32,
+        };
+        let mut buffer = header.as_bytes().to_vec();
+        buffer.resize(buffer.len() + self.capacity * size_of::<Run>(), 0);
+        buffer
     }
 }
 
@@ -364,8 +386,10 @@ impl WithReader for FreeRunsTuple {
 
     fn deserialize_ref(source: &[u8]) -> FreeRunsTupleReader<'_> {
         let checker = RefChecker::new(source);
-        let header = checker.prefix(0_u16);
-        FreeRunsTupleReader { header }
+        let header: &FreeRunsTupleHeader = checker.prefix(0_u16);
+        let s = size_of::<FreeRunsTupleHeader>();
+        let runs = checker.bytes(s, s + header.len as usize * size_of::<Run>());
+        FreeRunsTupleReader { runs }
     }
 }
 
@@ -374,34 +398,37 @@ impl WithWriter for FreeRunsTuple {
 
     fn deserialize_mut(source: &mut [u8]) -> FreeRunsTupleWriter<'_> {
         let mut checker = MutChecker::new(source);
-        let header = checker.prefix(0_u16);
-        FreeRunsTupleWriter { header }
+        let header: &mut FreeRunsTupleHeader = checker.prefix(0_u16);
+        let s = size_of::<FreeRunsTupleHeader>();
+        let runs = checker.bytes(s, s + header.capacity as usize * size_of::<Run>());
+        FreeRunsTupleWriter { header, runs }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct FreeRunsTupleReader<'a> {
-    header: &'a FreeRunsTupleHeader,
+    runs: &'a [Run],
 }
 
 impl<'a> FreeRunsTupleReader<'a> {
-    pub fn runs(self) -> &'a [[u32; 2]] {
-        &self.header.runs[..self.header.len as usize]
+    pub fn runs(self) -> &'a [Run] {
+        self.runs
     }
 }
 
 pub struct FreeRunsTupleWriter<'a> {
     header: &'a mut FreeRunsTupleHeader,
+    runs: &'a mut [Run],
 }
 
 impl FreeRunsTupleWriter<'_> {
-    pub fn runs(&self) -> &[[u32; 2]] {
-        &self.header.runs[..self.header.len as usize]
+    pub fn runs(&self) -> &[Run] {
+        &self.runs[..self.header.len as usize]
     }
     /// Keeps the first of `runs` that fit; returns how many.
-    pub fn set(&mut self, runs: &[[u32; 2]]) -> usize {
-        let n = runs.len().min(FREE_RUNS);
-        self.header.runs[..n].copy_from_slice(&runs[..n]);
+    pub fn set(&mut self, runs: &[Run]) -> usize {
+        let n = runs.len().min(self.runs.len());
+        self.runs[..n].copy_from_slice(&runs[..n]);
         self.header.len = n as u32;
         n
     }
