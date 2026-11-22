@@ -9,7 +9,7 @@
 use crate::closure_lifetime_binder::id_4;
 use crate::operator::*;
 use crate::tuples::{MetaTuple, WithReader};
-use crate::{KHint, RerankMethod, vectors};
+use crate::{KHint, KKind, RerankMethod, vectors};
 use always_equal::AlwaysEqual;
 use distance::Distance;
 use index::fetch::BorrowedIter;
@@ -60,10 +60,19 @@ impl Table for () {
     fn prefetch(&mut self, _: NonZero<u64>) {}
 }
 
-/// Rows to read ahead after `n`, doubling so that a scan ended early reads few.
+/// Rows to read ahead after `n`: as many as `k` says are still to come, else doubling so that a
+/// scan ended early reads few.
 #[inline]
-fn ramp(n: usize, window: usize) -> usize {
-    (1 << (n / 2 + 1).ilog2()).min(window)
+fn ramp(n: usize, window: usize, k: KHint) -> usize {
+    let doubling = 1 << (n / 2 + 1).ilog2();
+    let left = usize::try_from(k.k).unwrap_or(usize::MAX).saturating_sub(n);
+    match k.kind {
+        KKind::Unknown => doubling,
+        KKind::Exact => left,
+        KKind::AtLeast => doubling.max(left),
+        KKind::AtMost => doubling.min(left),
+    }
+    .min(window)
 }
 
 /// Candidates whose table pages are read ahead of the table rerank, in the order it takes them.
@@ -93,7 +102,9 @@ where
 {
     #[inline]
     fn fill(&mut self) {
-        while self.ahead.len() < ramp(self.taken, self.table.window())
+        // Candidates the rerank drops come on top of the rows, so `k` bounds them only from below.
+        let k = self.table.k().and(KKind::AtLeast);
+        while self.ahead.len() < ramp(self.taken, self.table.window(), k)
             && let Some(candidate) = self.sequence.next()
         {
             self.table.prefetch(candidate.1.0.get().0);
@@ -191,7 +202,7 @@ where
 
 impl<T, F, P, W, H: Table> Reranker<T, F, P, W, H> {
     fn window(&self) -> usize {
-        ramp(self.returned, self.table.window())
+        ramp(self.returned, self.table.window(), self.table.k())
     }
 
     fn push(&mut self, row: Result) {
@@ -341,7 +352,7 @@ mod tests {
     use index_accessor::Dot;
     use std::cell::RefCell;
 
-    struct Recorder<'a>(usize, &'a RefCell<Vec<NonZero<u64>>>);
+    struct Recorder<'a>(usize, KHint, &'a RefCell<Vec<NonZero<u64>>>);
 
     impl Table for Recorder<'_> {
         fn window(&self) -> usize {
@@ -349,11 +360,11 @@ mod tests {
         }
 
         fn k(&self) -> KHint {
-            KHint::UNKNOWN
+            self.1
         }
 
         fn prefetch(&mut self, payload: NonZero<u64>) {
-            self.1.borrow_mut().push(payload);
+            self.2.borrow_mut().push(payload);
         }
     }
 
@@ -403,7 +414,7 @@ mod tests {
     #[test]
     fn reading_ahead_keeps_the_order() {
         let index = MemoryRelation::<crate::Opaque>::new([]);
-        let run = |table: Recorder| {
+        let run = |table: Recorder, n: usize| {
             let mut rows = rows();
             let reranker = Reranker {
                 prefetcher: PlainPrefetcher::new(&index, candidates(&mut rows)),
@@ -416,25 +427,36 @@ mod tests {
             };
             reranker
                 .map(|(_, payload)| payload.get())
+                .take(n)
                 .collect::<Vec<_>>()
         };
+        let unknown = KHint::UNKNOWN;
         let (none, one, four) = Default::default();
-        let expected = run(Recorder(0, &none));
+        let expected = run(Recorder(0, unknown, &none), 6);
         assert_eq!(expected, [2, 1, 4, 5, 6, 3]);
-        assert_eq!(run(Recorder(1, &one)), expected);
-        assert_eq!(run(Recorder(4, &four)), expected);
+        assert_eq!(run(Recorder(1, unknown, &one), 6), expected);
+        assert_eq!(run(Recorder(4, unknown, &four), 6), expected);
         assert!(read(&none).is_empty());
         // the window ramps from one row, so the first rows are read as with a window of one
         assert_eq!(read(&one), [1, 2, 1, 3, 4, 3, 5, 3, 6, 3]);
         assert_eq!(read(&four), [1, 2, 1, 3, 4, 5, 6]);
+        let log = RefCell::default();
+        let reads = |k, kind, n| {
+            assert_eq!(run(Recorder(4, KHint { k, kind }, &log), n), expected[..n]);
+            read(&log)
+        };
+        assert_eq!(reads(0, KKind::Unknown, 3), [1, 2, 1, 3, 4]);
+        assert_eq!(reads(3, KKind::Exact, 3), [1, 2, 3, 4]);
+        assert_eq!(reads(3, KKind::AtLeast, 6), [1, 2, 3, 4, 5, 6]);
+        assert_eq!(reads(1, KKind::AtMost, 1), [1, 2]);
     }
 
     #[test]
     fn table_rerank_reads_candidates_ahead() {
         let index = MemoryRelation::<crate::Opaque>::new([]);
         // requests as payloads, table reads as payloads + 100
-        let run = |window: usize, log: &RefCell<Vec<NonZero<u64>>>| {
-            let (table, mut rows) = (Recorder(window, log), rows());
+        let run = |window: usize, k: KHint, log: &RefCell<Vec<NonZero<u64>>>| {
+            let (table, mut rows) = (Recorder(window, k, log), rows());
             let candidates = TableAhead::new(candidates(&mut rows), table);
             let prefetcher = PlainPrefetcher::new(&index, candidates);
             rerank_heap(prefetcher, |payload: NonZero<u64>| {
@@ -444,13 +466,27 @@ mod tests {
             .map(|(_, payload)| payload.get())
             .collect::<Vec<_>>()
         };
+        let unknown = KHint::UNKNOWN;
         let (none, one, four) = Default::default();
-        assert_eq!(run(0, &none), [2, 1, 4, 5, 6, 3]);
-        assert_eq!(run(1, &one), [2, 1, 4, 5, 6, 3]);
-        assert_eq!(run(4, &four), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(run(0, unknown, &none), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(run(1, unknown, &one), [2, 1, 4, 5, 6, 3]);
+        assert_eq!(run(4, unknown, &four), [2, 1, 4, 5, 6, 3]);
         assert_eq!(read(&none), [101, 102, 103, 104, 105, 106]);
         assert_eq!(read(&one), [2, 101, 3, 102, 4, 103, 5, 104, 6, 105, 106]);
         assert_eq!(read(&four), [2, 101, 3, 4, 102, 5, 103, 6, 104, 105, 106]);
+        let log = RefCell::default();
+        let reads = |k, kind| {
+            assert_eq!(run(4, KHint { k, kind }, &log), [2, 1, 4, 5, 6, 3]);
+            read(&log)
+        };
+        assert_eq!(
+            reads(4, KKind::Exact),
+            [2, 3, 4, 101, 102, 5, 103, 6, 104, 105, 106]
+        );
+        assert_eq!(
+            reads(4, KKind::AtMost),
+            [2, 101, 3, 4, 102, 5, 103, 6, 104, 105, 106]
+        );
     }
 
     fn floats(seed: u64, scale: f32) -> Vec<f32> {
