@@ -72,7 +72,11 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
 ) where
     R::Page: Page<Opaque = Opaque>,
 {
-    let assigned = assign::<R, O>(index, vector, bump, prefetch_h1_vectors);
+    let meta_guard = index.read(0);
+    let meta_tuple = MetaTuple::deserialize_ref(meta_guard.get(1).expect("data corruption"));
+    let (root, freepages_first) = (Root::of(meta_tuple), meta_tuple.freepages_first());
+    drop(meta_guard);
+    let assigned = assign::<R, O>(index, &root, vector, bump, prefetch_h1_vectors);
     let (code, delta) = assigned.code;
     let (prefetch, head) = key;
     let branch = Branch {
@@ -84,69 +88,93 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
         extra: payload,
     };
     let serialized = AppendableTuple::serialize(&appendable_tuple(branch, columns));
+    // under the jump page's share lock, as a maintain swaps the list's tapes under its exclusive lock
+    let jump_tuple = JumpTuple::deserialize_ref(assigned.jump.get(1).expect("data corruption"));
+    let appendable_first = jump_tuple.appendable_first();
     tape::append(
         index,
-        assigned.appendable_first,
+        appendable_first,
         &serialized,
         false,
-        Some(assigned.freepages_first),
+        Some(freepages_first),
     );
 }
 
-/// The list a vector goes to and its code there, with the tapes an insert appends it to.
-pub struct Assigned {
-    /// The list's jump page.
+/// Where routing begins, as the meta page has it.
+pub struct Root {
+    dim: u32,
+    is_residual: bool,
+    height_of_root: u32,
+    first: u32,
+    norm: f32,
+    head: u16,
+    prefetch: Vec<u32>,
+}
+
+impl Root {
+    pub fn of(meta_tuple: MetaTupleReader<'_>) -> Self {
+        Self {
+            dim: meta_tuple.dim(),
+            is_residual: meta_tuple.is_residual(),
+            height_of_root: meta_tuple.height_of_root(),
+            first: meta_tuple.first(),
+            norm: meta_tuple.centroid_norm(),
+            head: meta_tuple.centroid_head(),
+            prefetch: meta_tuple.centroid_prefetch().to_vec(),
+        }
+    }
+}
+
+/// The list a vector goes to, with its jump page share-locked until this is dropped, and the vector's code there.
+pub struct Assigned<G> {
     pub first: u32,
-    pub appendable_first: u32,
-    pub freepages_first: u32,
+    pub jump: G,
     pub code: (rabitq::bit::Code, f32),
 }
 
-/// The list that `vector` goes to and the vector's code there.
+/// The list that `vector` goes to from `root` and the vector's code there.
 pub fn assign<'b, R: RelationRead, O: Operator>(
     index: &'b R,
+    root: &Root,
     vector: <O::Vector as VectorOwned>::Borrowed<'_>,
     bump: &'b impl Bump,
     mut prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R>,
-) -> Assigned
+) -> Assigned<R::ReadGuard<'b>>
 where
     R::Page: Page<Opaque = Opaque>,
 {
-    let meta_guard = index.read(0);
-    let meta_bytes = meta_guard.get(1).expect("data corruption");
-    let meta_tuple = MetaTuple::deserialize_ref(meta_bytes);
-    let dim = meta_tuple.dim();
-    let is_residual = meta_tuple.is_residual();
-    let height_of_root = meta_tuple.height_of_root();
-    let freepages_first = meta_tuple.freepages_first();
+    let Root {
+        dim,
+        is_residual,
+        height_of_root,
+        first,
+        norm,
+        head,
+        ..
+    } = *root;
     assert_eq!(dim, vector.dim(), "unmatched dimensions");
     let epsilon = 1.9;
 
     type State = (Reverse<Distance>, AlwaysEqual<f32>, AlwaysEqual<u32>);
     let mut state: State = if is_residual {
-        let prefetch =
-            BorrowedIter::from_slice(meta_tuple.centroid_prefetch(), |x| bump.alloc_slice(x));
-        let head = meta_tuple.centroid_head();
         let distance = centroids::read::<R, O, _>(
-            prefetch.map(|id| index.read(id)),
+            root.prefetch.iter().map(|&id| index.read(id)),
             head,
             LAccess::new(
                 O::Vector::unpack(vector),
                 O::RoutingAccessor::default_with_dimension(dim),
             ),
         );
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
         (Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))
     } else {
         // fast path
-        let distance = Distance::ZERO;
-        let norm = meta_tuple.centroid_norm();
-        let first = meta_tuple.first();
-        (Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))
+        (
+            Reverse(Distance::ZERO),
+            AlwaysEqual(norm),
+            AlwaysEqual(first),
+        )
     };
 
-    drop(meta_guard);
     let lut = (O::Vector::block_preprocess(vector),);
     // Insertion only routes: approximate distances may pick a different list,
     // but the residual code is built exactly against the chosen centroid by
@@ -227,8 +255,7 @@ where
 
     Assigned {
         first,
-        appendable_first: jump_tuple.appendable_first(),
-        freepages_first,
+        jump: jump_guard,
         code,
     }
 }

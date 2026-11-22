@@ -6,7 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-use crate::insert::assign;
+use crate::insert::{Root, assign};
 use crate::keys::{Columns, Keys};
 use crate::list::{Fixed, ListWriter, Rows, firsts};
 use crate::operator::{Operator, Vector};
@@ -163,9 +163,10 @@ impl Spill for Vec<Vec<u8>> {
     }
 }
 
-/// What a build encodes its rows with: the index's filter keys, and whether its vectors are in it.
+/// What a build encodes its rows with: where routing begins, the index's filter keys, and whether its vectors are in it.
 pub struct Encoder<'b, R> {
     index: &'b R,
+    root: Root,
     keys: Keys,
     vectors: bool,
 }
@@ -179,6 +180,7 @@ where
         let meta_tuple = MetaTuple::deserialize_ref(meta_guard.get(1).expect("data corruption"));
         Self {
             index,
+            root: Root::of(meta_tuple),
             keys: Keys::of_meta(meta_tuple),
             vectors: !meta_tuple.rerank_in_heap(),
         }
@@ -200,7 +202,7 @@ where
         prefetch_h1_vectors: impl PrefetcherHeapFamily<'c, R>,
         out: &mut Vec<u8>,
     ) {
-        let assigned = assign::<R, O>(self.index, projected, bump, prefetch_h1_vectors);
+        let assigned = assign::<R, O>(self.index, &self.root, projected, bump, prefetch_h1_vectors);
         let (code, delta) = assigned.code;
         out.extend_from_slice(&assigned.first.to_be_bytes());
         self.keys.sortable(Columns::row(columns), out);
@@ -783,5 +785,122 @@ mod tests {
                 .unwrap_or(n as usize);
             assert!(most <= 32, "{most} rows between checks, of {n}");
         }
+    }
+
+    /// The relation; each write records whether the list's jump page is share-locked, and the first runs `meanwhile`.
+    struct Watched<'a, F>(&'a M, u32, std::cell::RefCell<(Vec<bool>, Option<F>)>);
+
+    impl<F> index::relation::Relation for Watched<'_, F> {
+        type Page = <M as index::relation::Relation>::Page;
+    }
+
+    impl<F> index::relation::RelationReadTypes for Watched<'_, F> {
+        type ReadGuard<'b> = <M as index::relation::RelationReadTypes>::ReadGuard<'b>;
+    }
+
+    impl<F> RelationRead for Watched<'_, F> {
+        fn read(&self, id: u32) -> Self::ReadGuard<'_> {
+            self.0.read(id)
+        }
+    }
+
+    impl<F> index::relation::RelationWriteTypes for Watched<'_, F> {
+        type WriteGuard<'b> = <M as index::relation::RelationWriteTypes>::WriteGuard<'b>;
+    }
+
+    impl<F: FnOnce()> RelationWrite for Watched<'_, F> {
+        fn write(&self, id: u32, tracking_freespace: bool) -> Self::WriteGuard<'_> {
+            self.watch();
+            self.0.write(id, tracking_freespace)
+        }
+        fn extend(&self, opaque: Opaque, tracking_freespace: bool) -> Self::WriteGuard<'_> {
+            self.watch();
+            self.0.extend(opaque, tracking_freespace)
+        }
+        fn search(&self, freespace: usize) -> Option<Self::WriteGuard<'_>> {
+            self.0.search(freespace)
+        }
+        fn commit_pair(&self, first: Self::WriteGuard<'_>, second: Self::WriteGuard<'_>) {
+            self.0.commit_pair(first, second)
+        }
+    }
+
+    impl<F: FnOnce()> Watched<'_, F> {
+        fn watch(&self) {
+            let locked = self.0.page(self.1).try_borrow_mut().is_err();
+            let meanwhile = {
+                let mut state = self.2.borrow_mut();
+                state.0.push(locked);
+                state.1.take()
+            };
+            if let Some(meanwhile) = meanwhile {
+                meanwhile();
+            }
+        }
+    }
+
+    /// An insert appends under its list's jump page share lock, which a maintain takes exclusively to swap the list's
+    /// tapes: a maintain between the insert's routing and its append cannot swap them.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn inserts_append_under_the_jump_page() {
+        let (keys, dim) = (Keys::new([]), 100);
+        let relation = index(&keys, false, dim, 1);
+        write::<_, O>(
+            &relation,
+            sorted(&relation, &data(1..=3000, dim, &keys)),
+            1 << 30,
+            &mut Vec::new(),
+        );
+        let first = firsts(&relation, || ())[0];
+        let rows = data(3001..=3100, dim, &keys);
+        // from the 41st on, the list holds rows to compact
+        let swapped = Cell::new(None);
+        for (i, (payload, columns, vector)) in rows.iter().enumerate() {
+            let meanwhile = || {
+                let maintain = std::panic::AssertUnwindSafe(|| {
+                    let prefetch = MakePlainPrefetcher { index: &relation };
+                    maintain::<_, O>(&relation, prefetch, 1 << 30, &Pending::default(), || ())
+                });
+                swapped.set(Some(std::panic::catch_unwind(maintain).is_ok()));
+            };
+            let watched = Watched(
+                &relation,
+                first,
+                (Vec::new(), (i == 40).then_some(meanwhile)).into(),
+            );
+            let key = insert_vector::<_, O>(&relation, *payload, vector.as_borrowed(), &mut First);
+            let (bump, prefetch) = (
+                bumpalo::Bump::new(),
+                MakePlainPrefetcher { index: &watched },
+            );
+            insert::<_, O>(
+                &watched,
+                *payload,
+                columns,
+                vector.as_borrowed(),
+                key,
+                &bump,
+                prefetch,
+            );
+            let (locked, _) = watched.2.into_inner();
+            assert!(
+                locked.iter().all(|&x| x),
+                "an insert writes with its jump page unlocked"
+            );
+        }
+        assert_eq!(
+            swapped.get(),
+            Some(false),
+            "a maintain swapped a list's tapes under an insert"
+        );
+        let prefetch = MakePlainPrefetcher { index: &relation };
+        maintain::<_, O>(&relation, prefetch, 1 << 30, &Pending::default(), || ());
+        let mut payloads = lists(&relation, &keys, dim)
+            .into_iter()
+            .flat_map(|list| list.rows.into_iter().map(|x| x.payload))
+            .collect::<Vec<_>>();
+        payloads.sort_unstable();
+        assert_eq!(payloads, (1..=3100).collect::<Vec<_>>());
     }
 }
