@@ -93,6 +93,88 @@ enum Source {
     Extend,
 }
 
+/// Where the pages of the list a maintain writes go: as many as it is thought to take, from one source at a time.
+struct Placement {
+    /// The pages the list is thought to take, until it is begun.
+    estimate: Cell<usize>,
+    /// The pages still to place for it, and where they come from.
+    state: RefCell<(usize, Source)>,
+}
+
+impl Placement {
+    fn new() -> Self {
+        Self {
+            estimate: Cell::new(0),
+            state: RefCell::new((0, Source::None)),
+        }
+    }
+    /// The list is begun: pages are placed for it from here on.
+    fn begin(&self) {
+        *self.state.borrow_mut() = (self.estimate.get(), Source::None);
+    }
+    /// The list's next page, or `None` for an extension.
+    fn page<'b, R: RelationRead + RelationWrite>(
+        &self,
+        index: &'b R,
+        freepages_first: u32,
+    ) -> Option<R::WriteGuard<'b>>
+    where
+        R::Page: Page<Opaque = Opaque>,
+    {
+        let mut state = self.state.borrow_mut();
+        let (want, source) = &mut *state;
+        *want = want.saturating_sub(1);
+        loop {
+            match source {
+                Source::None => *source = Self::choose(index, freepages_first, *want + 1),
+                Source::Runs(id) => match freepages::take(index, freepages_first, *id) {
+                    Some(guard) => {
+                        *id += 1;
+                        break Some(guard);
+                    }
+                    None => *source = Source::None,
+                },
+                Source::Free(run) => match run.next() {
+                    Some(id) => match freepages::alloc(index, freepages_first) {
+                        Some(guard) => {
+                            if guard.id() != id {
+                                *source = Source::None;
+                            }
+                            break Some(guard);
+                        }
+                        None => *source = Source::Extend,
+                    },
+                    None => *source = Source::None,
+                },
+                Source::Extend => break None,
+            }
+        }
+    }
+    /// A list's `n` pages, in the order it is written: the shortest kept run that fits, else the free list's head if
+    /// it fits, else the longest kept run or else the head if it takes at least half of them, else an extension.
+    fn choose<R: RelationRead>(index: &R, freepages_first: u32, n: usize) -> Source
+    where
+        R::Page: Page<Opaque = Opaque>,
+    {
+        let runs = freepages::runs(index, freepages_first);
+        let len = |run: &&Run| run.len();
+        if let Some(run) = runs.iter().filter(|x| x.len() >= n).min_by_key(len) {
+            return Source::Runs(run.start);
+        }
+        let head = freepages::head(index, freepages_first, n);
+        let free = head.first().map_or(0..0, |&id| id..id + head.len() as u32);
+        if free.len() == n {
+            return Source::Free(free);
+        }
+        let least = n.div_ceil(2).max(free.len() + 1);
+        match runs.iter().filter(|x| x.len() >= least).max_by_key(len) {
+            Some(run) => Source::Runs(run.start),
+            None if free.len() >= n.div_ceil(2) => Source::Free(free),
+            None => Source::Extend,
+        }
+    }
+}
+
 /// `memory`: the most bytes of a list's rows that are sorted at once by their keys.
 /// `check`: a delay point, where maintain locks no page and `pending` may be given back.
 pub fn maintain<'b, R: RelationRead + RelationWrite, O: Operator>(
@@ -126,58 +208,13 @@ where
 
     let state = firsts(index, &check);
 
-    // a list's `n` pages, in the order it is written: the shortest kept run that fits, else the free list's head if
-    // it fits, else the longest kept run or else the head if it takes at least half of them, else an extension
-    let choose = |index: &R, n: usize| {
-        let runs = freepages::runs(index, freepages_first);
-        let len = |run: &&Run| run.len();
-        if let Some(run) = runs.iter().filter(|x| x.len() >= n).min_by_key(len) {
-            return Source::Runs(run.start);
-        }
-        let head = freepages::head(index, freepages_first, n);
-        let free = head.first().map_or(0..0, |&id| id..id + head.len() as u32);
-        if free.len() == n {
-            return Source::Free(free);
-        }
-        let least = n.div_ceil(2).max(free.len() + 1);
-        match runs.iter().filter(|x| x.len() >= least).max_by_key(len) {
-            Some(run) => Source::Runs(run.start),
-            None if free.len() >= n.div_ceil(2) => Source::Free(free),
-            None => Source::Extend,
-        }
-    };
-    let placement = RefCell::new((0_usize, Source::None));
+    let placement = Placement::new();
     let hooked_index = RelationHooked(index, {
         id_3(|index: &R, opaque: Opaque, tracking_freespace: bool| {
             let mut buffers = buffers.borrow_mut();
-            let mut placement = placement.borrow_mut();
-            let (want, source) = &mut *placement;
-            *want = want.saturating_sub(1);
-            let guard = loop {
-                match source {
-                    _ if tracking_freespace => break None,
-                    Source::None => *source = choose(index, *want + 1),
-                    Source::Runs(id) => match freepages::take(index, freepages_first, *id) {
-                        Some(guard) => {
-                            *id += 1;
-                            break Some(guard);
-                        }
-                        None => *source = Source::None,
-                    },
-                    Source::Free(run) => match run.next() {
-                        Some(id) => match freepages::alloc(index, freepages_first) {
-                            Some(guard) => {
-                                if guard.id() != id {
-                                    *source = Source::None;
-                                }
-                                break Some(guard);
-                            }
-                            None => *source = Source::Extend,
-                        },
-                        None => *source = Source::None,
-                    },
-                    Source::Extend => break None,
-                }
+            let guard = match tracking_freespace {
+                true => None,
+                false => placement.page(index, freepages_first),
             };
             let guard = match guard {
                 Some(mut guard) => {
@@ -216,8 +253,6 @@ where
         };
 
         let mut trace = Vec::new();
-        // the pages that the new list is placed for, as many as the old one took until its rows are counted
-        let estimate = Cell::new(0);
         let mut tuples = 0_u64;
         let rows = RefCell::new(Rows::new(dim as _, memory));
         let mut push = id_2(|row| {
@@ -226,7 +261,7 @@ where
         });
         // the new list is begun at its first rows, once the old one's size is known
         let start = || {
-            *placement.borrow_mut() = (estimate.get(), Source::None);
+            placement.begin();
             ListWriter::create(&hooked_index, &keys)
         };
         // at each page the frozen tape moves on to, it is unlocked for `check`
@@ -256,7 +291,8 @@ where
             true,
         );
         let directory_pages = trace.len();
-        estimate.set(directory_pages + pages + 1);
+        // the pages that the new list is placed for, as many as the old one took until its rows are counted
+        placement.estimate.set(directory_pages + pages + 1);
         tape::read_frozen_tape::<R, _, _>(
             paced(
                 tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied()),
@@ -301,7 +337,7 @@ where
         let mut pass = read_appendable(index, &mut at, &mut trace, &mut between, &mut push, dim);
 
         // the new frozen tape holds the rows as densely as the old one did
-        estimate.set(match frozen_rows {
+        placement.estimate.set(match frozen_rows {
             0 => trace.len() + 1,
             _ => (rows.borrow().len() * pages).div_ceil(frozen_rows) + 1 + directory_pages,
         });
