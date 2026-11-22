@@ -81,6 +81,8 @@ impl NullOrderRows {
             let _switch = crate::index::MemoryContextSwitch::new(context);
             let desc = pg_sys::CreateTemplateTupleDesc(1);
             pg_sys::TupleDescInitEntry(desc, 1, null(), pg_sys::TIDOID, -1, 0);
+            #[cfg(feature = "pg19")]
+            pg_sys::TupleDescFinalize(desc);
             let store = pg_sys::tuplestore_begin_heap(false, false, pg_sys::work_mem);
             let slot =
                 pg_sys::MakeSingleTupleTableSlot(desc, &raw const pg_sys::TTSOpsMinimalTuple);

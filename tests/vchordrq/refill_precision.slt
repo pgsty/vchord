@@ -1,0 +1,70 @@
+statement ok
+CREATE TABLE precision_centers(id int, parent int, vector vector(2));
+INSERT INTO precision_centers SELECT i,NULL,ARRAY[i*1000,0]::real[] FROM generate_series(0,15) i;
+CREATE TABLE precision_rows(id int, v vector(2), tenant int);
+INSERT INTO precision_rows SELECT i,ARRAY[i,i%7]::real[],1 FROM generate_series(1,16000) i;
+CREATE VIEW precision_l2 AS SELECT v <-> '[8000,0]' AS d FROM precision_rows
+  WHERE tenant=1 ORDER BY v <-> '[8000,0]';
+CREATE TEMP TABLE precision_expected AS SELECT ARRAY(TABLE precision_l2) AS distances;
+SET work_mem='64kB';
+SET vchordrq.probes='1';
+SET enable_seqscan=off;
+SET enable_sort=off;
+CREATE INDEX precision_rq ON precision_rows USING vchordrq (v vector_l2_ops, tenant)
+  WITH (options='build.external.table = "public.precision_centers"');
+
+query T
+SELECT distances = ARRAY(TABLE precision_l2) FROM precision_expected;
+----
+t
+
+statement ok
+DROP INDEX precision_rq;
+CREATE INDEX precision_rq ON precision_rows USING vchordrq (v vector_l2_ops, tenant)
+  WITH (options='build.external.table = "public.precision_centers"
+rerank_in_table = true');
+
+query T
+SELECT distances = ARRAY(TABLE precision_l2) FROM precision_expected;
+----
+t
+
+statement ok
+DROP INDEX precision_rq;
+TRUNCATE precision_rows, precision_centers;
+INSERT INTO precision_centers VALUES (1,NULL,'[0,1]'),(2,NULL,'[0,-1]');
+INSERT INTO precision_rows VALUES (1,'[0.00000001,1]',1),(2,'[0.00000002,-1]',1);
+CREATE VIEW precision_cosine AS SELECT id FROM precision_rows WHERE tenant=1 ORDER BY v <=> '[1,0]';
+
+query TT
+SELECT count(DISTINCT (v <=> '[1,0]'))=2, count(DISTINCT (v <=> '[1,0]')::real)=1 FROM precision_rows;
+----
+t t
+
+statement ok
+CREATE INDEX precision_rq ON precision_rows USING vchordrq (v vector_cosine_ops, tenant)
+  WITH (options='build.external.table = "public.precision_centers"');
+
+query T
+SELECT ARRAY(TABLE precision_cosine);
+----
+{2,1}
+
+statement ok
+DROP INDEX precision_rq;
+CREATE INDEX precision_rq ON precision_rows USING vchordrq (v vector_cosine_ops, tenant)
+  WITH (options='build.external.table = "public.precision_centers"
+rerank_in_table = true');
+
+query T
+SELECT ARRAY(TABLE precision_cosine);
+----
+{2,1}
+
+statement ok
+DROP VIEW precision_cosine, precision_l2;
+DROP TABLE precision_rows, precision_centers, precision_expected;
+RESET work_mem;
+RESET vchordrq.probes;
+RESET enable_seqscan;
+RESET enable_sort;

@@ -253,12 +253,12 @@ impl SearchBuilder for DefaultBuilder {
         }
         Box::new(iter.map(move |(distance, pointer)| {
             let (key, _) = pointer_to_kv(pointer);
-            (distance, key, recheck)
+            (opfamily.output(distance), key, recheck)
         }))
     }
 }
 
-type Ranked<'b> = Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>;
+type Ranked<'b> = Box<dyn Iterator<Item = (Distance, NonZero<u64>)> + 'b>;
 
 struct Finish {
     ordered: bool,
@@ -287,8 +287,9 @@ impl Finish {
             return Box::new(std::iter::empty());
         }
         // `<=`: the index's distance may round up to the radius where the operator's is under it.
-        let within = move |(distance, _): &(f32, NonZero<u64>)| {
-            self.threshold.is_none_or(|r| *distance <= r)
+        let within = move |(distance, _): &(Distance, NonZero<u64>)| {
+            self.threshold
+                .is_none_or(|r| opfamily.output(*distance) <= r)
         };
         match search {
             vchordrq::Search::Single(candidates) => {
@@ -362,6 +363,8 @@ impl SortedRows {
             let desc = pg_sys::CreateTemplateTupleDesc(2);
             pg_sys::TupleDescInitEntry(desc, 1, null(), pg_sys::FLOAT4OID, -1, 0);
             pg_sys::TupleDescInitEntry(desc, 2, null(), pg_sys::INT8OID, -1, 0);
+            #[cfg(feature = "pg19")]
+            pg_sys::TupleDescFinalize(desc);
             let slot =
                 pg_sys::MakeSingleTupleTableSlot(desc, &raw const pg_sys::TTSOpsMinimalTuple);
             let float = pg_sys::lookup_type_cache(pg_sys::FLOAT4OID, pg_sys::TYPECACHE_LT_OPR as _);
@@ -383,13 +386,13 @@ impl SortedRows {
         }
     }
 
-    fn push(&mut self, distance: f32, payload: NonZero<u64>) {
+    fn push(&mut self, distance: Distance, payload: NonZero<u64>) {
         use pgrx::pg_sys;
         unsafe {
             pg_sys::ExecClearTuple(self.slot);
             (*self.slot)
                 .tts_values
-                .write(pg_sys::Datum::from(distance.to_bits()));
+                .write(pg_sys::Datum::from(distance.to_f32().to_bits()));
             (*self.slot)
                 .tts_values
                 .add(1)
@@ -403,7 +406,7 @@ impl SortedRows {
 }
 
 impl Iterator for SortedRows {
-    type Item = (f32, NonZero<u64>);
+    type Item = (Distance, NonZero<u64>);
 
     fn next(&mut self) -> Option<Self::Item> {
         use pgrx::pg_sys;
@@ -421,7 +424,7 @@ impl Iterator for SortedRows {
             let values = (*self.slot).tts_values;
             let distance = f32::from_bits((*values).value() as u32);
             let payload = NonZero::new((*values.add(1)).value() as u64).unwrap();
-            Some((distance, payload))
+            Some((Distance::from_f32(distance), payload))
         }
     }
 }
@@ -445,7 +448,7 @@ fn rerank_table<'b, R, O, D>(
     vector: impl Borrow<O::Vector> + 'b,
     (io, prefilter, table): (Io, bool, TablePrefetch),
     mut fetcher: impl Fetcher + 'b,
-    (opfamily, d): (Opfamily, D),
+    d: D,
 ) -> Ranked<'b>
 where
     R: RelationRead,
@@ -457,7 +460,6 @@ where
         ) -> Distance
         + 'b,
 {
-    let f = move |(distance, payload)| (opfamily.output(distance), payload);
     let distance = move |payload| {
         let (key, _) = pointer_to_kv(payload);
         let mut tuple = fetcher.fetch(key)?;
@@ -470,12 +472,13 @@ where
         Some(unsafe { O::Vector::in_datum(datums[0], |row| d(query, row)) })
     };
     match io {
-        Io::Plain => {
-            Box::new(rerank_heap(PlainPrefetcher::new(index, candidates), distance).map(f))
-        }
+        Io::Plain => Box::new(rerank_heap(
+            PlainPrefetcher::new(index, candidates),
+            distance,
+        )),
         Io::Simple | Io::Stream => {
             let prefetcher = PlainPrefetcher::new(index, TableAhead::new(candidates, table));
-            Box::new(rerank_heap(prefetcher, distance).map(f))
+            Box::new(rerank_heap(prefetcher, distance))
         }
     }
 }
@@ -501,14 +504,25 @@ where
     if let RerankMethod::Heap = how(index) {
         let reranking = (io, prefilter, table);
         return if opfamily.is_cosine() {
-            let d = (opfamily, unit_distance::<O>);
-            rerank_table::<_, O, _>(index, candidates, vector, reranking, fetcher, d)
+            rerank_table::<_, O, _>(
+                index,
+                candidates,
+                vector,
+                reranking,
+                fetcher,
+                unit_distance::<O>,
+            )
         } else {
-            let d = (opfamily, exact_distance::<O>);
-            rerank_table::<_, O, _>(index, candidates, vector, reranking, fetcher, d)
+            rerank_table::<_, O, _>(
+                index,
+                candidates,
+                vector,
+                reranking,
+                fetcher,
+                exact_distance::<O>,
+            )
         };
     }
-    let f = move |(distance, payload)| (opfamily.output(distance), payload);
     let predicate = id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
         let (key, _) = pointer_to_kv(*pointer);
         let Some(mut tuple) = fetcher.fetch(key) else {
@@ -520,27 +534,27 @@ where
     match (io, prefilter) {
         (Io::Plain, false) => {
             let prefetcher = PlainPrefetcher::new(index, candidates);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
         }
         (Io::Plain, true) => {
             let prefetcher = PlainPrefetcher::new(index, filter(candidates, predicate));
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
         }
         (Io::Simple, false) => {
             let prefetcher = SimplePrefetcher::new(index, candidates);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table))
         }
         (Io::Simple, true) => {
             let prefetcher = SimplePrefetcher::new(index, filter(candidates, predicate));
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
         }
         (Io::Stream, false) => {
             let prefetcher = StreamPrefetcher::new(index, candidates, hints);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table))
         }
         (Io::Stream, true) => {
             let prefetcher = StreamPrefetcher::new(index, filter(candidates, predicate), hints);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
         }
     }
 }
