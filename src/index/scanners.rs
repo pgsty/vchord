@@ -98,7 +98,8 @@ impl NullOrderRows {
                 |row: &mut dyn crate::index::traverse::Tuple| {
                     let mut tid = row.id();
                     let mut value = Datum::from(&raw mut tid);
-                    pg_sys::tuplestore_putvalues(store, desc, &raw mut value, &mut false);
+                    let mut is_null = false;
+                    pg_sys::tuplestore_putvalues(store, desc, &raw mut value, &raw mut is_null);
                 },
             );
             Self {
