@@ -6,6 +6,109 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+pub(super) unsafe fn usable_path(path: *mut pgrx::pg_sys::IndexPath) -> bool {
+    use pgrx::pg_sys::{self, IndexClause, NodeTag, NullTest, NullTestType, RestrictInfo};
+    unsafe {
+        let index = (*path).indexinfo;
+        if (*path).path.pathtype != NodeTag::T_IndexScan {
+            return false;
+        }
+        if (*path)
+            .indexorderbys
+            .as_ref()
+            .is_some_and(|list| list.length > 1)
+        {
+            (*path).indexorderbys = pg_sys::list_copy_head((*path).indexorderbys, 1);
+            (*path).indexorderbycols = pg_sys::list_copy_head((*path).indexorderbycols, 1);
+            (*path).path.pathkeys = pg_sys::list_copy_head((*path).path.pathkeys, 1);
+        }
+        let base_quals = (*(*index).rel).baserestrictinfo;
+        let join_quals = (*path)
+            .path
+            .param_info
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |p| p.ppi_clauses);
+        let quals = [base_quals, join_quals, (*index).indpred];
+        if quals.iter().any(|q| !q.is_null()) {
+            let mut test = NullTest::default();
+            test.xpr.type_ = NodeTag::T_NullTest;
+            let column = pgrx::PgList::<pg_sys::TargetEntry>::from_pg((*index).indextlist)
+                .get_ptr(0)
+                .unwrap();
+            test.arg = (*column).expr;
+            test.nulltesttype = NullTestType::IS_NULL;
+            let mut predicate = pgrx::PgList::new();
+            predicate.push(&raw mut test);
+            if quals
+                .into_iter()
+                .any(|q| !q.is_null() && pg_sys::predicate_implied_by(predicate.as_ptr(), q, false))
+            {
+                return false;
+            }
+        }
+        !(*path).indexorderbys.is_null()
+            || pgrx::PgList::<IndexClause>::from_pg((*path).indexclauses)
+                .iter_ptr()
+                .any(|clause| {
+                    (*clause).indexcol == 0
+                        && pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals)
+                            .iter_ptr()
+                            .any(|qual| (*(*qual).clause).type_ == NodeTag::T_OpExpr)
+                })
+    }
+}
+
+static mut PREV_SET_REL_PATHLIST: pgrx::pg_sys::set_rel_pathlist_hook_type = None;
+
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn set_rel_pathlist(
+    root: *mut pgrx::pg_sys::PlannerInfo,
+    rel: *mut pgrx::pg_sys::RelOptInfo,
+    rti: pgrx::pg_sys::Index,
+    rte: *mut pgrx::pg_sys::RangeTblEntry,
+) {
+    use pgrx::pg_sys;
+    unsafe {
+        let paths = pgrx::PgList::<pg_sys::Path>::from_pg((*rel).pathlist);
+        let mut removed = false;
+        const ESTIMATORS: [pg_sys::amcostestimate_function; 2] = [
+            Some(super::vchordrq::am::amcostestimate),
+            Some(super::vchordg::am::amcostestimate),
+        ];
+        for pos in (0..paths.len()).rev() {
+            let path = paths.get_ptr(pos).unwrap();
+            if (*path).type_ != pg_sys::NodeTag::T_IndexPath {
+                continue;
+            }
+            let index_path = path.cast::<pg_sys::IndexPath>();
+            if (*index_path).indextotalcost != super::UNUSABLE_PATH_COST {
+                continue;
+            }
+            if let Some(cost) = (*(*index_path).indexinfo).amcostestimate
+                && ESTIMATORS
+                    .into_iter()
+                    .flatten()
+                    .any(|am| std::ptr::fn_addr_eq(cost, am))
+            {
+                (*rel).pathlist = pg_sys::list_delete_nth_cell((*rel).pathlist, pos as _);
+                removed = true;
+            }
+        }
+        if removed
+            && !pgrx::PgList::<pg_sys::Path>::from_pg((*rel).pathlist)
+                .iter_ptr()
+                .any(|p| (*p).pathtype == pg_sys::NodeTag::T_SeqScan)
+        {
+            let seq = pg_sys::create_seqscan_path(root, rel, (*rel).lateral_relids, 0);
+            pg_sys::add_path(rel, seq);
+        }
+        if let Some(prev) = PREV_SET_REL_PATHLIST {
+            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+            pg_sys::ffi::pg_guard_ffi_boundary(|| prev(root, rel, rti, rte));
+        }
+    }
+}
+
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn rewrite_plan_state(
     node: *mut pgrx::pg_sys::PlanState,
@@ -181,6 +284,8 @@ unsafe extern "C-unwind" fn executor_start(
 pub fn init() {
     assert!(crate::is_main());
     unsafe {
+        PREV_SET_REL_PATHLIST = pgrx::pg_sys::set_rel_pathlist_hook;
+        pgrx::pg_sys::set_rel_pathlist_hook = Some(set_rel_pathlist);
         PREV_EXECUTOR_START = pgrx::pg_sys::ExecutorStart_hook;
         pgrx::pg_sys::ExecutorStart_hook = Some(executor_start);
     }

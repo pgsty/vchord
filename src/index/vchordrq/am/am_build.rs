@@ -447,6 +447,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             );
             // Every participant added its counts before entering barrier 1.
             let shared = leader.vchordrqshared;
+            (*index_info).ii_BrokenHotChain |= (*shared).broken_hot_chain;
             ((*shared).heap_tuples, (*shared).index_tuples as f64)
         }
     } else {
@@ -500,6 +501,7 @@ struct VchordrqShared {
     /* sums of every participant's counts, reported by `ambuild` */
     heap_tuples: f64,
     index_tuples: u64,
+    broken_hot_chain: bool,
     barrier_leave_0: bool,
     barrier_enter_1: i32,
     barrier_leave_1: bool,
@@ -752,6 +754,7 @@ impl VchordrqLeader {
                 indtuples: 0,
                 heap_tuples: 0.0,
                 index_tuples: 0,
+                broken_hot_chain: false,
             });
             pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_enter_0);
             pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordrqshared).condvar_barrier_leave_0);
@@ -1113,6 +1116,7 @@ unsafe fn parallel_build(
         pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordrqshared).mutex);
         (*vchordrqshared).heap_tuples += heap_tuples;
         (*vchordrqshared).index_tuples += index_tuples;
+        (*vchordrqshared).broken_hot_chain |= (*index_info).ii_BrokenHotChain;
         pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordrqshared).mutex);
     }
 

@@ -162,6 +162,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             loop {
                 pgrx::pg_sys::SpinLockAcquire(&raw mut (*leader.vchordgshared).mutex);
                 if (*leader.vchordgshared).workers_done == nparticipants {
+                    (*index_info).ii_BrokenHotChain |= (*leader.vchordgshared).broken_hot_chain;
                     pgrx::pg_sys::SpinLockRelease(&raw mut (*leader.vchordgshared).mutex);
                     break;
                 }
@@ -216,6 +217,7 @@ struct VchordgShared {
     indtuples: u64,
     heap_tuples: f64,
     index_tuples: u64,
+    broken_hot_chain: bool,
 }
 
 fn is_mvcc_snapshot(snapshot: *mut pgrx::pg_sys::SnapshotData) -> bool {
@@ -319,6 +321,7 @@ impl VchordgLeader {
                 indtuples: 0,
                 heap_tuples: 0.0,
                 index_tuples: 0,
+                broken_hot_chain: false,
             });
             pgrx::pg_sys::ConditionVariableInit(&raw mut (*vchordgshared).condvar_workers_done);
             pgrx::pg_sys::SpinLockInit(&raw mut (*vchordgshared).mutex);
@@ -516,6 +519,7 @@ unsafe fn parallel_build(
         pgrx::pg_sys::SpinLockAcquire(&raw mut (*vchordgshared).mutex);
         (*vchordgshared).heap_tuples += heap_tuples;
         (*vchordgshared).index_tuples += index_tuples;
+        (*vchordgshared).broken_hot_chain |= (*index_info).ii_BrokenHotChain;
         (*vchordgshared).workers_done += 1;
         pgrx::pg_sys::SpinLockRelease(&raw mut (*vchordgshared).mutex);
         pgrx::pg_sys::ConditionVariableSignal(&raw mut (*vchordgshared).condvar_workers_done);

@@ -1,0 +1,39 @@
+statement ok
+CREATE TYPE key_mood AS ENUM ('low','high');
+CREATE DOMAIN key_domain AS key_mood;
+CREATE DOMAIN key_nested AS key_domain;
+CREATE TABLE enum_rows (id int, v vector(2), mood key_nested);
+INSERT INTO enum_rows VALUES (1,'[1,0]','low'),(3,'[3,0]','high'),(4,'[4,0]',NULL);
+CREATE INDEX enum_rows_idx ON enum_rows USING vchordrq (v vector_l2_ops,mood enum_ops);
+
+statement ok
+ALTER TYPE key_mood ADD VALUE 'middle' BEFORE 'high';
+
+statement ok
+INSERT INTO enum_rows VALUES (2,'[2,0]','middle');
+SET enable_seqscan=off;
+SET enable_sort=off;
+
+query T
+EXPLAIN (COSTS OFF) SELECT id FROM enum_rows WHERE mood::key_mood <= 'middle' ORDER BY v <-> '[0,0]';
+----
+Index Scan using enum_rows_idx on enum_rows
+  Index Cond: ((mood)::key_mood <= 'middle'::key_mood)
+  Order By: (v <-> '[0,0]'::vector)
+
+query T
+SELECT ARRAY(SELECT id FROM enum_rows WHERE mood::key_mood <= 'middle' ORDER BY v <-> '[0,0]');
+----
+{1,2}
+
+query T
+SELECT ARRAY(SELECT id FROM enum_rows WHERE mood::key_mood >= 'middle' ORDER BY v <-> '[0,0]');
+----
+{2,3}
+
+statement ok
+DROP TABLE enum_rows;
+DROP DOMAIN key_nested, key_domain;
+DROP TYPE key_mood;
+RESET enable_seqscan;
+RESET enable_sort;

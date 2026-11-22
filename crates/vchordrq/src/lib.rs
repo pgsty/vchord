@@ -43,7 +43,9 @@ pub use prewarm::prewarm;
 pub use rerank::{
     Table, TableAhead, exact_distance, how, rerank_heap, rerank_index, unit_distance,
 };
-pub use search::{Candidates, MaxsimCandidate, SearchParams, default_search, maxsim_search};
+pub use search::{
+    Candidates, MaxsimCandidate, Search, SearchParams, default_search, maxsim_search,
+};
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 

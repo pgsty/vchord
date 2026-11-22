@@ -1,0 +1,185 @@
+statement ok
+CREATE TABLE order_rows (id int, v vector(2));
+INSERT INTO order_rows VALUES (1,'[1,0]'), (2,'[-1,0]'), (3,'[2,0]');
+INSERT INTO order_rows SELECT id,NULL FROM generate_series(4,708) id;
+ANALYZE order_rows;
+SET enable_seqscan=off;
+SET enable_sort=off;
+SET plan_cache_mode=force_generic_plan;
+CREATE FUNCTION order_plan(q text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO plan;
+  RETURN plan::text;
+END $$;
+CREATE VIEW order_nulls AS SELECT id FROM order_rows WHERE v IS NULL ORDER BY v <-> '[0,0]';
+CREATE VIEW order_two AS SELECT id FROM order_rows ORDER BY v <-> '[0,0]', v <-> '[-2,0]' LIMIT 2;
+CREATE VIEW order_one AS SELECT id FROM order_rows ORDER BY v <-> '[-1,0]' LIMIT 1;
+PREPARE parameter_order(vector) AS SELECT id FROM order_rows ORDER BY v <-> $1 LIMIT 2;
+PREPARE parameter_order_count(vector) AS SELECT count(*) FROM (SELECT id FROM order_rows ORDER BY v <-> $1 LIMIT 2) s;
+PREPARE parameter_all(vector) AS SELECT count(*), count(DISTINCT id), count(v) FROM
+  (SELECT id,v FROM order_rows ORDER BY v <-> $1) s;
+PREPARE parameter_sphere(vector) AS SELECT array_agg(id ORDER BY id) FROM
+  (SELECT id FROM order_rows WHERE v <<->> sphere('[0,0]'::vector,1.5) ORDER BY v <-> $1) s;
+CREATE VIEW order_rescans AS SELECT array_agg(n ORDER BY i) FROM
+  (VALUES (1,NULL::vector),(2,'[-1,0]'::vector),(3,NULL::vector)) inputs(i,q)
+  CROSS JOIN LATERAL (SELECT count(*) AS n FROM
+    (SELECT id FROM order_rows ORDER BY v <-> q LIMIT 4) result) counts;
+CREATE INDEX order_rq_idx ON order_rows USING vchordrq (v vector_l2_ops);
+UPDATE order_rows SET id=1000 WHERE id=4;
+
+query ITT
+SELECT count(*), order_plan('TABLE order_nulls') NOT LIKE '%order_rq_idx%',
+  order_plan('TABLE order_one') LIKE '%order_rq_idx%' FROM order_nulls;
+----
+705 t t
+
+query T
+SELECT ARRAY(TABLE order_two);
+----
+{2,1}
+
+query I
+EXECUTE parameter_order_count(NULL);
+----
+2
+
+query I
+EXECUTE parameter_order('[-1,0]');
+----
+2
+1
+
+query TT
+SELECT order_plan('EXECUTE parameter_all(NULL)') LIKE '%order_rq_idx%',
+  order_plan('EXECUTE parameter_order(''[-1,0]'')') LIKE '%order_rq_idx%';
+----
+t t
+
+query III
+EXECUTE parameter_all(NULL);
+----
+708 708 3
+
+query T
+TABLE order_rescans;
+----
+{4,3,4}
+
+query T
+EXECUTE parameter_sphere(NULL);
+----
+{1,2}
+
+statement ok
+DROP INDEX order_rq_idx;
+CREATE INDEX order_g_idx ON order_rows USING vchordg (v vector_l2_ops);
+
+query ITT
+SELECT count(*), order_plan('TABLE order_nulls') NOT LIKE '%order_g_idx%',
+  order_plan('TABLE order_one') LIKE '%order_g_idx%' FROM order_nulls;
+----
+705 t t
+
+query T
+SELECT ARRAY(TABLE order_two);
+----
+{2,1}
+
+query I
+EXECUTE parameter_order_count(NULL);
+----
+2
+
+query I
+EXECUTE parameter_order('[-1,0]');
+----
+2
+1
+
+query TT
+SELECT order_plan('EXECUTE parameter_all(NULL)') LIKE '%order_g_idx%',
+  order_plan('EXECUTE parameter_order(''[-1,0]'')') LIKE '%order_g_idx%';
+----
+t t
+
+query III
+EXECUTE parameter_all(NULL);
+----
+708 708 3
+
+query T
+TABLE order_rescans;
+----
+{4,3,4}
+
+query T
+EXECUTE parameter_sphere(NULL);
+----
+{1,2}
+
+statement ok
+DROP INDEX order_g_idx;
+CREATE INDEX order_partial_idx ON order_rows USING vchordrq (v vector_l2_ops) WHERE v IS NULL;
+
+query IT
+SELECT count(*), order_plan('TABLE order_nulls') NOT LIKE '%order_partial_idx%' FROM order_nulls;
+----
+705 t
+
+statement ok
+CREATE INDEX order_btree_idx ON order_rows (id) WHERE v IS NULL;
+
+query TT
+SELECT order_plan('SELECT id FROM order_rows WHERE v IS NULL ORDER BY id LIMIT 2') LIKE '%order_btree_idx%',
+  ARRAY(SELECT id FROM order_rows WHERE v IS NULL ORDER BY id LIMIT 2) = ARRAY[5,6];
+----
+t t
+
+statement ok
+DROP INDEX order_partial_idx, order_btree_idx;
+ALTER TABLE order_rows ADD COLUMN owner int;
+UPDATE order_rows SET owner=id%2;
+CREATE INDEX order_key_idx ON order_rows USING vchordrq (v vector_l2_ops, owner) WHERE id<10;
+PREPARE parameter_key(vector) AS SELECT array_agg(id ORDER BY id) FROM
+  (SELECT id FROM order_rows WHERE id<10 AND owner=1 ORDER BY v <-> $1) s;
+
+query T
+SELECT order_plan('EXECUTE parameter_key(NULL)') LIKE '%order_key_idx%';
+----
+t
+
+query T
+EXECUTE parameter_key(NULL);
+----
+{1,3,5,7,9}
+
+statement ok
+CREATE TABLE order_multis (id int, v vector(2)[]);
+INSERT INTO order_multis VALUES (1,ARRAY['[1,0]'::vector]), (2,NULL), (3,NULL);
+CREATE INDEX order_multis_idx ON order_multis USING vchordrq (v vector_maxsim_ops);
+PREPARE parameter_multi(vector[]) AS SELECT count(*) FROM (SELECT id FROM order_multis ORDER BY v @# $1 LIMIT 2) s;
+
+query T
+SELECT order_plan('EXECUTE parameter_multi(NULL)') LIKE '%order_multis_idx%';
+----
+t
+
+query I
+EXECUTE parameter_multi(NULL);
+----
+2
+
+statement ok
+DEALLOCATE parameter_multi;
+DEALLOCATE parameter_key;
+DEALLOCATE parameter_sphere;
+DEALLOCATE parameter_all;
+DEALLOCATE parameter_order;
+DEALLOCATE parameter_order_count;
+DROP VIEW order_one, order_two, order_nulls, order_rescans;
+DROP TABLE order_rows, order_multis;
+DROP FUNCTION order_plan(text);
+RESET plan_cache_mode;
+RESET enable_seqscan;
+RESET enable_sort;

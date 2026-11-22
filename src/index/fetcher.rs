@@ -28,6 +28,17 @@ pub trait Fetcher {
     fn fetch(&mut self, key: [u16; 3]) -> Option<Self::Tuple<'_>>;
 }
 
+impl<F: Fetcher> Fetcher for &mut F {
+    type Tuple<'a>
+        = F::Tuple<'a>
+    where
+        Self: 'a;
+
+    fn fetch(&mut self, key: [u16; 3]) -> Option<Self::Tuple<'_>> {
+        (**self).fetch(key)
+    }
+}
+
 impl<T: Fetcher, F: FnOnce() -> T> Fetcher for LazyCell<T, F> {
     type Tuple<'a>
         = T::Tuple<'a>
@@ -230,7 +241,7 @@ impl FilterableTuple for HeapTuple<'_> {
 }
 
 /// Starts reads of the table pages of rows about to be returned, with `PrefetchBuffer`.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct TablePrefetch {
     relation: pgrx::pg_sys::Relation,
     window: usize,

@@ -19,7 +19,7 @@ use distance::Distance;
 use index::bump::Bump;
 use index::fetch::{BorrowedIter, Fetch};
 use index::packed::{PackedRefMut4, PackedRefMut8};
-use index::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily, Sequence};
+use index::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily};
 use index::relation::{Page, Relation, RelationRead, RelationReadTypes};
 use index_accessor::{DefaultWithDimension, FunctionalAccessor, LAccess};
 use rabitq::bit::binary::BinaryLut;
@@ -56,8 +56,6 @@ pub type MaxsimCandidate<'b> = (
     (Reverse<Distance>, AlwaysEqual<Distance>),
     AlwaysEqual<PackedRefMut8<'b, (NonZero<u64>, u16, BorrowedIter<'b>)>>,
 );
-
-type Refill<'b> = Box<dyn FnMut() -> Option<Vec<Candidate<'b>>> + 'b>;
 
 #[derive(Debug)]
 pub struct SearchParams {
@@ -387,8 +385,14 @@ where
         tuples
     }
 
-    fn read(&mut self, lists: Vec<List<'b>>, filter: impl Filter) -> Vec<Candidate<'b>> {
-        let (bump, epsilon) = (self.bump, self.epsilon);
+    fn read<'a>(
+        &mut self,
+        lists: Vec<List<'b>>,
+        filter: impl Filter,
+        bump: &'a impl Bump,
+        bound: Option<Distance>,
+    ) -> Candidates<'a> {
+        let epsilon = self.epsilon;
         let mut results = LinkedVec::new();
         self.read_lists(
             lists,
@@ -396,6 +400,9 @@ where
             id_2(|row| {
                 let (rough, err) = row.value;
                 let lowerbound = Distance::from_f32(rough - err * epsilon);
+                if bound.is_some_and(|radius| lowerbound >= radius) {
+                    return;
+                }
                 results.push((
                     (Reverse(lowerbound), AlwaysEqual(())),
                     AlwaysEqual(PackedRefMut4(bump.alloc((
@@ -406,7 +413,7 @@ where
                 ));
             }),
         );
-        results.into_vec()
+        Heap::from(results.into_vec())
     }
 }
 
@@ -505,70 +512,13 @@ impl<'b, R: RelationRead + 'b, P: Prefetcher<'b, R = R, Item = Scheduled>> Relat
     }
 }
 
-/// With a filter, an empty heap reads further lists, whose rows can be nearer than those returned.
-pub struct Candidates<'b> {
-    heap: Heap<Candidate<'b>>,
-    bound: Option<Distance>,
-    refill: Option<Refill<'b>>,
-}
+pub type Candidates<'b> = Heap<Candidate<'b>>;
 
-impl<'b> Candidates<'b> {
-    fn new(
-        results: Vec<Candidate<'b>>,
-        bound: Option<Distance>,
-        refill: Option<Refill<'b>>,
-    ) -> Self {
-        let mut this = Self {
-            heap: Heap::new(),
-            bound,
-            refill,
-        };
-        this.take(results);
-        this
-    }
+pub type Refill<'b> = Box<dyn for<'a> FnMut(&'a bumpalo::Bump) -> Option<Candidates<'a>> + 'b>;
 
-    /// Drops the candidates past the bound; once one is, the lists read reach past it.
-    fn take(&mut self, mut results: Vec<Candidate<'b>>) {
-        if let Some(bound) = self.bound {
-            let n = results.len();
-            results.retain(|((Reverse(lowerbound), _), _)| *lowerbound < bound);
-            if results.len() < n {
-                self.refill = None;
-            }
-        }
-        self.heap = Heap::from(results);
-    }
-}
-
-impl<'b> Sequence for Candidates<'b> {
-    type Item = Candidate<'b>;
-    type Inner = std::vec::IntoIter<Candidate<'b>>;
-
-    #[inline]
-    fn next(&mut self) -> Option<Candidate<'b>> {
-        self.heap.pop()
-    }
-
-    #[inline]
-    fn peek(&mut self) -> Option<&Candidate<'b>> {
-        self.heap.peek()
-    }
-
-    fn into_inner(self) -> Self::Inner {
-        self.heap.into_vec().into_iter()
-    }
-
-    fn refill(&mut self) -> bool {
-        while self.heap.is_empty()
-            && let Some(refill) = self.refill.as_mut()
-        {
-            match refill() {
-                Some(results) => self.take(results),
-                None => self.refill = None,
-            }
-        }
-        !self.heap.is_empty()
-    }
+pub enum Search<'b> {
+    Single(Candidates<'b>),
+    Refill(Refill<'b>),
 }
 
 /// Candidates past `bound` are dropped; with a filter, refills double the probes to `max_probes`.
@@ -582,7 +532,7 @@ pub fn default_search<'b, R: RelationRead, O: Operator>(
     bump: &'b impl Bump,
     prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R> + 'b,
     prefetch_h0_tuples: impl PrefetcherSequenceFamily<'b, R> + 'b,
-) -> Candidates<'b>
+) -> Search<'b>
 where
     R::Page: Page<Opaque = Opaque>,
 {
@@ -606,14 +556,20 @@ where
         rest,
     } = searcher.route(&probes, false);
     let Some(filter) = filter else {
-        return Candidates::new(searcher.read(lists, ()), bound, None);
+        return Search::Single(searcher.read(lists, (), bump, bound));
     };
-    let mut read = lists.iter().map(|list| list.2.0).collect::<HashSet<_>>();
-    let results = searcher.read(lists, &filter);
     let max_probes = max_probes.map_or(usize::MAX, |x| x as usize);
+    if complete || lists.len() >= max_probes {
+        return Search::Single(searcher.read(lists, &filter, bump, bound));
+    }
+    let mut read = lists.iter().map(|list| list.2.0).collect::<HashSet<_>>();
+    let mut pending = lists.into_iter();
     // Below a root alone, routing's ranking of every list gives each round its further lists.
     let mut rest = (probes.len() == 1).then_some(rest);
-    let refill = move || {
+    Search::Refill(Box::new(move |scratch| {
+        if let Some(list) = pending.next() {
+            return Some(searcher.read(vec![list], &filter, scratch, bound));
+        }
         while !complete && read.len() < max_probes {
             for x in probes.iter_mut() {
                 *x = x.saturating_mul(2).max(1);
@@ -630,13 +586,13 @@ where
             };
             lists.truncate(max_probes - read.len());
             read.extend(lists.iter().map(|list| list.2.0));
-            if !lists.is_empty() {
-                return Some(searcher.read(lists, &filter));
+            pending = lists.into_iter();
+            if let Some(list) = pending.next() {
+                return Some(searcher.read(vec![list], &filter, scratch, bound));
             }
         }
         None
-    };
-    Candidates::new(results, bound, Some(Box::new(refill)))
+    }))
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(

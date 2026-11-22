@@ -351,6 +351,7 @@ impl<'a> FilterKeys<'a> {
     unsafe fn enum_values(&self, i: usize, value: Datum, strategy: u16) -> Vec<[u128; 2]> {
         unsafe {
             let ty = pg_sys::get_atttype((*self.index_relation).rd_id, i as i16 + 2);
+            let ty = pg_sys::getBaseType(ty);
             let cache = pg_sys::lookup_type_cache(ty, 0);
             let id = pg_sys::SysCacheIdentifier::ENUMTYPOIDNAME as _;
             let list = pg_sys::SearchSysCacheList(id, 1, ty.into(), Datum::null(), Datum::null());

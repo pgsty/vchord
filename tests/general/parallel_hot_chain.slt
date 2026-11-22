@@ -1,0 +1,154 @@
+# Hold the leader on its first heap tuple until two workers have joined and a
+# worker has processed the only HOT update, near the end of the table.
+statement ok
+CREATE FUNCTION hot_locks(leader int, phase int) RETURNS int
+LANGUAGE sql VOLATILE PARALLEL SAFE AS $$
+  SELECT count(DISTINCT pid)::int FROM pg_locks
+  WHERE locktype = 'advisory' AND classid = leader::oid AND objid = phase::oid AND granted
+$$;
+CREATE FUNCTION hot_wait(leader int, phase int, participants int) RETURNS void
+LANGUAGE plpgsql VOLATILE PARALLEL SAFE AS $$
+DECLARE deadline timestamptz := clock_timestamp() + interval '45 seconds';
+BEGIN
+  WHILE public.hot_locks(leader, phase) < participants LOOP
+    IF clock_timestamp() >= deadline THEN RAISE EXCEPTION 'HOT build timed out at phase %', phase; END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+END $$;
+CREATE FUNCTION hot_vector(id int, v vector) RETURNS vector
+LANGUAGE plpgsql IMMUTABLE PARALLEL SAFE AS $$
+DECLARE leader int := nullif(current_setting('hot_test.leader', true), '')::int;
+BEGIN
+  IF pg_backend_pid() <> nullif(current_setting('hot_test.serial_pid', true), '')::int THEN
+    RAISE EXCEPTION 'unexpected parallel worker during serial fallback';
+  END IF;
+  IF leader IS NULL OR public.hot_locks(leader, 4) > 0 THEN RETURN v; END IF;
+  IF pg_backend_pid() = leader THEN
+    PERFORM public.hot_wait(leader, 1, 2);
+    PERFORM pg_advisory_xact_lock_shared(leader, 2);
+    PERFORM public.hot_wait(leader, 3, 1);
+    PERFORM pg_advisory_xact_lock_shared(leader, 4);
+  ELSE
+    PERFORM pg_advisory_xact_lock_shared(leader, 1);
+    PERFORM public.hot_wait(leader, 2, 1);
+    IF id = 4000 THEN
+      PERFORM pg_advisory_xact_lock_shared(leader, 3);
+      PERFORM public.hot_wait(leader, 4, 1);
+    END IF;
+  END IF;
+  RETURN v;
+END $$;
+
+statement ok
+CREATE TABLE hot_rq (id int, v vector(2), pad text) WITH (fillfactor=50, autovacuum_enabled=false, parallel_workers=2);
+CREATE TABLE hot_g (LIKE hot_rq) WITH (fillfactor=50, autovacuum_enabled=false, parallel_workers=2);
+INSERT INTO hot_rq SELECT id, CASE id WHEN 1 THEN '[1,0]'::vector WHEN 4000 THEN '[0,0]'::vector END,
+  repeat('x', 200) FROM generate_series(1, 4000) id;
+INSERT INTO hot_g SELECT * FROM hot_rq;
+CREATE FUNCTION hot_plan(tab text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE plan json;
+BEGIN
+  EXECUTE format('EXPLAIN (FORMAT JSON, COSTS OFF) SELECT id FROM %I ORDER BY hot_vector(id,v)::vector(2) <-> ''[0,0]'' LIMIT 1', tab) INTO plan;
+  RETURN plan::text;
+END $$;
+
+connection old
+statement ok
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SET LOCAL enable_seqscan=off;
+SELECT pg_current_snapshot();
+
+statement ok
+UPDATE hot_rq SET v='[9,0]' WHERE id=4000;
+UPDATE hot_g SET v='[9,0]' WHERE id=4000;
+SET max_parallel_maintenance_workers=2;
+
+statement ok
+SELECT set_config('hot_test.leader',pg_backend_pid()::text,false);
+CREATE INDEX hot_rq_idx ON hot_rq USING vchordrq ((hot_vector(id,v)::vector(2)) vector_l2_ops);
+
+statement ok
+CREATE INDEX hot_g_idx ON hot_g USING vchordg ((hot_vector(id,v)::vector(2)) vector_l2_ops);
+RESET hot_test.leader;
+
+query I
+SELECT count(*) FROM pg_index WHERE indexrelid IN ('hot_rq_idx'::regclass,'hot_g_idx'::regclass) AND indcheckxmin;
+----
+2
+
+connection old
+query TT
+SELECT hot_plan('hot_rq') LIKE '%Seq Scan%', hot_plan('hot_g') LIKE '%Seq Scan%';
+----
+t t
+
+connection old
+query II
+SELECT (SELECT id FROM hot_rq ORDER BY hot_vector(id,v)::vector(2) <-> '[0,0]' LIMIT 1),
+       (SELECT id FROM hot_g ORDER BY hot_vector(id,v)::vector(2) <-> '[0,0]' LIMIT 1);
+----
+4000 4000
+
+statement ok
+SET max_parallel_maintenance_workers=0;
+CREATE INDEX hot_rq_serial ON hot_rq USING vchordrq ((hot_vector(id,v)::vector(2)) vector_l2_ops);
+CREATE INDEX hot_g_serial ON hot_g USING vchordg ((hot_vector(id,v)::vector(2)) vector_l2_ops);
+
+query I
+SELECT count(*) FROM pg_index WHERE indexrelid IN ('hot_rq_serial'::regclass,'hot_g_serial'::regclass) AND indcheckxmin;
+----
+2
+
+statement ok
+SET max_parallel_maintenance_workers=2;
+SET max_parallel_workers=0;
+SELECT set_config('hot_test.serial_pid',pg_backend_pid()::text,false);
+CREATE INDEX hot_rq_fallback ON hot_rq USING vchordrq ((hot_vector(id,v)::vector(2)) vector_l2_ops);
+CREATE INDEX hot_g_fallback ON hot_g USING vchordg ((hot_vector(id,v)::vector(2)) vector_l2_ops);
+RESET hot_test.serial_pid;
+RESET max_parallel_workers;
+
+query I
+SELECT count(*) FROM pg_index WHERE indexrelid IN ('hot_rq_fallback'::regclass,'hot_g_fallback'::regclass) AND indcheckxmin;
+----
+2
+
+connection old
+statement ok
+COMMIT;
+
+statement ok
+SET enable_seqscan=off;
+DROP INDEX hot_rq_serial, hot_g_serial, hot_rq_fallback, hot_g_fallback;
+
+query TT
+SELECT hot_plan('hot_rq') LIKE '%hot_rq_idx%', hot_plan('hot_g') LIKE '%hot_g_idx%';
+----
+t t
+
+query II
+SELECT (SELECT id FROM hot_rq ORDER BY hot_vector(id,v)::vector(2) <-> '[0,0]' LIMIT 1),
+       (SELECT id FROM hot_g ORDER BY hot_vector(id,v)::vector(2) <-> '[0,0]' LIMIT 1);
+----
+1 1
+
+statement ok
+VACUUM hot_rq;
+
+statement ok
+VACUUM hot_g;
+
+statement ok
+REINDEX INDEX hot_rq_idx;
+REINDEX INDEX hot_g_idx;
+
+query I
+SELECT count(*) FROM pg_index WHERE indexrelid IN ('hot_rq_idx'::regclass,'hot_g_idx'::regclass) AND indcheckxmin;
+----
+0
+
+statement ok
+DROP TABLE hot_rq, hot_g;
+DROP FUNCTION hot_plan(text), hot_vector(int,vector), hot_wait(int,int,int), hot_locks(int,int);
+RESET enable_seqscan;
+RESET max_parallel_maintenance_workers;

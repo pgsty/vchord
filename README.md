@@ -56,6 +56,10 @@ SELECT * FROM items ORDER BY embedding <-> '[3, 1, 2]' LIMIT 5;
 
 Use `USING vchordg` for a graph index. See [indexing](https://vchord.pgsty.com/docs/vchord/usage/indexing/), [graph search](https://vchord.pgsty.com/docs/vchord/usage/graph-index/), and [parameter tuning](https://vchord.pgsty.com/docs/vchord/usage/partitioning-tuning/) for configuration.
 
+For a query such as `WHERE tenant_id = 42 ORDER BY embedding <-> $1 LIMIT 10`, an RQ index on `(embedding vector_l2_ops, tenant_id)` can filter candidates inside each IVF list. `vchordrq.probes` selects the initial lists. A pushed-down filter key can extend the search to further lists. `vchordrq.max_probes` caps that expansion and always preserves the initial probes. Its default of `-1` allows expansion through the whole tree.
+
+When an ordered scan can expand, RQ reranks the eligible lists and sorts their candidates before returning the first row. The sort uses `work_mem` and can spill to temporary files. Even `LIMIT 1` can pay this startup cost. Setting `max_probes` to the initial leaf probe count gives single-level indexes the ordinary streaming ANN path. A sphere predicate uses a strict radius and PostgreSQL rechecks its boundary.
+
 ## Build from Source
 
 Requires PostgreSQL 15–19 development headers, pgvector, Rust 1.99.1+, GNU Make, and matching Clang, libclang, and LLVM tools on `x86_64` or `aarch64`. Built with pgrx 0.20.0.
@@ -77,7 +81,7 @@ Install the new library and SQL files, restart PostgreSQL, then run in each data
 ALTER EXTENSION vchord UPDATE;
 ```
 
-See [release notes](https://vchord.pgsty.com/blog/release/) for migration requirements.
+1.4.0 reads ordinary 1.3.0 RQ indexes and writes the same format (`1001`). Adding filter key columns requires a new RQ index, which uses format `1003`. Before restoring a 1.3.0 binary, remove or replace every keyed index while 1.4.0 is still running, and restore a compatible 1.3.0 extension catalog or database backup. The distribution provides a forward SQL upgrade. PostgreSQL 14 installations must also move to a supported server major. See the [1.4.0 release notes](docs/release-notes/1.4.0.md).
 
 ## Testing
 

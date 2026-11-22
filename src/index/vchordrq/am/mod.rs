@@ -300,9 +300,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         // 18 compares disabled nodes first) and give them a dominating finite
         // cost (before PostgreSQL 18, `disable_cost` is additive) (#32).
         // Clauses on the filter key column, or arrays of spheres, give no vector.
-        let unusable = ((*path).indexorderbys.is_null() && !has_vector_clause(path))
-            || (*path).path.pathtype == pgrx::pg_sys::NodeTag::T_IndexOnlyScan;
-        if unusable {
+        if !crate::index::hook::usable_path(path) {
             #[cfg(any(feature = "pg18", feature = "pg19"))]
             {
                 (*path).path.disabled_nodes += 1;
@@ -441,8 +439,25 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 .unwrap_or(1.0);
             // Only rows the keys select become candidates.
             let keys = FilterKeys::of_index(relation.raw()).keys;
-            let key_selectivity = filter_key_selectivity(root, path, keys).clamp(1e-9, 1.0);
-            let candidates = node_count * key_selectivity;
+            let key_selectivity = filter_key_selectivity(root, path, keys);
+            let initial_share = probes
+                .iter()
+                .zip(cost.cells.iter().rev().skip(1))
+                .map(|(&probe, &cells)| f64::from(probe) / f64::from(cells.max(1)))
+                .fold(1.0, f64::min);
+            let probe_limit = gucs::vchordrq_max_probes()
+                .unwrap_or(cost.cells[0])
+                .min(cost.cells[0]);
+            let ordered_refill = key_selectivity.is_some()
+                && !(*path).indexorderbys.is_null()
+                && f64::from(probe_limit) > (initial_share * f64::from(cost.cells[0])).round();
+            let key_selectivity = key_selectivity.unwrap_or(1.0).clamp(1e-9, 1.0);
+            let candidates = if ordered_refill {
+                (*index_opt_info).tuples * f64::from(probe_limit) / f64::from(cost.cells[0].max(1))
+                    * key_selectivity
+            } else {
+                node_count * key_selectivity
+            };
             let filter_selectivity = (filter_selectivity / key_selectivity).clamp(1e-9, 1.0);
             // The scan cannot process more candidates than the configured IVF
             // budget, even for very selective filters or an unbounded query.
@@ -456,7 +471,13 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 1.0
             };
             *index_startup_cost = 0.001 * node_count;
-            *index_total_cost = 0.001 * node_count + full_path_count;
+            if ordered_refill {
+                let retained = gucs::vchordrq_max_scan_tuples()
+                    .map_or(candidates, |n| candidates.min(n.into()));
+                *index_startup_cost += candidates
+                    * (1.0 + 2.0 * pgrx::pg_sys::cpu_operator_cost * retained.max(2.0).log2());
+            }
+            *index_total_cost = *index_startup_cost + full_path_count;
             *index_selectivity = scan_selectivity;
             *index_correlation = 0.0;
             *index_pages = page_count;
@@ -470,30 +491,12 @@ pub unsafe extern "C-unwind" fn amcostestimate(
     }
 }
 
-/// A clause on the vector column that gives one vector: a sphere, not an array or a NULL test.
-unsafe fn has_vector_clause(path: *mut pgrx::pg_sys::IndexPath) -> bool {
-    use pgrx::pg_sys::{IndexClause, NodeTag, RestrictInfo};
-    unsafe {
-        pgrx::PgList::<IndexClause>::from_pg((*path).indexclauses)
-            .iter_ptr()
-            .any(|clause| {
-                (*clause).indexcol == 0
-                    && pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals)
-                        .iter_ptr()
-                        .all(|qual| {
-                            let tag = (*(*qual).clause).type_;
-                            tag != NodeTag::T_ScalarArrayOpExpr && tag != NodeTag::T_NullTest
-                        })
-            })
-    }
-}
-
 /// The share of rows the filter key quals select, plus on a hashed key the hash collisions.
 unsafe fn filter_key_selectivity(
     root: *mut pgrx::pg_sys::PlannerInfo,
     path: *mut pgrx::pg_sys::IndexPath,
     keys: &vchordrq::keys::Keys,
-) -> f64 {
+) -> Option<f64> {
     use pgrx::pg_sys::{IndexClause, NodeTag, RestrictInfo, ScalarArrayOpExpr};
     unsafe {
         let mut quals = pgrx::PgList::<RestrictInfo>::new();
@@ -526,7 +529,7 @@ unsafe fn filter_key_selectivity(
             }
         }
         if quals.is_empty() {
-            return 1.0;
+            return None;
         }
         let selectivity = pgrx::pg_sys::clauselist_selectivity(
             root,
@@ -535,7 +538,7 @@ unsafe fn filter_key_selectivity(
             pgrx::pg_sys::JoinType::JOIN_INNER,
             std::ptr::null_mut(),
         );
-        selectivity + collisions
+        Some(selectivity + collisions)
     }
 }
 
@@ -707,6 +710,12 @@ pub unsafe extern "C-unwind" fn amrescan(
         scanner.searched = false;
         drop(scanner.scanning.take());
         scanner.bump.reset();
+        if crate::index::scanners::null_order(scan) {
+            scanner.scanning = Some(LazyCell::new(Box::new(move || {
+                Box::new(crate::index::scanners::NullOrderRows::new(scan))
+            })));
+            return;
+        }
         // Per filter key column, the stored forms that all scan keys on it accept.
         let constrained = keys.iter().any(|key| key.sk_attno >= 2);
         let filter = constrained.then(|| {
@@ -743,6 +752,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             }
         }
         let options = SearchOptions {
+            scan_context: pgrx::pg_sys::GetMemoryChunkContext(scan.cast()),
             search: SearchParams {
                 probes,
                 epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),

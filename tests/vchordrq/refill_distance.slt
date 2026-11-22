@@ -1,0 +1,129 @@
+statement ok
+CREATE TABLE refill_centers (id int, parent int, vector vector(2));
+INSERT INTO refill_centers VALUES (1,NULL,'[0,0]'),(2,NULL,'[10,0]');
+CREATE TABLE refill_rows (id int, v vector(2), owner int);
+INSERT INTO refill_rows VALUES (1,'[1,0]',1),(9,'[-9,0]',1),(6,'[6,0]',1),(7,'[7,0]',1),(2,'[2,0]',2);
+CREATE INDEX refill_idx ON refill_rows USING vchordrq (v vector_l2_ops, owner)
+WITH (options='build.external.table = "public.refill_centers"');
+SET enable_seqscan=off;
+SET enable_sort=off;
+SET vchordrq.probes='1';
+CREATE VIEW refill_order AS SELECT id FROM refill_rows WHERE owner=1 ORDER BY v <-> '[0,0]';
+CREATE VIEW refill_sphere AS SELECT id FROM refill_rows WHERE owner=1 AND v <<->> sphere('[0,0]'::vector,7);
+
+query T
+SELECT ARRAY(TABLE refill_order);
+----
+{1,6,7,9}
+
+query T
+SELECT ARRAY(SELECT id FROM refill_order LIMIT 2);
+----
+{1,6}
+
+query T
+SELECT ARRAY(SELECT id FROM refill_sphere ORDER BY id);
+----
+{1,6}
+
+query T
+SELECT ARRAY(SELECT id FROM refill_rows WHERE owner=1 AND v <<->> sphere('[0,0]'::vector,7) ORDER BY v <-> '[0,0]');
+----
+{1,6}
+
+statement ok
+SET vchordrq.max_scan_tuples=2;
+
+query T
+SELECT ARRAY(TABLE refill_order);
+----
+{1,6}
+
+statement ok
+SET vchordrq.max_scan_tuples=0;
+
+query I
+SELECT count(*) FROM refill_order;
+----
+0
+
+statement ok
+RESET vchordrq.max_scan_tuples;
+SET vchordrq.max_probes=1;
+
+query T
+SELECT ARRAY(TABLE refill_order);
+----
+{1,9}
+
+query T
+SELECT ARRAY(TABLE refill_sphere);
+----
+{1}
+
+statement ok
+RESET vchordrq.max_probes;
+DROP INDEX refill_idx;
+UPDATE refill_centers SET parent=id+2;
+INSERT INTO refill_centers VALUES (3,5,'[0,0]'),(4,5,'[10,0]'),(5,NULL,'[5,0]');
+CREATE INDEX refill_idx ON refill_rows USING vchordrq (v vector_l2_ops, owner)
+WITH (options='build.external.table = "public.refill_centers"
+rerank_in_table = true');
+SET vchordrq.probes='1,1';
+SET vchordrq.prefilter=on;
+
+query T
+SELECT ARRAY(SELECT id FROM refill_rows WHERE owner=1 AND id <> 7 ORDER BY v <-> '[0,0]');
+----
+{1,6,9}
+
+query T
+SELECT ARRAY(SELECT id FROM refill_sphere ORDER BY id);
+----
+{1,6}
+
+statement ok
+INSERT INTO refill_rows SELECT 100+i, ARRAY[10+i%5,0]::real[]::vector, 1 FROM generate_series(1,8000) i;
+SET work_mem='64kB';
+CREATE FUNCTION refill_spills() RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE plan json; scan json;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM refill_rows WHERE owner=1 ORDER BY v <-> ''[0,0]'' LIMIT 1' INTO plan;
+  scan := plan->0->'Plan'->'Plans'->0;
+  RETURN scan->>'Index Name' = 'refill_idx' AND (scan->>'Temp Written Blocks')::int > 0;
+END $$;
+
+query T
+SELECT refill_spills();
+----
+t
+
+statement ok
+BEGIN;
+DECLARE refill_cursor CURSOR FOR SELECT id FROM refill_order;
+
+query I
+FETCH 2 FROM refill_cursor;
+----
+1
+6
+
+query I
+FETCH 2 FROM refill_cursor;
+----
+7
+9
+
+statement ok
+CLOSE refill_cursor;
+COMMIT;
+DROP FUNCTION refill_spills();
+RESET work_mem;
+
+statement ok
+DROP VIEW refill_order, refill_sphere;
+DROP TABLE refill_centers, refill_rows;
+RESET vchordrq.prefilter;
+RESET vchordrq.probes;
+RESET enable_seqscan;
+RESET enable_sort;
