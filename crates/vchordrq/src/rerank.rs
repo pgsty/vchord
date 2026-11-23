@@ -75,8 +75,7 @@ impl<T: Table> Table for Hinted<T> {
     }
 }
 
-/// Rows to read ahead after `n`: as many as `k` says are still to come, else doubling so that a
-/// scan ended early reads few.
+/// Rows to read ahead after `n`: as many as `k` says are to come, else doubling.
 #[inline]
 fn ramp(n: usize, window: usize, k: KHint) -> usize {
     let doubling = 1 << (n / 2 + 1).ilog2();
@@ -326,8 +325,7 @@ pub fn exact_distance<O: Operator>(
     accessor.finish(query.1, row.1)
 }
 
-/// The cosine operator's distance from `query`, as given, to `row`, less one; `y2` is the query's
-/// squared norm.
+/// The cosine operator's distance from `query`, as given, to `row`, less one; `y2` is `|query|²`.
 #[inline]
 pub fn cosine_distance<O: Operator>(
     query: <O::Vector as VectorOwned>::Borrowed<'_>,

@@ -6,17 +6,14 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-//! A custom scan over a vchordrq index scan, put in by [`plan`]. It hands up the scan's rows with
-//! the distance the scan computed, owns the sphere around the scan's vector (membership is by
-//! that distance, without a recheck, unless PostgreSQL rechecks other keys of the scan), and tells
-//! the scan how many rows the Limit above takes.
+//! A custom scan over a vchordrq scan: hands up its distance, owns its sphere, passes it the Limit.
 
 mod plan;
 
 use crate::index::vchordrq::am::Scanner;
 use pgrx::pg_sys::submodules::ffi::pg_guard_ffi_boundary;
-use pgrx::pg_sys::{self, List, Node, Plan};
-use std::ffi::{c_char, c_int};
+use pgrx::pg_sys::{self, List, Node, Plan, TupleTableSlot};
+use std::ffi::{CString, c_char, c_int};
 use std::ptr::null_mut;
 use vchordrq::{KHint, KKind};
 
@@ -38,7 +35,7 @@ static mut EXEC_METHODS: pg_sys::CustomExecMethods = pg_sys::CustomExecMethods {
     ReInitializeDSMCustomScan: None,
     InitializeWorkerCustomScan: None,
     ShutdownCustomScan: None,
-    ExplainCustomScan: None,
+    ExplainCustomScan: Some(explain),
 };
 
 static mut PREV_PLANNER: pg_sys::planner_hook_type = None;
@@ -51,50 +48,40 @@ pub fn init() {
     }
 }
 
-#[cfg(not(feature = "pg19"))]
-#[pgrx::pg_guard]
-unsafe extern "C-unwind" fn planner(
-    parse: *mut pg_sys::Query,
-    query_string: *const c_char,
-    cursor_options: c_int,
-    bound_params: pg_sys::ParamListInfo,
-) -> *mut pg_sys::PlannedStmt {
-    unsafe {
-        let stmt = if let Some(prev) = PREV_PLANNER {
-            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
-            pg_guard_ffi_boundary(|| prev(parse, query_string, cursor_options, bound_params))
-        } else {
-            pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
-        };
-        if crate::index::gucs::vchordrq_scan_node() {
-            plan::rewrite(stmt);
+// pg_guard passes the arguments by its own span: the macro names them, including PG 19's `es`
+macro_rules! planner {
+    ($($explain:ty)?) => {
+        #[pgrx::pg_guard]
+        unsafe extern "C-unwind" fn planner(
+            parse: *mut pg_sys::Query,
+            query_string: *const c_char,
+            cursor_options: c_int,
+            bound_params: pg_sys::ParamListInfo,
+            $(es: $explain,)?
+        ) -> *mut pg_sys::PlannedStmt {
+            unsafe {
+                let (query, options, params) = (query_string, cursor_options, bound_params);
+                let stmt = if let Some(prev) = PREV_PLANNER {
+                    #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+                    pg_guard_ffi_boundary(|| {
+                        prev(parse, query, options, params $(, es as $explain)?)
+                    })
+                } else {
+                    pg_sys::standard_planner(parse, query, options, params $(, es as $explain)?)
+                };
+                if crate::index::gucs::vchordrq_scan_node() {
+                    plan::rewrite(stmt);
+                }
+                stmt
+            }
         }
-        stmt
-    }
+    };
 }
 
+#[cfg(not(feature = "pg19"))]
+planner!();
 #[cfg(feature = "pg19")]
-#[pgrx::pg_guard]
-unsafe extern "C-unwind" fn planner(
-    parse: *mut pg_sys::Query,
-    query_string: *const c_char,
-    cursor_options: c_int,
-    bound_params: pg_sys::ParamListInfo,
-    es: *mut pg_sys::ExplainState,
-) -> *mut pg_sys::PlannedStmt {
-    unsafe {
-        let stmt = if let Some(prev) = PREV_PLANNER {
-            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
-            pg_guard_ffi_boundary(|| prev(parse, query_string, cursor_options, bound_params, es))
-        } else {
-            pg_sys::standard_planner(parse, query_string, cursor_options, bound_params, es)
-        };
-        if crate::index::gucs::vchordrq_scan_node() {
-            plan::rewrite(stmt);
-        }
-        stmt
-    }
-}
+planner!(*mut pg_sys::ExplainState);
 
 unsafe fn cells<'a>(list: *mut List) -> &'a mut [pg_sys::ListCell] {
     unsafe {
@@ -110,8 +97,17 @@ unsafe fn nth(list: *mut List, i: usize) -> *mut Node {
     unsafe { cells(list)[i].ptr_value.cast() }
 }
 
-/// The plan carries the Limit's count and offset and, for EvalPlanQual, the distance by the
-/// expression in `custom_exprs`; the Limit's kind and whether it keeps ties in `custom_private`.
+// called per row without pgrx's guard: these frames drop nothing, so an error unwinds past them
+unsafe extern "C" {
+    fn ExecScan(
+        node: *mut pg_sys::ScanState,
+        access: pg_sys::ExecScanAccessMtd,
+        recheck: pg_sys::ExecScanRecheckMtd,
+    ) -> *mut TupleTableSlot;
+    fn slot_getsomeattrs_int(slot: *mut TupleTableSlot, attnum: c_int);
+}
+
+/// `custom_exprs`: the Limit's count, offset, EvalPlanQual's distance; `custom_private`: kind, ties
 #[repr(C)]
 struct State {
     css: pg_sys::CustomScanState,
@@ -128,6 +124,8 @@ struct State {
     count: *mut pg_sys::ExprState,
     offset: *mut pg_sys::ExprState,
     distance: *mut pg_sys::ExprState,
+    /// the hint the scan last received
+    hint: KHint,
 }
 
 #[pgrx::pg_guard]
@@ -166,16 +164,13 @@ unsafe extern "C-unwind" fn begin(
         (*state).ordered = pg_sys::list_length((*custom).custom_scan_tlist) as usize > columns;
         (*state).direct = (*css).ss.ps.ps_ProjInfo.is_null() && !epq;
         (*state).started = false;
-        (*state).kind = match private(0) {
-            1 => KKind::Exact,
-            2 => KKind::AtLeast,
-            3 => KKind::AtMost,
-            _ => KKind::Unknown,
-        };
+        (*state).kind = KKind::try_from(private(0))
+            .unwrap_or_else(|kind| pgrx::error!("the plan's row hint kind {kind} is unknown"));
         (*state).ties = private(1) != 0;
         (*state).count = expr(0);
         (*state).offset = expr(1);
         (*state).distance = if epq { expr(2) } else { null_mut() };
+        (*state).hint = KHint::UNKNOWN;
         if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int == 0 {
             let scanner = crate::index::hook::begin_scan(child).cast::<Scanner>();
             (*scanner).hack = std::ptr::NonNull::new(child);
@@ -222,19 +217,20 @@ unsafe fn hint(state: &State) -> KHint {
 }
 
 /// Starts the child's scan with the hint, once the Limit above has computed its count.
-#[cold]
-unsafe fn start(state: *mut State) {
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn start(state: *mut State) {
     unsafe {
         (*state).started = true;
+        (*state).hint = hint(&*state);
         let child = (*state).child;
-        (*(*(*child).iss_ScanDesc).opaque.cast::<Scanner>()).k = hint(&*state);
+        (*(*(*child).iss_ScanDesc).opaque.cast::<Scanner>()).k = (*state).hint;
         pg_sys::ExecReScan(child.cast());
     }
 }
 
 /// The child's next row and its distance into the scan slot.
 #[inline(always)]
-unsafe fn fetch(state: *mut State) -> *mut pg_sys::TupleTableSlot {
+unsafe fn fetch(state: *mut State) -> *mut TupleTableSlot {
     const EMPTY: u16 = pg_sys::TTS_FLAG_EMPTY as u16;
     const SHOULDFREE: u16 = pg_sys::TTS_FLAG_SHOULDFREE as u16;
     unsafe {
@@ -242,23 +238,22 @@ unsafe fn fetch(state: *mut State) -> *mut pg_sys::TupleTableSlot {
         let slot = (*state).css.ss.ss_ScanTupleSlot;
         // clearing a virtual slot is setting its flags, unless a parent has materialized it
         if (*slot).tts_flags & SHOULDFREE != 0 {
-            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
-            pg_guard_ffi_boundary(|| (*(*slot).tts_ops).clear.unwrap_unchecked()(slot));
+            #[allow(ffi_unwind_calls, reason = "unguarded: see `ExecScan`")]
+            (*(*slot).tts_ops).clear.unwrap_unchecked()(slot);
         }
         (*slot).tts_flags |= EMPTY;
         (*slot).tts_nvalid = 0;
         if !(*state).started {
             start(state);
         }
-        let exec = (*child).ss.ps.ExecProcNode.unwrap_unchecked();
-        #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
-        let from = pg_guard_ffi_boundary(|| exec(child.cast()));
+        #[allow(ffi_unwind_calls, reason = "unguarded: see `ExecScan`")]
+        let from = (*child).ss.ps.ExecProcNode.unwrap_unchecked()(child.cast());
         if from.is_null() || (*from).tts_flags & EMPTY != 0 {
             return slot;
         }
         let n = (*state).columns;
         if ((*from).tts_nvalid as usize) < n {
-            pg_sys::slot_getsomeattrs_int(from, n as c_int);
+            slot_getsomeattrs_int(from, n as c_int);
         }
         std::ptr::copy_nonoverlapping((*from).tts_values, (*slot).tts_values, n);
         std::ptr::copy_nonoverlapping((*from).tts_isnull, (*slot).tts_isnull, n);
@@ -277,8 +272,7 @@ unsafe fn fetch(state: *mut State) -> *mut pg_sys::TupleTableSlot {
     }
 }
 
-#[pgrx::pg_guard]
-unsafe extern "C-unwind" fn next(ss: *mut pg_sys::ScanState) -> *mut pg_sys::TupleTableSlot {
+unsafe extern "C-unwind" fn next(ss: *mut pg_sys::ScanState) -> *mut TupleTableSlot {
     unsafe { fetch(ss.cast()) }
 }
 
@@ -286,7 +280,7 @@ unsafe extern "C-unwind" fn next(ss: *mut pg_sys::ScanState) -> *mut pg_sys::Tup
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn recheck(
     ss: *mut pg_sys::ScanState,
-    _slot: *mut pg_sys::TupleTableSlot,
+    _slot: *mut TupleTableSlot,
 ) -> bool {
     unsafe {
         let state = ss.cast::<State>();
@@ -310,14 +304,13 @@ unsafe extern "C-unwind" fn recheck(
     }
 }
 
-#[pgrx::pg_guard]
-unsafe extern "C-unwind" fn exec(css: *mut pg_sys::CustomScanState) -> *mut pg_sys::TupleTableSlot {
+unsafe extern "C-unwind" fn exec(css: *mut pg_sys::CustomScanState) -> *mut TupleTableSlot {
     unsafe {
         let state = css.cast::<State>();
         if (*state).direct {
             return fetch(state);
         }
-        pg_sys::ExecScan(&raw mut (*css).ss, Some(next), Some(recheck))
+        ExecScan(&raw mut (*css).ss, Some(next), Some(recheck))
     }
 }
 
@@ -338,31 +331,24 @@ unsafe extern "C-unwind" fn rescan(css: *mut pg_sys::CustomScanState) {
     }
 }
 
-#[cfg(debug_assertions)]
-thread_local! {
-    static RECEIVED: std::cell::RefCell<Vec<KHint>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Debug builds only: notes the hint a scan received when it started returning rows.
-#[cfg(debug_assertions)]
-pub fn record(k: KHint) {
-    RECEIVED.with_borrow_mut(|received| {
-        if received.len() < 1024 {
-            received.push(k);
+/// EXPLAIN ANALYZE shows the hint the scan last received.
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn explain(
+    css: *mut pg_sys::CustomScanState,
+    _ancestors: *mut List,
+    es: *mut pg_sys::ExplainState,
+) {
+    unsafe {
+        let KHint { k, kind } = (*css.cast::<State>()).hint;
+        let kind = match kind {
+            KKind::Unknown => return,
+            KKind::Exact => "exact",
+            KKind::AtLeast => "at least",
+            KKind::AtMost => "at most",
+        };
+        if (*es).analyze {
+            let hint = CString::new(format!("{kind} {k}")).unwrap();
+            pg_sys::ExplainPropertyText(c"Row Hint".as_ptr(), hint.as_ptr(), es);
         }
-    });
-}
-
-/// Debug builds only: the hints this backend's scans received since the last call, for
-/// `tests/vchordrq/debug`.
-#[cfg(debug_assertions)]
-#[pgrx::pg_extern(sql = "")]
-fn _vchordrq_debug_k_hints() -> pgrx::iter::SetOfIterator<'static, String> {
-    let received = RECEIVED.take();
-    pgrx::iter::SetOfIterator::new(received.into_iter().map(|KHint { k, kind }| match kind {
-        KKind::Unknown => "unknown".to_string(),
-        KKind::Exact => format!("exact {k}"),
-        KKind::AtLeast => format!("at_least {k}"),
-        KKind::AtMost => format!("at_most {k}"),
-    }))
+    }
 }

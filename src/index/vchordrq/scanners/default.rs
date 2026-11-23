@@ -101,8 +101,7 @@ impl SearchBuilder for DefaultBuilder {
     {
         let mut vector = None;
         let mut threshold = None;
-        // Only the first sphere around the search vector bounds the search. PostgreSQL rechecks
-        // the others, and that one too unless the scan node owns it and nothing else is rechecked.
+        // the first sphere around the search vector bounds the search; the others are rechecked
         let mut others = (options.search.filter.as_ref()).is_some_and(|filter| !filter.exact());
         let opfamily = self.opfamily;
         // each vector as the index takes it, and as given
@@ -128,8 +127,8 @@ impl SearchBuilder for DefaultBuilder {
             }
         }
         // a halfvec copy normalized in the index is within its rounding of the operator's cosine
-        let halfvec = matches!(opfamily, Opfamily::HalfvecCosine);
-        let rounded = halfvec && !matches!(how(index), RerankMethod::Heap);
+        let rounded = matches!(opfamily, Opfamily::HalfvecCosine)
+            && !matches!(how(index), RerankMethod::Heap);
         let owned = options.owned && !others && !rounded;
         let recheck = others || (threshold.is_some() && !owned);
         let k = if recheck {
@@ -137,8 +136,6 @@ impl SearchBuilder for DefaultBuilder {
         } else {
             options.k
         };
-        #[cfg(debug_assertions)]
-        crate::index::vchordrq::node::record(k);
         let bound = threshold.map(|radius| opfamily.bound(radius));
         let Some((vector, raw)) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
@@ -197,8 +194,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    // halfvec rounds the normalized query and copies: rerank by the operator's
-                    // cosine on the query as given and each copy's own norm
+                    // halfvec rounds the normalized query: rerank by the query as given
                     let raw = VectOwned::<f16>::from_owned(raw);
                     let y2 = <Op as Operator>::Vector::squared_norm(raw.as_borrowed());
                     if opfamily.is_cosine() && (MIN_FAST_X2..f32::INFINITY).contains(&y2) {
@@ -266,8 +262,7 @@ impl SearchBuilder for DefaultBuilder {
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
             };
-        // Owned, the sphere is the operator's `<` on the scan's distance; else `<=`, as the
-        // index's distance may round up to the radius where the operator's is under it.
+        // owned, the sphere is the operator's `<` on the scan's distance; else `<=` and the recheck
         let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> = match threshold {
             Some(threshold) if owned => Box::new(iter.take_while(move |(x, _)| *x < threshold)),
             Some(threshold) => Box::new(iter.take_while(move |(x, _)| *x <= threshold)),

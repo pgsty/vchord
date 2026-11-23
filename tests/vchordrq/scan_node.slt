@@ -1,6 +1,4 @@
-# The scan node (src/index/vchordrq/node): above a vchordrq index scan, `col <op> q` is the
-# distance the scan computed and the scan owns the sphere around q. Rows equal those without
-# the node; where the node does not apply, the plan is PostgreSQL's.
+# The scan node: `col <op> q` above a vchordrq scan is the scan's distance; rows are as without it.
 
 statement ok
 CREATE TABLE sn (id int PRIMARY KEY, owner int, v vector(3));
@@ -18,8 +16,7 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET max_parallel_workers_per_gather = 0;
 
-# Rows of `q` with the node and without: the same ids in the same order, distances within
-# rounding.
+# rows of `q` with the node and without: the same ids in the same order, distances within rounding
 statement ok
 CREATE FUNCTION sn_same(q text) RETURNS bool LANGUAGE plpgsql AS $$
 DECLARE a int[]; b int[]; x float8[]; y float8[];
@@ -32,7 +29,7 @@ BEGIN
     AND (SELECT bool_and(abs(i - j) < 1e-6) FROM unnest(x, y) u(i, j));
 END $$;
 
-# The plan of `q`, run.
+# the plan of `q`, run
 statement ok
 CREATE FUNCTION sn_explain(q text) RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE plan json;
@@ -41,7 +38,78 @@ BEGIN
   RETURN plan::jsonb;
 END $$;
 
-# a function in LIMIT is not evaluated again
+# The Limit's rows the scan is told, as EXPLAIN ANALYZE shows them.
+statement ok
+CREATE FUNCTION sn_hint(q text) RETURNS text LANGUAGE sql AS $$
+SELECT coalesce(jsonb_path_query_first(sn_explain(q), '$.**."Row Hint"') #>> '{}', 'none')
+$$;
+
+query T
+SELECT sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 10 OFFSET 20$$);
+----
+exact 30
+
+query T
+SELECT sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' FETCH FIRST 10 ROWS WITH TIES$$);
+----
+at least 11
+
+query TT
+SELECT sn_hint($$SELECT id FROM sn WHERE owner = 3 ORDER BY v <=> '[1,0,0]' LIMIT 10$$),
+  sn_hint($$SELECT id FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.5) ORDER BY v <=> '[1,0,0]' LIMIT 10$$);
+----
+at least 10 exact 10
+
+statement ok
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+
+query TTT
+SELECT sn_hint($$SELECT s.id FROM sn s JOIN sn_asset a ON a.id = s.id WHERE a.visible ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$),
+  sn_hint($$SELECT s.id FROM sn s LEFT JOIN sn_tag t ON t.id = s.id ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$),
+  sn_hint($$SELECT s.id FROM sn s LEFT JOIN sn_asset a ON a.id = s.id ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$);
+----
+at least 10 at most 10 exact 10
+
+statement ok
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+
+query TTT
+SELECT sn_hint($$SELECT id FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.3) ORDER BY owner LIMIT 5$$),
+  sn_hint($$SELECT count(*) FROM (SELECT id FROM sn ORDER BY v <=> '[1,0,0]' OFFSET 5) s$$),
+  sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT NULL$$);
+----
+none none none
+
+# a count that needs no code to evaluate again: a generic plan's parameters, or a LATERAL value per row
+statement ok
+SET plan_cache_mode = force_generic_plan;
+PREPARE sn_p(vector, int, int) AS SELECT id FROM sn ORDER BY v <=> $1 LIMIT $2 OFFSET $3;
+CREATE FUNCTION sn_hint_p() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE plan json;
+BEGIN
+  EXECUTE $q$EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE sn_p('[1,0,0]', 7, 2)$q$ INTO plan;
+  RETURN jsonb_path_query_first(plan::jsonb, '$.**."Row Hint"') #>> '{}';
+END $$;
+
+query T
+SELECT sn_hint_p();
+----
+exact 9
+
+statement ok
+DEALLOCATE sn_p;
+DROP FUNCTION sn_hint_p;
+RESET plan_cache_mode;
+
+query T
+SELECT sn_hint($$SELECT a.id, x.id FROM sn_asset a CROSS JOIN LATERAL
+  (SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT a.owner) x WHERE a.id IN (5, 6)$$);
+----
+exact 6
+
+# a function in LIMIT is not evaluated again: the hint is not given
 statement ok
 CREATE FUNCTION sn_k(n int) RETURNS int LANGUAGE plpgsql STABLE AS $$
 BEGIN
@@ -60,10 +128,10 @@ SET vchordrq.scan_node = on;
 SELECT count(*) FROM (SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT sn_k(3)) s;
 INSERT INTO sn_calls VALUES (true, current_setting('sn.calls')::int);
 
-query B
-SELECT count(DISTINCT calls) = 1 FROM sn_calls;
+query BT
+SELECT count(DISTINCT calls) = 1, sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT sn_k(3)$$) FROM sn_calls;
 ----
-t
+t none
 
 statement ok
 DROP TABLE sn_calls;
@@ -273,8 +341,7 @@ SELECT id FROM sn_del2 WHERE owner = -1;
 ----
 1797
 
-# The distance is pgvector's range for cosine, [0, 2]: a row within rounding of its query
-# reports 0.
+# The distance is pgvector's range for cosine, [0, 2]: a row within rounding of its query reports 0.
 query B
 SELECT bool_and(x.d >= 0 AND x.d <= 2) FROM sn q CROSS JOIN LATERAL
   (SELECT v <=> q.v AS d FROM sn ORDER BY v <=> q.v LIMIT 1) x WHERE q.id <= 300;
@@ -409,5 +476,5 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 
 statement ok
-DROP FUNCTION sn_same, sn_explain;
+DROP FUNCTION sn_same, sn_hint, sn_explain;
 DROP TABLE sn, sn_asset, sn_tag, sn_del1, sn_del2, sn_part, sn_g, sn_m;

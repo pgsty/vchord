@@ -6,24 +6,32 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-/// How `k` bounds the rows a scan will be asked for.
-///
-/// `k` counts the rows the scan returns whose heap tuples are visible: the
-/// executor skips the others and asks for more. Nodes above the Limit may
-/// stop reading early (a cursor, an outer Limit, a semi join), so a scan can
-/// always be asked for fewer rows than its hint says.
+/// How `k`, counting rows with visible heap tuples, bounds the rows a scan will be asked for.
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KKind {
     /// Nothing is known (`k` is 0).
-    Unknown,
+    Unknown = 0,
     /// No more than `k` rows, and `k` unless the statement stops early.
-    Exact,
-    /// Rows may be dropped above the scan (a filter, a join, a recheck): at
-    /// least `k` rows unless the statement stops early, maybe more.
-    AtLeast,
-    /// Other inputs share the Limit, or rows may be multiplied above the
-    /// scan: no more than `k` rows, maybe fewer.
-    AtMost,
+    Exact = 1,
+    /// Rows may be dropped above the scan: at least `k` unless the statement stops early.
+    AtLeast = 2,
+    /// Other inputs share the Limit, or rows multiply above the scan: no more than `k`.
+    AtMost = 3,
+}
+
+impl TryFrom<i32> for KKind {
+    type Error = i32;
+
+    fn try_from(value: i32) -> Result<Self, i32> {
+        match value {
+            0 => Ok(Self::Unknown),
+            1 => Ok(Self::Exact),
+            2 => Ok(Self::AtLeast),
+            3 => Ok(Self::AtMost),
+            _ => Err(value),
+        }
+    }
 }
 
 impl KKind {
@@ -39,8 +47,7 @@ impl KKind {
     }
 }
 
-/// A hint, never a promise: a scan must stay correct when asked for any
-/// number of rows. It is resolved again after every rescan.
+/// A hint, never a promise: a scan stays correct when asked for any number of rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KHint {
     pub k: u64,

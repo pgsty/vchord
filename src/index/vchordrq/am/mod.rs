@@ -25,7 +25,7 @@ use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
-use vchordrq::{InsertChooser, KHint, KKind, SearchParams};
+use vchordrq::{InsertChooser, KHint, SearchParams};
 
 #[repr(C)]
 pub struct Reloption {
@@ -664,17 +664,22 @@ pub unsafe extern "C-unwind" fn ambeginscan(
 /// executor evaluates it again on returned rows. Keep quals with volatile
 /// functions or SubPlans (whose plans `contain_volatile_functions` does not
 /// inspect) in the executor only (#34).
-unsafe fn prefilter_safe(hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>) -> bool {
-    let Some(hack) = hack else {
-        return true;
-    };
+unsafe fn prefilter(hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>) -> bool {
     unsafe {
-        let plan = (*hack.as_ptr()).ss.ps.plan;
-        if plan.is_null() {
-            return true;
+        match hack.map(|hack| (*hack.as_ptr()).ss.ps.plan) {
+            Some(plan) if !plan.is_null() => prefilters((*plan).qual),
+            _ => gucs::vchordrq_prefilter(),
         }
-        let qual = (*plan).qual.cast::<pgrx::pg_sys::Node>();
-        !(pgrx::pg_sys::contain_volatile_functions(qual) || pgrx::pg_sys::contain_subplans(qual))
+    }
+}
+
+/// Whether the scan evaluates `qual` itself, so that the executor drops no row it returns.
+pub unsafe fn prefilters(qual: *mut pgrx::pg_sys::List) -> bool {
+    unsafe {
+        let qual = qual.cast::<pgrx::pg_sys::Node>();
+        gucs::vchordrq_prefilter()
+            && !(pgrx::pg_sys::contain_volatile_functions(qual)
+                || pgrx::pg_sys::contain_subplans(qual))
     }
 }
 
@@ -760,7 +765,7 @@ pub unsafe extern "C-unwind" fn amrescan(
                 );
             }
         }
-        let mut options = SearchOptions {
+        let options = SearchOptions {
             search: SearchParams {
                 probes,
                 epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),
@@ -772,17 +777,10 @@ pub unsafe extern "C-unwind" fn amrescan(
             maxsim_threshold: gucs::vchordrq_maxsim_threshold((*scan).indexRelation),
             io_search: gucs::vchordrq_io_search(),
             io_rerank: gucs::vchordrq_io_rerank(),
-            prefilter: gucs::vchordrq_prefilter() && prefilter_safe(scanner.hack),
+            prefilter: prefilter(scanner.hack),
             table: TablePrefetch::new(scan),
             owned: scanner.owned,
             k: scanner.k,
-        };
-        // The executor drops rows that fail a qual the scan does not evaluate itself.
-        let qual = (scanner.hack).is_some_and(|hack| !(*hack.as_ptr()).ss.ps.qual.is_null());
-        options.k = if qual && !options.prefilter {
-            scanner.k.and(KKind::AtLeast)
-        } else {
-            scanner.k
         };
         let fetcher = {
             let hack = scanner.hack;

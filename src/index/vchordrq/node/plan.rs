@@ -6,8 +6,7 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
-//! The rewrite of a finished plan: each vchordrq index scan goes under the scan node, whose
-//! distance column replaces `col <op> q` above it, and which learns the nearest Limit.
+//! The rewrite of a finished plan: vchordrq scans go under the node; its distance is `col <op> q`.
 
 use super::{SCAN_METHODS, cells, nth};
 use pgrx::pg_sys::{self, AttrNumber, List, Node, NodeTag, Oid, Plan};
@@ -20,7 +19,7 @@ pub unsafe fn rewrite(stmt: *mut pg_sys::PlannedStmt) {
         let mut rewrite = Rewrite {
             stmt,
             next_id: None,
-            // EvalPlanQual runs under these only; it computes the distance by the expression.
+            // EvalPlanQual runs under these only; it computes the distance by the expression
             epq: (*stmt).commandType != pg_sys::CmdType::CMD_SELECT
                 || (*stmt).hasModifyingCTE
                 || !(*stmt).rowMarks.is_null(),
@@ -57,7 +56,9 @@ unsafe fn distance_var(varno: c_int, attno: AttrNumber, ty: Oid) -> *mut Node {
 /// The nearest Limit above a node, and how the node's rows reach it.
 #[derive(Clone, Copy)]
 struct Limit {
-    limit: *mut pg_sys::Limit,
+    count: *mut Node,
+    offset: *mut Node,
+    ties: bool,
     kind: KKind,
 }
 
@@ -71,10 +72,13 @@ impl Limit {
                 return None;
             }
             let ties = (*limit).limitOption == pg_sys::LimitOption::LIMIT_OPTION_WITH_TIES;
+            // with ties it reads on while rows tie with the last one
+            let kind = if ties { KKind::AtLeast } else { KKind::Exact };
             Some(Self {
-                limit,
-                // it reads on while rows tie with the last one
-                kind: if ties { KKind::AtLeast } else { KKind::Exact },
+                count,
+                offset,
+                ties,
+                kind,
             })
         }
     }
@@ -102,8 +106,7 @@ unsafe fn plain(expr: *mut Node) -> bool {
     }
 }
 
-/// How a join's outer rows reach its output: dropped (inner and semi joins), multiplied (left
-/// joins to several rows) or neither.
+/// How a join's outer rows reach its output: dropped (inner, semi), multiplied (left) or neither.
 unsafe fn through_join(plan: *mut Plan) -> KKind {
     use pg_sys::JoinType::*;
     unsafe {
@@ -172,6 +175,30 @@ impl Ordering {
     }
 }
 
+/// Whether the index is vchordrq's, and how many spheres the scan has on its vector column.
+unsafe fn vchordrq_spheres(scan: *mut pg_sys::IndexScan) -> Option<usize> {
+    unsafe {
+        let relation = pg_sys::RelationIdGetRelation((*scan).indexid);
+        let spheres =
+            (crate::index::hook::dirty_check_vchordrq(relation) == Some(true)).then(|| {
+                let opfamily = *(*relation).rd_opfamily;
+                cells((*scan).indexqual)
+                    .iter()
+                    .map(|cell| cell.ptr_value.cast::<Node>())
+                    .filter(|&qual| {
+                        (*qual).type_ == NodeTag::T_OpExpr && {
+                            let qual = qual.cast::<pg_sys::OpExpr>();
+                            is_var(nth((*qual).args, 0), pg_sys::INDEX_VAR, 1)
+                                && pg_sys::get_op_opfamily_strategy((*qual).opno, opfamily) == 2
+                        }
+                    })
+                    .count()
+            });
+        pg_sys::RelationClose(relation);
+        spheres
+    }
+}
+
 struct Rewrite {
     stmt: *mut pg_sys::PlannedStmt,
     next_id: Option<c_int>,
@@ -179,8 +206,7 @@ struct Rewrite {
 }
 
 impl Rewrite {
-    /// Wraps the vchordrq index scans under `*slot`, takes their distance in the nodes between,
-    /// and with `want` has `*slot` output it too; `limit` is how `*slot`'s rows reach a Limit.
+    /// Wraps the scans under `*slot`, with `want` outputs their distance; `limit`: how rows go up.
     unsafe fn fix(&mut self, slot: *mut *mut Plan, want: bool, limit: Option<Limit>) -> Option<Up> {
         use NodeTag::*;
         unsafe {
@@ -219,17 +245,17 @@ impl Rewrite {
                 }
                 T_Limit => {
                     let side = self.fix(&raw mut (*plan).lefttree, want, Limit::of(plan))?;
-                    mirror(plan, side)
+                    Some(mirror(plan, side))
                 }
                 // they pass rows on as they come; an incremental sort reads its last group whole
                 T_IncrementalSort | T_Unique | T_LockRows => {
                     let side = self.fix(&raw mut (*plan).lefttree, want, pass(KKind::AtLeast))?;
-                    mirror(plan, side)
+                    Some(mirror(plan, side))
                 }
                 // they read all rows, or replay them on a rescan without rescanning below
                 T_Sort | T_Material | T_Memoize | T_Hash => {
                     let side = self.fix(&raw mut (*plan).lefttree, want, None)?;
-                    mirror(plan, side)
+                    Some(mirror(plan, side))
                 }
                 // each input is a scan of its own; the distance stays in the column it already had
                 T_Append | T_MergeAppend => {
@@ -273,11 +299,13 @@ impl Rewrite {
     ) -> Option<Up> {
         unsafe {
             let scan = (*slot).cast::<pg_sys::IndexScan>();
-            if !is_vchordrq((*scan).indexid) {
-                return None;
-            }
+            let spheres = vchordrq_spheres(scan)?;
             let ordering = Ordering::of(scan);
             if ordering.is_none() && !(*scan).indexorderbyorig.is_null() {
+                return None;
+            }
+            // nothing to substitute, no sphere to own and no Limit to pass
+            if ordering.is_none() && limit.is_none() && spheres != 1 {
                 return None;
             }
             let rti = (*scan).scan.scanrelid as c_int;
@@ -290,8 +318,7 @@ impl Rewrite {
                 ty: ordering.map_or(pg_sys::InvalidOid, |o| o.ty),
                 columns: Vec::new(),
             };
-            // The scan node's tuple is the columns that the target list reads but for the
-            // distance, then the distance.
+            // the node's tuple: the columns the target list reads but for the distance, then it
             let tlist = (*scan).scan.plan.targetlist;
             collect(tlist.cast(), (&raw mut subst).cast());
             let epq = ordering.filter(|_| self.epq);
@@ -316,13 +343,20 @@ impl Rewrite {
                 subst.op = op;
                 distance
             });
-            let (count, offset, kind, ties) = match limit {
-                Some(Limit { limit, kind }) => {
-                    let ties = (*limit).limitOption == pg_sys::LimitOption::LIMIT_OPTION_WITH_TIES;
-                    ((*limit).limitCount, (*limit).limitOffset, kind, ties)
-                }
-                None => (null_mut(), null_mut(), KKind::Unknown, false),
-            };
+            // the executor drops rows that fail a qual the scan does not evaluate itself
+            let qual = (*scan).scan.plan.qual;
+            let prefiltered = qual.is_null() || crate::index::vchordrq::am::prefilters(qual);
+            let limit = limit.and_then(|l| {
+                l.and(if prefiltered {
+                    KKind::Exact
+                } else {
+                    KKind::AtLeast
+                })
+            });
+            let (count, offset, ties, kind) = limit
+                .map_or((null_mut(), null_mut(), false, KKind::Unknown), |l| {
+                    (l.count, l.offset, l.ties, l.kind)
+                });
             let custom =
                 pg_sys::palloc0(size_of::<pg_sys::CustomScan>()).cast::<pg_sys::CustomScan>();
             (*custom).scan.plan = (*scan).scan.plan;
@@ -361,27 +395,16 @@ impl Rewrite {
     }
 }
 
-unsafe fn is_vchordrq(index: Oid) -> bool {
+/// A node that returns its input's tuples mirrors its target list: a new junk column is the last.
+unsafe fn mirror(plan: *mut Plan, side: Up) -> Up {
     unsafe {
-        let relation = pg_sys::RelationIdGetRelation(index);
-        let vchordrq = crate::index::hook::dirty_check_vchordrq(relation) == Some(true);
-        pg_sys::RelationClose(relation);
-        vchordrq
-    }
-}
-
-/// For a node that returns its input's tuples, its target list mirrors the input's.
-unsafe fn mirror(plan: *mut Plan, side: Up) -> Option<Up> {
-    unsafe {
-        let Some(dist) = side.dist else {
-            return Some(side);
-        };
-        let len = pg_sys::list_length((*plan).targetlist) as AttrNumber;
-        if dist == len + 1 {
-            let var = distance_var(pg_sys::OUTER_VAR, dist, side.ordering.ty);
-            push_entry(&mut (*plan).targetlist, var, true);
+        if let Some(dist) = side.dist {
+            if dist as c_int == pg_sys::list_length((*plan).targetlist) + 1 {
+                let var = distance_var(pg_sys::OUTER_VAR, dist, side.ordering.ty);
+                push_entry(&mut (*plan).targetlist, var, true);
+            }
         }
-        (dist <= len + 1).then_some(side)
+        side
     }
 }
 
@@ -400,9 +423,7 @@ unsafe fn project(plan: *mut Plan, varno: c_int, side: Up, want: bool) -> Option
         subst.apply((*plan).targetlist);
         subst.apply((*plan).qual);
         let dist = side.dist.filter(|_| want)?;
-        let vec = side
-            .vec
-            .and_then(|vec| find((*plan).targetlist, varno, vec));
+        let vec = (side.vec).and_then(|vec| find((*plan).targetlist, varno, vec));
         let dist = output(&mut (*plan).targetlist, varno, dist, side.ordering.ty);
         Some(Up {
             vec,
@@ -457,8 +478,7 @@ unsafe fn max_id(stmt: *mut pg_sys::PlannedStmt) -> c_int {
     }
 }
 
-/// Replaces `Var(varno, vec) <op> query` by `Var(to)`; with `columns`, also renumbers the Vars
-/// of `varno` to their place in `columns` under `to.0`.
+/// Replaces `Var(varno, vec) <op> query` by `Var(to)`; renumbers the Vars of `varno` by `columns`.
 struct Subst {
     varno: c_int,
     vec: AttrNumber,
@@ -511,12 +531,8 @@ impl Subst {
         }
     }
 
-    fn context(&self) -> *mut c_void {
-        (self as *const Self).cast_mut().cast()
-    }
-
     unsafe fn mutate(&self, node: *mut Node) -> *mut Node {
-        unsafe { subst(node, self.context()) }
+        unsafe { subst(node, (self as *const Self).cast_mut().cast()) }
     }
 
     /// Replaces the distance in a target list or qual, in place.
@@ -533,30 +549,11 @@ impl Subst {
                 } else {
                     (&raw mut cell.ptr_value).cast::<*mut Node>()
                 };
-                match (**expr).type_ {
-                    T_Var | T_Const | T_Param => (),
-                    _ if self.matches(*expr) => *expr = distance_var(self.to.0, self.to.1, self.ty),
-                    _ if occurs(*expr, self.context()) => *expr = self.mutate(*expr),
-                    _ => (),
+                if !matches!((**expr).type_, T_Var | T_Const | T_Param) {
+                    *expr = self.mutate(*expr);
                 }
             }
         }
-    }
-}
-
-/// Whether the distance occurs in `node`.
-#[pgrx::pg_guard]
-unsafe extern "C-unwind" fn occurs(node: *mut Node, context: *mut c_void) -> bool {
-    unsafe {
-        if node.is_null() {
-            return false;
-        }
-        context
-            .cast::<Subst>()
-            .as_ref()
-            .unwrap_unchecked()
-            .matches(node)
-            || pg_sys::expression_tree_walker(node, Some(occurs), context)
     }
 }
 

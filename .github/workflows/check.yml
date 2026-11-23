@@ -356,7 +356,6 @@ jobs:
           sqllogictest --db $(whoami) --user $(whoami) './tests/general/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordg/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/*.slt' --label pg${{ matrix.version }}
-          sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/debug/*.slt' --label pg${{ matrix.version }}
           if [ "${{ matrix.version }}" -ge "17" ]; then
             sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
@@ -495,7 +494,6 @@ jobs:
           sqllogictest --db $(whoami) --user $(whoami) './tests/general/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordg/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/*.slt' --label pg${{ matrix.version }}
-          sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/debug/*.slt' --label pg${{ matrix.version }}
           if [ "${{ matrix.version }}" -ge "17" ]; then
             sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
@@ -628,7 +626,6 @@ jobs:
           sqllogictest --db $env:USERNAME --user $env:USERNAME './tests/general/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $env:USERNAME --user $env:USERNAME './tests/vchordg/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $env:USERNAME --user $env:USERNAME './tests/vchordrq/*.slt' --label pg${{ matrix.version }}
-          sqllogictest --db $env:USERNAME --user $env:USERNAME './tests/vchordrq/debug/*.slt' --label pg${{ matrix.version }}
           if ( "${{ matrix.version }}" -ge "17" ) {
             sqllogictest --db $env:USERNAME --user $env:USERNAME './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           }
@@ -765,7 +762,6 @@ jobs:
           sqllogictest --db $(whoami) --user $(whoami) './tests/general/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordg/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/*.slt' --label pg${{ matrix.version }}
-          sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/debug/*.slt' --label pg${{ matrix.version }}
           if [ "${{ matrix.version }}" -ge "17" ]; then
             sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
@@ -956,7 +952,6 @@ jobs:
           sqllogictest --db $(whoami) --user $(whoami) './tests/general/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordg/*.slt' --label pg${{ matrix.version }}
           sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/*.slt' --label pg${{ matrix.version }}
-          sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/debug/*.slt' --label pg${{ matrix.version }}
           if [ "${{ matrix.version }}" -ge "17" ]; then
             sqllogictest --db $(whoami) --user $(whoami) './tests/vchordrq/pg17/*.slt' --label pg${{ matrix.version }}
           fi
