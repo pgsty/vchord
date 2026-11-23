@@ -337,9 +337,19 @@ pub fn cosine_distance<O: Operator>(
     if x2 >= MIN_FAST_X2 && p.is_normal() {
         Distance::from_f32(exact_distance::<O>(query, row).to_f32() / p.sqrt())
     } else {
-        let (query, row) = (query.own(), row.own());
-        Distance::from_f32(row.as_borrowed().operator_cos(query.as_borrowed()).to_f32() - 1.0)
+        operator_cosine::<O>(query, row)
     }
+}
+
+/// [`cosine_distance`] off its fast path, kept out of line so that each scan inlines the rest.
+#[cold]
+#[inline(never)]
+fn operator_cosine<O: Operator>(
+    query: <O::Vector as VectorOwned>::Borrowed<'_>,
+    row: <O::Vector as VectorOwned>::Borrowed<'_>,
+) -> Distance {
+    let (query, row) = (query.own(), row.own());
+    Distance::from_f32(row.as_borrowed().operator_cos(query.as_borrowed()).to_f32() - 1.0)
 }
 
 /// The dot product distance from `query` to `row` scaled to unit length, as a cosine index stores it.
@@ -352,8 +362,18 @@ pub fn unit_distance<O: Operator>(
     if (MIN_FAST_X2..f32::INFINITY).contains(&x2) {
         Distance::from_f32(exact_distance::<O>(query, row).to_f32() / x2.sqrt())
     } else {
-        exact_distance::<O>(query, row.function_normalize().as_borrowed())
+        normalized_distance::<O>(query, row)
     }
+}
+
+/// [`unit_distance`] off its fast path, kept out of line so that each scan inlines the rest.
+#[cold]
+#[inline(never)]
+fn normalized_distance<O: Operator>(
+    query: <O::Vector as VectorOwned>::Borrowed<'_>,
+    row: <O::Vector as VectorOwned>::Borrowed<'_>,
+) -> Distance {
+    exact_distance::<O>(query, row.function_normalize().as_borrowed())
 }
 
 #[cfg(test)]
