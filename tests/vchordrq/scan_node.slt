@@ -314,6 +314,31 @@ statement ok
 EXPLAIN (VERBOSE) SELECT x.id, x.v <=> '[1,1,0]' FROM (SELECT id, v FROM sn ORDER BY v <=> '[1,1,0]' LIMIT 30) x
 JOIN sn_asset a ON a.id = x.id WHERE a.visible AND x.id % 2 = 0;
 
+# EvalPlanQual fills a marked subquery's scan from its row's copy: the distance above it is the operator's
+statement ok
+CREATE TABLE sn_k (id int PRIMARY KEY, n int);
+INSERT INTO sn_k SELECT id, 0 FROM sn;
+ANALYZE sn_k;
+
+statement ok
+BEGIN;
+DECLARE sn_e CURSOR FOR SELECT count(*), count(d) FROM (SELECT x.v <=> '[1,1,0]' AS d FROM sn_k k
+  JOIN (SELECT id, v FROM sn ORDER BY v <=> '[1,1,0]' LIMIT 10) x ON x.id = k.id FOR UPDATE OF k) s;
+
+connection other
+statement ok
+SET enable_seqscan = off;
+UPDATE sn_k SET n = 1 WHERE id IN (SELECT id FROM sn ORDER BY v <=> '[1,1,0]' LIMIT 3);
+
+connection default
+query II
+FETCH sn_e;
+----
+10 10
+
+statement ok
+COMMIT;
+
 # spheres: membership by the scan's distance, without a recheck
 query B
 SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.02)$$);
@@ -605,4 +630,4 @@ RESET enable_bitmapscan;
 
 statement ok
 DROP FUNCTION sn_same, sn_hint, sn_explain, sn_rows;
-DROP TABLE sn, sn_asset, sn_tag, sn_del1, sn_del2, sn_part, sn_g, sn_m;
+DROP TABLE sn, sn_asset, sn_tag, sn_k, sn_del1, sn_del2, sn_part, sn_g, sn_m;

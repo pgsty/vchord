@@ -253,8 +253,14 @@ impl Rewrite {
                 }
                 T_SubqueryScan => {
                     let scan = plan.cast::<pg_sys::SubqueryScan>();
-                    let side = self.fix(&raw mut (*scan).subplan, true, pass(KKind::Exact))?;
-                    project(plan, (*scan).scan.scanrelid as c_int, side, want)
+                    let rti = (*scan).scan.scanrelid;
+                    // EvalPlanQual fills a marked subquery's scan from its row copy, which has no junk
+                    let marks = cells((*self.stmt).rowMarks);
+                    let copied = marks
+                        .iter()
+                        .any(|cell| (*cell.ptr_value.cast::<pg_sys::PlanRowMark>()).rti == rti);
+                    let side = self.fix(&raw mut (*scan).subplan, !copied, pass(KKind::Exact));
+                    project(plan, rti as c_int, side.filter(|_| !copied)?, want)
                 }
                 T_Limit => {
                     let side = self.fix(&raw mut (*plan).lefttree, want, Limit::of(plan))?;
