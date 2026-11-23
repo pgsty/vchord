@@ -11,6 +11,7 @@
 mod plan;
 
 use crate::index::vchordrq::am::Scanner;
+use crate::index::vchordrq::scanners::Above;
 use pgrx::pg_sys::submodules::ffi::pg_guard_ffi_boundary;
 use pgrx::pg_sys::{self, List, Node, Plan, TupleTableSlot};
 use std::ffi::{CString, c_char, c_int};
@@ -171,7 +172,7 @@ unsafe extern "C-unwind" fn begin(
         if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int == 0 {
             let scanner = crate::index::hook::begin_scan(child).cast::<Scanner>();
             (*scanner).hack = std::ptr::NonNull::new(child);
-            (*scanner).owned = true;
+            (*scanner).above = Some(Above::new((*child).iss_ScanDesc));
         }
     }
 }
@@ -213,15 +214,21 @@ unsafe fn hint(state: &State) -> KHint {
     }
 }
 
+/// What the child's scan holds of this node, which `begin` gave it.
+unsafe fn above<'a>(child: *mut pg_sys::IndexScanState) -> &'a Above {
+    unsafe {
+        let scanner = (*(*child).iss_ScanDesc).opaque.cast::<Scanner>();
+        (*scanner).above.as_ref().unwrap_unchecked()
+    }
+}
+
 /// Starts the child's scan with the hint, once the Limit above has computed its count.
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn start(state: *mut State) {
     unsafe {
         (*state).started = true;
         let child = (*state).child;
-        (*(*(*child).iss_ScanDesc).opaque.cast::<Scanner>())
-            .k
-            .set(hint(&*state));
+        above(child).k.set(hint(&*state));
         pg_sys::ExecReScan(child.cast());
     }
 }
@@ -341,7 +348,7 @@ unsafe extern "C-unwind" fn explain(
         if scan.is_null() {
             return;
         }
-        let KHint { k, kind } = (*(*scan).opaque.cast::<Scanner>()).k.get();
+        let KHint { k, kind } = above((*css.cast::<State>()).child).k.get();
         let kind = match kind {
             KKind::Unknown => return,
             KKind::Exact => "exact",

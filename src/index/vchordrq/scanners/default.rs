@@ -125,11 +125,14 @@ impl SearchBuilder for DefaultBuilder {
                 _ => others = true,
             }
         }
-        let owned = options.owned && !others;
+        let owned = options.above.is_some() && !others;
         let recheck = others || (threshold.is_some() && !owned);
-        let k = options.k.get();
-        let k = if recheck { k.and(KKind::AtLeast) } else { k };
-        options.k.set(k);
+        let k = options.above.as_ref().map_or(KHint::UNKNOWN, |above| {
+            let k = above.k.get();
+            let k = if recheck { k.and(KKind::AtLeast) } else { k };
+            above.k.set(k);
+            k
+        });
         let bound = threshold.map(|radius| opfamily.bound(radius));
         let Some((vector, raw)) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
@@ -270,9 +273,17 @@ impl SearchBuilder for DefaultBuilder {
                 }
             }
         }
-        Box::new(iter.map(move |(distance, pointer)| {
+        let iter = iter.map(move |(distance, pointer)| {
             let (key, _) = pointer_to_kv(pointer);
             (distance, key, recheck)
+        });
+        let Some(above) = options.above else {
+            return Box::new(iter);
+        };
+        // the node above takes each row's distance as the ORDER BY operator's value
+        let (out, value) = (above.value, opfamily.value());
+        Box::new(iter.inspect(move |&(distance, _, _)| unsafe {
+            *out.as_ptr() = value.datum(distance);
         }))
     }
 }

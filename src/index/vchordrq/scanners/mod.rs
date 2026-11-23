@@ -55,10 +55,30 @@ pub struct SearchOptions {
     pub io_rerank: Io,
     pub prefilter: bool,
     pub table: crate::index::fetcher::TablePrefetch,
-    /// The scan node above owns the sphere around the vector.
-    pub owned: bool,
-    /// How many rows the scan node above will take, and then what the scan used.
+    pub above: Option<Above>,
+}
+
+/// The scan node above a scan: it owns the sphere around the vector and takes each row's distance.
+#[derive(Debug, Clone)]
+pub struct Above {
+    /// where each row's distance goes, as the ORDER BY operator's value
+    pub value: std::ptr::NonNull<Datum>,
+    /// how many rows the node will take, and then what the scan used
     pub k: std::rc::Rc<std::cell::Cell<vchordrq::KHint>>,
+}
+
+impl Above {
+    /// The node above `scan`, which reads each row's distance from the scan's ORDER BY values.
+    pub unsafe fn new(scan: pgrx::pg_sys::IndexScanDesc) -> Self {
+        unsafe {
+            (*scan).xs_orderbyvals = pgrx::pg_sys::palloc0(size_of::<Datum>()).cast();
+            (*scan).xs_orderbynulls = pgrx::pg_sys::palloc0(1).cast();
+            Self {
+                value: std::ptr::NonNull::new_unchecked((*scan).xs_orderbyvals),
+                k: std::rc::Rc::new(std::cell::Cell::new(vchordrq::KHint::UNKNOWN)),
+            }
+        }
+    }
 }
 
 /// An opfamily's own vector type, taken out of an `OwnedVector` or read in place from a datum.

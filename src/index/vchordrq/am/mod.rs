@@ -14,19 +14,18 @@ use crate::index::gucs;
 use crate::index::scanners::SearchBuilder;
 use crate::index::storage::PostgresRelation;
 use crate::index::vchordrq::filter_key::FilterKeys;
-use crate::index::vchordrq::opclass::{Opfamily, OrderByValue, opfamily};
+use crate::index::vchordrq::opclass::{Opfamily, opfamily};
 use crate::index::vchordrq::scanners::*;
 use crate::recorder::DefaultRecorder;
 use pgrx::pg_sys::Datum;
 use rand::RngExt;
-use std::cell::{Cell, LazyCell};
+use std::cell::LazyCell;
 use std::ffi::CStr;
 use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
-use std::rc::Rc;
 use std::sync::OnceLock;
-use vchordrq::{InsertChooser, KHint, SearchParams};
+use vchordrq::{InsertChooser, SearchParams};
 
 #[repr(C)]
 pub struct Reloption {
@@ -637,19 +636,10 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     use pgrx::memcxt::PgMemoryContexts::CurrentMemoryContext;
 
     let scan = unsafe { pgrx::pg_sys::RelationGetIndexScan(index_relation, n_keys, n_orderbys) };
-    let opfamily = unsafe { opfamily(index_relation) };
-    unsafe {
-        // `amgettuple` returns each row's distance as its ORDER BY value.
-        let n = n_orderbys.max(1) as usize;
-        (*scan).xs_orderbyvals = pgrx::pg_sys::palloc0(n * size_of::<Datum>()).cast();
-        (*scan).xs_orderbynulls = pgrx::pg_sys::palloc0(n).cast();
-    }
     let scanner: Scanner = Scanner {
         hack: None,
-        opfamily,
-        value: opfamily.value(),
-        owned: false,
-        k: Rc::new(Cell::new(KHint::UNKNOWN)),
+        opfamily: unsafe { opfamily(index_relation) },
+        above: None,
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         searched: false,
         scanning: None,
@@ -700,9 +690,6 @@ pub unsafe extern "C-unwind" fn amrescan(
         if !orderbys.is_null() && (*scan).numberOfOrderBys > 0 {
             std::ptr::copy(orderbys, (*scan).orderByData, (*scan).numberOfOrderBys as _);
         }
-        // a NULL ORDER BY vector has no distance; the scan searches around a sphere's centre
-        *(*scan).xs_orderbynulls = (*scan).numberOfOrderBys > 0
-            && (*(*scan).orderByData).sk_flags & pgrx::pg_sys::SK_ISNULL as i32 != 0;
         let keys = if (*scan).numberOfKeys > 0 {
             std::slice::from_raw_parts((*scan).keyData, (*scan).numberOfKeys as _)
         } else {
@@ -725,6 +712,11 @@ pub unsafe extern "C-unwind" fn amrescan(
             );
         }
         let scanner = &mut *(*scan).opaque.cast::<Scanner>();
+        if scanner.above.is_some() {
+            // a NULL ORDER BY vector has no distance; the scan searches around a sphere's centre
+            *(*scan).xs_orderbynulls = (*scan).numberOfOrderBys > 0
+                && (*(*scan).orderByData).sk_flags & pgrx::pg_sys::SK_ISNULL as i32 != 0;
+        }
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         {
             scanner.searched = false;
@@ -780,8 +772,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             io_rerank: gucs::vchordrq_io_rerank(),
             prefilter: prefilter(scanner.hack),
             table: TablePrefetch::new(scan),
-            owned: scanner.owned,
-            k: Rc::clone(&scanner.k),
+            above: scanner.above.clone(),
         };
         let fetcher = {
             let hack = scanner.hack;
@@ -902,14 +893,11 @@ pub unsafe extern "C-unwind" fn amgettuple(
             }
         }
     }
-    if let Some((distance, key, recheck)) = scanning.deref_mut().next() {
+    if let Some((_, key, recheck)) = scanning.deref_mut().next() {
         unsafe {
             (*scan).xs_heaptid = key_to_ctid(key);
             (*scan).xs_recheck = recheck;
             (*scan).xs_recheckorderby = false;
-            if scanner.owned {
-                *(*scan).xs_orderbyvals = scanner.value.datum(distance);
-            }
         }
         true
     } else {
@@ -933,11 +921,7 @@ type Iter = Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
 pub struct Scanner {
     pub hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>,
     opfamily: Opfamily,
-    value: OrderByValue,
-    /// The scan node above owns the sphere around the vector.
-    pub owned: bool,
-    /// How many rows the scan node above will take, and then what the scan used.
-    pub k: Rc<Cell<KHint>>,
+    pub above: Option<Above>,
     #[cfg(any(feature = "pg18", feature = "pg19"))]
     searched: bool,
     scanning: Option<LazyCell<Iter, Box<dyn FnOnce() -> Iter>>>,
