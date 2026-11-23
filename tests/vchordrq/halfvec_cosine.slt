@@ -1,0 +1,27 @@
+# halfvec cosine: the index reranks by the operator's cosine on the query as given, so a table
+# rerank orders rows as the operator does, to f32 rounding.
+
+statement ok
+CREATE TABLE hc (id int PRIMARY KEY, h halfvec(8));
+INSERT INTO hc SELECT i, (SELECT array_agg(cos(i * 0.373 * j + j))::real[] FROM generate_series(1, 8) j)::halfvec
+FROM generate_series(1, 5000) i;
+CREATE INDEX ON hc USING vchordrq (h halfvec_cosine_ops) WITH (options = $$
+rerank_in_table = true
+[build.internal]
+lists = []
+$$);
+
+statement ok
+SET enable_seqscan = off;
+
+query B
+SELECT bool_and(d >= l - 1e-7) FROM (SELECT d, lag(d) OVER () l FROM
+(SELECT h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' d FROM hc ORDER BY h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' LIMIT 1000) s) s;
+----
+t
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE hc;

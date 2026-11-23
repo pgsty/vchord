@@ -41,7 +41,8 @@ pub use insert::{InsertChooser, insert, insert_vector};
 pub use maintain::{MaintainChooser, Pending, maintain};
 pub use prewarm::prewarm;
 pub use rerank::{
-    Table, TableAhead, exact_distance, how, rerank_heap, rerank_index, unit_distance,
+    Table, TableAhead, cosine_distance, exact_distance, how, rerank_heap, rerank_index,
+    rerank_index_by, unit_distance,
 };
 pub use search::{Candidates, MaxsimCandidate, SearchParams, default_search, maxsim_search};
 

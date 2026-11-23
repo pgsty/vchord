@@ -93,6 +93,15 @@ impl Opfamily {
             (B::Rabitq4(_), _) => unreachable!(),
         }
     }
+    /// A query vector as the index takes it: normalized for cosine.
+    pub fn normalized(self, vector: &OwnedVector) -> OwnedVector {
+        match vector {
+            OwnedVector::Vecf32(x) => self.input(BorrowedVector::Vecf32(x.as_borrowed())),
+            OwnedVector::Vecf16(x) => self.input(BorrowedVector::Vecf16(x.as_borrowed())),
+            OwnedVector::Rabitq8(x) => self.input(BorrowedVector::Rabitq8(x.as_borrowed())),
+            OwnedVector::Rabitq4(x) => self.input(BorrowedVector::Rabitq4(x.as_borrowed())),
+        }
+    }
     pub unsafe fn store(self, datum: Datum) -> Option<Vec<(OwnedVector, u16)>> {
         if datum.is_null() {
             return None;
@@ -188,6 +197,7 @@ impl Opfamily {
         };
         Some(store)
     }
+    /// The sphere as given, its centre not yet as the index takes it ([`Self::normalized`]).
     pub unsafe fn input_sphere(self, datum: Datum) -> Option<Sphere<OwnedVector>> {
         // A NULL sphere matches nothing; PostgreSQL rechecks it. A sphere
         // with a NULL center or radius is malformed, as for the operators.
@@ -203,28 +213,28 @@ impl Opfamily {
                     .get_by_index::<VectorOutput>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
-                self.input(BorrowedVector::Vecf32(vector.as_borrowed()))
+                OwnedVector::Vecf32(vector.as_borrowed().own())
             }
             Self::HalfvecL2 | Self::HalfvecIp | Self::HalfvecCosine | Self::HalfvecMaxsim => {
                 let vector = tuple
                     .get_by_index::<HalfvecOutput>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
-                self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
+                OwnedVector::Vecf16(vector.as_borrowed().own())
             }
             Self::Rabitq8L2 | Self::Rabitq8Ip | Self::Rabitq8Cosine | Self::Rabitq8Maxsim => {
                 let vector = tuple
                     .get_by_index::<Rabitq8Output>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
-                self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
+                OwnedVector::Rabitq8(vector.as_borrowed().own())
             }
             Self::Rabitq4L2 | Self::Rabitq4Ip | Self::Rabitq4Cosine | Self::Rabitq4Maxsim => {
                 let vector = tuple
                     .get_by_index::<Rabitq4Output>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
-                self.input(BorrowedVector::Rabitq4(vector.as_borrowed()))
+                OwnedVector::Rabitq4(vector.as_borrowed().own())
             }
         };
         let radius = tuple
@@ -233,6 +243,7 @@ impl Opfamily {
             .unwrap_or_else(|| pgrx::error!("Bad input: empty radius at sphere"));
         Some(Sphere { center, radius })
     }
+    /// The vector as given, not yet as the index takes it ([`Self::normalized`]).
     pub unsafe fn input_vector(self, datum: Datum) -> Option<OwnedVector> {
         if datum.is_null() {
             return None;
@@ -240,19 +251,19 @@ impl Opfamily {
         let vector = match self {
             Self::VectorL2 | Self::VectorIp | Self::VectorCosine | Self::VectorMaxsim => {
                 let vector = unsafe { VectorInput::from_datum(datum, false).unwrap() };
-                self.input(BorrowedVector::Vecf32(vector.as_borrowed()))
+                OwnedVector::Vecf32(vector.as_borrowed().own())
             }
             Self::HalfvecL2 | Self::HalfvecIp | Self::HalfvecCosine | Self::HalfvecMaxsim => {
                 let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
-                self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
+                OwnedVector::Vecf16(vector.as_borrowed().own())
             }
             Self::Rabitq8L2 | Self::Rabitq8Ip | Self::Rabitq8Cosine | Self::Rabitq8Maxsim => {
                 let vector = unsafe { Rabitq8Input::from_datum(datum, false).unwrap() };
-                self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
+                OwnedVector::Rabitq8(vector.as_borrowed().own())
             }
             Self::Rabitq4L2 | Self::Rabitq4Ip | Self::Rabitq4Cosine | Self::Rabitq4Maxsim => {
                 let vector = unsafe { Rabitq4Input::from_datum(datum, false).unwrap() };
-                self.input(BorrowedVector::Rabitq4(vector.as_borrowed()))
+                OwnedVector::Rabitq4(vector.as_borrowed().own())
             }
         };
         Some(vector)

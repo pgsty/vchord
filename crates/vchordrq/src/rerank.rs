@@ -220,6 +220,30 @@ pub fn rerank_index<
     table: impl Table,
 ) -> Reranker<T, impl FnMut(NonZero<u64>, P::Guards, u16) -> Option<Distance>, P, W, impl Table> {
     let dim = vector.borrow().as_borrowed().dim();
+    let accessor = move || O::DistanceAccessor::default_with_dimension(dim);
+    rerank_index_by::<O, T, P, W, _>(vector, prefetcher, table, accessor)
+}
+
+/// [`rerank_index`] with each row's distance from a new `accessor()`.
+pub fn rerank_index_by<
+    'b,
+    O: Operator,
+    T,
+    P: Prefetcher<'b, Item = ((Reverse<Distance>, AlwaysEqual<T>), AlwaysEqual<W>)>,
+    W: 'b + PackedRefMut<T = (NonZero<u64>, u16, BorrowedIter<'b>)>,
+    A: Accessor2<
+            <O::Vector as Vector>::Element,
+            <O::Vector as Vector>::Element,
+            <O::Vector as Vector>::Metadata,
+            <O::Vector as Vector>::Metadata,
+            Output = Distance,
+        >,
+>(
+    vector: impl Borrow<O::Vector>,
+    prefetcher: P,
+    table: impl Table,
+    accessor: impl Fn() -> A,
+) -> Reranker<T, impl FnMut(NonZero<u64>, P::Guards, u16) -> Option<Distance>, P, W, impl Table> {
     Reranker {
         prefetcher,
         cache: BinaryHeap::new(),
@@ -231,10 +255,7 @@ pub fn rerank_index<
                 prefetch,
                 head,
                 payload,
-                LTryAccess::new(
-                    O::Vector::unpack(vector.borrow().as_borrowed()),
-                    O::DistanceAccessor::default_with_dimension(dim),
-                ),
+                LTryAccess::new(O::Vector::unpack(vector.borrow().as_borrowed()), accessor()),
             )
         }),
         _phantom: PhantomData,
@@ -271,6 +292,24 @@ pub fn exact_distance<O: Operator>(
     let (query, row) = (O::Vector::unpack(query), O::Vector::unpack(row));
     accessor.push(query.0, row.0);
     accessor.finish(query.1, row.1)
+}
+
+/// The cosine operator's distance from `query`, as given, to `row`, less one; `y2` is the query's
+/// squared norm.
+#[inline]
+pub fn cosine_distance<O: Operator>(
+    query: <O::Vector as VectorOwned>::Borrowed<'_>,
+    row: <O::Vector as VectorOwned>::Borrowed<'_>,
+    y2: f32,
+) -> Distance {
+    let x2 = O::Vector::squared_norm(row);
+    let p = x2 * y2;
+    if x2 >= MIN_FAST_X2 && p.is_normal() {
+        Distance::from_f32(exact_distance::<O>(query, row).to_f32() / p.sqrt())
+    } else {
+        let (query, row) = (query.own(), row.own());
+        Distance::from_f32(row.as_borrowed().operator_cos(query.as_borrowed()).to_f32() - 1.0)
+    }
 }
 
 /// The dot product distance from `query` to `row` scaled to unit length, as a cosine index stores it.
