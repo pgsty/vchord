@@ -14,13 +14,12 @@ use crate::index::vchordrq::opclass::Opfamily;
 use crate::index::vchordrq::scanners::{FromOwned, SearchOptions};
 use crate::recorder::{Recorder, text};
 use always_equal::AlwaysEqual;
-use distance::Distance;
 use index::bump::Bump;
 use index::filter::filter;
 use index::packed::PackedRefMut4;
 use index::prefetcher::*;
 use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};
-use index_accessor::{Accessor2, CosineAccessor, DefaultWithDimension, Dot, L2S};
+use index_accessor::{Dot, L2S};
 use simd::f16;
 use std::borrow::Borrow;
 use std::num::NonZero;
@@ -29,13 +28,13 @@ use vchordrq::KKind;
 use vchordrq::operator::{Operator, Vector};
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
 use vchordrq::{
-    Candidates, Hinted, KHint, RerankMethod, Table, TableAhead, cosine_distance, default_search,
-    exact_distance, how, rerank_heap, rerank_index_by, unit_distance,
+    Candidates, Cosine, Exact, Hinted, KHint, RerankMethod, RowDistance, Table, TableAhead, Unit,
+    default_search, how, rerank_heap, rerank_index,
 };
+use vector::VectorOwned;
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
-use vector::vect::{MIN_FAST_X2, VectBorrowed, VectOwned};
-use vector::{VectorBorrowed, VectorOwned};
+use vector::vect::VectOwned;
 
 pub struct DefaultBuilder {
     opfamily: Opfamily,
@@ -126,10 +125,7 @@ impl SearchBuilder for DefaultBuilder {
                 _ => others = true,
             }
         }
-        // a halfvec copy normalized in the index is within its rounding of the operator's cosine
-        let rounded = matches!(opfamily, Opfamily::HalfvecCosine)
-            && !matches!(how(index), RerankMethod::Heap);
-        let owned = options.owned && !others && !rounded;
+        let owned = options.owned && !others;
         let recheck = others || (threshold.is_some() && !owned);
         let k = if recheck {
             options.k.and(KKind::AtLeast)
@@ -150,7 +146,7 @@ impl SearchBuilder for DefaultBuilder {
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
                 (VectorKind::Vecf32, DistanceKind::L2S) => {
                     type Op = vchordrq::operator::Op<VectOwned<f32>, L2S>;
-                    let unprojected = VectOwned::<f32>::from_owned(vector.clone());
+                    let unprojected = Rc::new(VectOwned::<f32>::from_owned(vector.clone()));
                     let projected = RandomProject::project(unprojected.as_borrowed());
                     let candidates = prefetched!(
                         index,
@@ -158,11 +154,13 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                    let query = Rc::clone(&unprojected);
+                    let measure = (opfamily, Exact(unprojected));
+                    rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
                 }
                 (VectorKind::Vecf32, DistanceKind::Dot) => {
                     type Op = vchordrq::operator::Op<VectOwned<f32>, Dot>;
-                    let unprojected = VectOwned::<f32>::from_owned(vector.clone());
+                    let unprojected = Rc::new(VectOwned::<f32>::from_owned(vector.clone()));
                     let projected = RandomProject::project(unprojected.as_borrowed());
                     let candidates = prefetched!(
                         index,
@@ -170,11 +168,18 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                    let query = Rc::clone(&unprojected);
+                    if opfamily.is_cosine() {
+                        let measure = (opfamily, Unit(unprojected));
+                        rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
+                    } else {
+                        let measure = (opfamily, Exact(unprojected));
+                        rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
+                    }
                 }
                 (VectorKind::Vecf16, DistanceKind::L2S) => {
                     type Op = vchordrq::operator::Op<VectOwned<f16>, L2S>;
-                    let unprojected = VectOwned::<f16>::from_owned(vector.clone());
+                    let unprojected = Rc::new(VectOwned::<f16>::from_owned(vector.clone()));
                     let projected = RandomProject::project(unprojected.as_borrowed());
                     let candidates = prefetched!(
                         index,
@@ -182,11 +187,13 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                    let query = Rc::clone(&unprojected);
+                    let measure = (opfamily, Exact(unprojected));
+                    rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
                 }
                 (VectorKind::Vecf16, DistanceKind::Dot) => {
                     type Op = vchordrq::operator::Op<VectOwned<f16>, Dot>;
-                    let unprojected = VectOwned::<f16>::from_owned(vector.clone());
+                    let unprojected = Rc::new(VectOwned::<f16>::from_owned(vector.clone()));
                     let projected = RandomProject::project(unprojected.as_borrowed());
                     let candidates = prefetched!(
                         index,
@@ -194,27 +201,16 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    // halfvec rounds the normalized query: rerank by the query as given
-                    let raw = VectOwned::<f16>::from_owned(raw);
-                    let y2 = <Op as Operator>::Vector::squared_norm(raw.as_borrowed());
-                    if opfamily.is_cosine() && (MIN_FAST_X2..f32::INFINITY).contains(&y2) {
-                        let accessor = move || CosineAccessor::new(y2);
-                        let d = move |query: VectBorrowed<'_, f16>, row: VectBorrowed<'_, f16>| {
-                            cosine_distance::<Op>(query, row, y2)
-                        };
-                        let reranking = (reranking, accessor, d);
-                        rerank_by::<_, Op, _, _>(
-                            index, candidates, raw, reranking, fetcher, opfamily,
-                        )
+                    let query = Rc::clone(&unprojected);
+                    if opfamily.is_cosine() {
+                        // the table rerank measures from the query as given, not its rounded normal
+                        let raw = VectOwned::<f16>::from_owned(raw);
+                        let y2 = <Op as Operator>::Vector::squared_norm(raw.as_borrowed());
+                        let measure = (opfamily, Cosine(raw, y2));
+                        rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
                     } else {
-                        rerank::<_, Op>(
-                            index,
-                            candidates,
-                            unprojected,
-                            reranking,
-                            fetcher,
-                            opfamily,
-                        )
+                        let measure = (opfamily, Exact(unprojected));
+                        rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
                     }
                 }
                 (VectorKind::Rabitq8, DistanceKind::L2S) => {
@@ -226,7 +222,9 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                    let query = Rc::clone(&unprojected);
+                    let measure = (opfamily, Exact(unprojected));
+                    rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
                 }
                 (VectorKind::Rabitq8, DistanceKind::Dot) => {
                     type Op = vchordrq::operator::Op<Rabitq8Owned, Dot>;
@@ -237,7 +235,14 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                    let query = Rc::clone(&unprojected);
+                    if opfamily.is_cosine() {
+                        let measure = (opfamily, Unit(unprojected));
+                        rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
+                    } else {
+                        let measure = (opfamily, Exact(unprojected));
+                        rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
+                    }
                 }
                 (VectorKind::Rabitq4, DistanceKind::L2S) => {
                     type Op = vchordrq::operator::Op<Rabitq4Owned, L2S>;
@@ -248,7 +253,9 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                    let query = Rc::clone(&unprojected);
+                    let measure = (opfamily, Exact(unprojected));
+                    rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
                 }
                 (VectorKind::Rabitq4, DistanceKind::Dot) => {
                     type Op = vchordrq::operator::Op<Rabitq4Owned, Dot>;
@@ -259,7 +266,14 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                    let query = Rc::clone(&unprojected);
+                    if opfamily.is_cosine() {
+                        let measure = (opfamily, Unit(unprojected));
+                        rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
+                    } else {
+                        let measure = (opfamily, Exact(unprojected));
+                        rerank::<_, Op>(index, candidates, query, reranking, fetcher, measure)
+                    }
                 }
             };
         // owned, the sphere is the operator's `<` on the scan's distance; else `<=` and the recheck
@@ -297,23 +311,17 @@ impl SearchBuilder for DefaultBuilder {
 }
 
 /// The table rerank of `rerank`, with `d` the distance from the query to a row's vector.
-fn rerank_table<'b, R, O, D>(
+fn rerank_table<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
-    vector: impl Borrow<O::Vector> + 'b,
     (io, prefilter, table): (Io, bool, impl Table + 'b),
     mut fetcher: impl Fetcher + 'b,
-    (opfamily, d): (Opfamily, D),
+    (opfamily, d): (Opfamily, impl RowDistance<O> + 'b),
 ) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
 where
     R: RelationRead,
     O: Operator,
     O::Vector: FromOwned,
-    D: Fn(
-            <O::Vector as VectorOwned>::Borrowed<'_>,
-            <O::Vector as VectorOwned>::Borrowed<'_>,
-        ) -> Distance
-        + 'b,
 {
     let f = move |(distance, payload)| (opfamily.output(distance), payload);
     let distance = move |payload| {
@@ -324,8 +332,7 @@ where
         }
         let (datums, is_nulls) = tuple.build();
         assert!(!is_nulls[0], "a reranked row has no vector");
-        let query = vector.borrow().as_borrowed();
-        Some(unsafe { O::Vector::in_datum(datums[0], |row| d(query, row)) })
+        Some(unsafe { O::Vector::in_datum(datums[0], |row| d.distance(row)) })
     };
     match io {
         Io::Plain => {
@@ -346,109 +353,45 @@ fn rerank<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
     vector: impl Borrow<O::Vector> + 'b,
-    reranking: (Io, bool, TablePrefetch, KHint),
+    (io, prefilter, table, k): (Io, bool, TablePrefetch, KHint),
     fetcher: impl Fetcher + 'b,
-    opfamily: Opfamily,
+    measure: (Opfamily, impl RowDistance<O> + 'b),
 ) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
 where
     R: RelationRead + RelationPrefetch + RelationReadStream,
     R::Page: Page<Opaque = vchordrq::Opaque>,
     O: Operator,
     O::Vector: FromOwned,
-{
-    let dim = vector.borrow().as_borrowed().dim();
-    let accessor = move || O::DistanceAccessor::default_with_dimension(dim);
-    if opfamily.is_cosine() {
-        let reranking = (reranking, accessor, unit_distance::<O>);
-        rerank_by::<_, O, _, _>(index, candidates, vector, reranking, fetcher, opfamily)
-    } else {
-        let reranking = (reranking, accessor, exact_distance::<O>);
-        rerank_by::<_, O, _, _>(index, candidates, vector, reranking, fetcher, opfamily)
-    }
-}
-
-/// [`rerank`] measuring copies in the index with `accessor()` and rows in the table with `d`.
-fn rerank_by<'b, R, O, A, D>(
-    index: &'b R,
-    candidates: Candidates<'b>,
-    vector: impl Borrow<O::Vector> + 'b,
-    ((io, prefilter, table, k), accessor, d): (
-        (Io, bool, TablePrefetch, KHint),
-        impl Fn() -> A + Copy + 'b,
-        D,
-    ),
-    fetcher: impl Fetcher + 'b,
-    opfamily: Opfamily,
-) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
-where
-    R: RelationRead + RelationPrefetch + RelationReadStream,
-    R::Page: Page<Opaque = vchordrq::Opaque>,
-    O: Operator,
-    O::Vector: FromOwned,
-    A: Accessor2<
-            <O::Vector as Vector>::Element,
-            <O::Vector as Vector>::Element,
-            <O::Vector as Vector>::Metadata,
-            <O::Vector as Vector>::Metadata,
-            Output = Distance,
-        > + 'b,
-    D: Fn(
-            <O::Vector as VectorOwned>::Borrowed<'_>,
-            <O::Vector as VectorOwned>::Borrowed<'_>,
-        ) -> Distance
-        + 'b,
 {
     if k.kind == KKind::Unknown {
-        let reranking = ((io, prefilter, table), accessor, d);
-        rerank_on::<_, O, _, _>(index, candidates, vector, reranking, fetcher, opfamily)
+        let reranking = (io, prefilter, table);
+        rerank_on::<_, O>(index, candidates, vector, reranking, fetcher, measure)
     } else {
-        let reranking = ((io, prefilter, Hinted(table, k)), accessor, d);
-        rerank_on::<_, O, _, _>(index, candidates, vector, reranking, fetcher, opfamily)
+        let reranking = (io, prefilter, Hinted(table, k));
+        rerank_on::<_, O>(index, candidates, vector, reranking, fetcher, measure)
     }
 }
 
-/// [`rerank_by`] with the table read ahead as `table` does.
-fn rerank_on<'b, R, O, A, D>(
+/// [`rerank`] with the table read ahead as `table` does.
+fn rerank_on<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
     vector: impl Borrow<O::Vector> + 'b,
-    ((io, prefilter, table), accessor, d): (
-        (Io, bool, impl Table + 'b),
-        impl Fn() -> A + Copy + 'b,
-        D,
-    ),
+    (io, prefilter, table): (Io, bool, impl Table + 'b),
     mut fetcher: impl Fetcher + 'b,
-    opfamily: Opfamily,
+    measure: (Opfamily, impl RowDistance<O> + 'b),
 ) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
 where
     R: RelationRead + RelationPrefetch + RelationReadStream,
     R::Page: Page<Opaque = vchordrq::Opaque>,
     O: Operator,
     O::Vector: FromOwned,
-    A: Accessor2<
-            <O::Vector as Vector>::Element,
-            <O::Vector as Vector>::Element,
-            <O::Vector as Vector>::Metadata,
-            <O::Vector as Vector>::Metadata,
-            Output = Distance,
-        > + 'b,
-    D: Fn(
-            <O::Vector as VectorOwned>::Borrowed<'_>,
-            <O::Vector as VectorOwned>::Borrowed<'_>,
-        ) -> Distance
-        + 'b,
 {
     if let RerankMethod::Heap = how(index) {
         let reranking = (io, prefilter, table);
-        return rerank_table::<_, O, _>(
-            index,
-            candidates,
-            vector,
-            reranking,
-            fetcher,
-            (opfamily, d),
-        );
+        return rerank_table::<_, O>(index, candidates, reranking, fetcher, measure);
     }
+    let opfamily = measure.0;
     let f = move |(distance, payload)| (opfamily.output(distance), payload);
     let predicate = id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
         let (key, _) = pointer_to_kv(*pointer);
@@ -461,27 +404,27 @@ where
     match (io, prefilter) {
         (Io::Plain, false) => {
             let prefetcher = PlainPrefetcher::new(index, candidates);
-            Box::new(rerank_index_by::<O, _, _, _, _>(vector, prefetcher, (), accessor).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
         }
         (Io::Plain, true) => {
             let prefetcher = PlainPrefetcher::new(index, filter(candidates, predicate));
-            Box::new(rerank_index_by::<O, _, _, _, _>(vector, prefetcher, (), accessor).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
         }
         (Io::Simple, false) => {
             let prefetcher = SimplePrefetcher::new(index, candidates);
-            Box::new(rerank_index_by::<O, _, _, _, _>(vector, prefetcher, table, accessor).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table).map(f))
         }
         (Io::Simple, true) => {
             let prefetcher = SimplePrefetcher::new(index, filter(candidates, predicate));
-            Box::new(rerank_index_by::<O, _, _, _, _>(vector, prefetcher, (), accessor).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
         }
         (Io::Stream, false) => {
             let prefetcher = StreamPrefetcher::new(index, candidates, hints);
-            Box::new(rerank_index_by::<O, _, _, _, _>(vector, prefetcher, table, accessor).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table).map(f))
         }
         (Io::Stream, true) => {
             let prefetcher = StreamPrefetcher::new(index, filter(candidates, predicate), hints);
-            Box::new(rerank_index_by::<O, _, _, _, _>(vector, prefetcher, (), accessor).map(f))
+            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()).map(f))
         }
     }
 }

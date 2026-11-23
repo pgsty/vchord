@@ -9,10 +9,11 @@
 //! The rewrite of a finished plan: vchordrq scans go under the node; its distance is `col <op> q`.
 
 use super::{SCAN_METHODS, cells, nth};
+use crate::index::storage::PostgresRelation;
 use pgrx::pg_sys::{self, AttrNumber, List, Node, NodeTag, Oid, Plan};
 use std::ffi::{c_char, c_int, c_void};
 use std::ptr::null_mut;
-use vchordrq::KKind;
+use vchordrq::{KKind, RerankMethod, how};
 
 pub unsafe fn rewrite(stmt: *mut pg_sys::PlannedStmt) {
     unsafe {
@@ -176,25 +177,34 @@ impl Ordering {
     }
 }
 
-/// Whether the index is vchordrq's, and how many spheres the scan has on its vector column.
+/// The scan's spheres on its vector column, if its vchordrq index measures as the operator does.
 unsafe fn vchordrq_spheres(scan: *mut pg_sys::IndexScan) -> Option<usize> {
+    use crate::index::vchordrq::opclass::{Opfamily, opfamily};
     unsafe {
         let relation = pg_sys::RelationIdGetRelation((*scan).indexid);
-        let spheres =
-            (crate::index::hook::dirty_check_vchordrq(relation) == Some(true)).then(|| {
-                let opfamily = *(*relation).rd_opfamily;
-                cells((*scan).indexqual)
-                    .iter()
-                    .map(|cell| cell.ptr_value.cast::<Node>())
-                    .filter(|&qual| {
-                        (*qual).type_ == NodeTag::T_OpExpr && {
-                            let qual = qual.cast::<pg_sys::OpExpr>();
-                            is_var(nth((*qual).args, 0), pg_sys::INDEX_VAR, 1)
-                                && pg_sys::get_op_opfamily_strategy((*qual).opno, opfamily) == 2
-                        }
-                    })
-                    .count()
-            });
+        // halfvec cosine copies in the index are rounded: the statement keeps the operator's value
+        let rounded = || {
+            matches!(opfamily(relation), Opfamily::HalfvecCosine)
+                && !matches!(
+                    how(&PostgresRelation::<vchordrq::Opaque>::new(relation)),
+                    RerankMethod::Heap
+                )
+        };
+        let ours = crate::index::hook::dirty_check_vchordrq(relation) == Some(true);
+        let spheres = (ours && !rounded()).then(|| {
+            let opfamily = *(*relation).rd_opfamily;
+            cells((*scan).indexqual)
+                .iter()
+                .map(|cell| cell.ptr_value.cast::<Node>())
+                .filter(|&qual| {
+                    (*qual).type_ == NodeTag::T_OpExpr && {
+                        let qual = qual.cast::<pg_sys::OpExpr>();
+                        is_var(nth((*qual).args, 0), pg_sys::INDEX_VAR, 1)
+                            && pg_sys::get_op_opfamily_strategy((*qual).opno, opfamily) == 2
+                    }
+                })
+                .count()
+        });
         pg_sys::RelationClose(relation);
         spheres
     }

@@ -403,32 +403,6 @@ impl Accessor2<f16, f16, (), ()> for DistanceAccessor<VectOwned<f16>, Approximat
     }
 }
 
-/// The cosine operator's `-xy / sqrt(x2 y2)` of a stored row `x` and a query with `y2` given.
-#[derive(Debug, Clone, Copy)]
-pub struct CosineAccessor(f32, f32, f32);
-
-impl CosineAccessor {
-    #[inline(always)]
-    pub fn new(y2: f32) -> Self {
-        Self(0.0, 0.0, y2)
-    }
-}
-
-impl Accessor2<f16, f16, (), ()> for CosineAccessor {
-    type Output = Distance;
-
-    #[inline(always)]
-    fn push(&mut self, query: &[f16], row: &[f16]) {
-        self.0 += f16::reduce_sum_of_xy(row, query);
-        self.1 += f16::reduce_sum_of_x2(row);
-    }
-
-    #[inline(always)]
-    fn finish(self, (): (), (): ()) -> Self::Output {
-        Distance::from_f32(-(self.0 / (self.1 * self.2).sqrt()))
-    }
-}
-
 pub trait DefaultWithDimension {
     fn default_with_dimension(dim: u32) -> Self;
 }

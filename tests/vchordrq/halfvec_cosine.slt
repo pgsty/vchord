@@ -1,5 +1,4 @@
-# halfvec cosine: the index reranks by the operator's cosine on the query as given, so a table
-# rerank orders rows as the operator does, to f32 rounding.
+# halfvec cosine: a table rerank measures rows from the query as given, as the operator does.
 
 statement ok
 CREATE TABLE hc (id int PRIMARY KEY, h halfvec(8));
@@ -27,7 +26,7 @@ SELECT max(abs(n - o)) < 1e-6 FROM (SELECT h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4
 ----
 t
 
-# with the normalized copies in the index, PostgreSQL rechecks a sphere's rows with the operator
+# with the normalized copies in the index, the scan is left alone: one statement, one precision
 statement ok
 CREATE TABLE hci AS SELECT * FROM hc;
 CREATE INDEX ON hci USING vchordrq (h halfvec_cosine_ops) WITH (options = $$
@@ -42,8 +41,25 @@ FROM unnest('{0.255}'::real[]) r;
 ----
 19 19
 
+query I
+SELECT count(*) FILTER (WHERE d >= 0.2555) FROM (SELECT h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' d FROM hci
+  WHERE (h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]') < 0.2555 ORDER BY h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' LIMIT 100) s;
+----
+0
+
+statement ok
+CREATE TABLE hci_on AS SELECT h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' d FROM hci ORDER BY h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' LIMIT 50;
+SET vchordrq.scan_node = off;
+CREATE TABLE hci_off AS SELECT h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' d FROM hci ORDER BY h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' LIMIT 50;
+RESET vchordrq.scan_node;
+
+query B
+SELECT (SELECT array_agg(d ORDER BY d) FROM hci_on) = (SELECT array_agg(d ORDER BY d) FROM hci_off);
+----
+t
+
 statement ok
 RESET enable_seqscan;
 
 statement ok
-DROP TABLE hc, hci;
+DROP TABLE hc, hci, hci_on, hci_off;

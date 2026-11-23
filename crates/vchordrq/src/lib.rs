@@ -43,8 +43,8 @@ pub use khint::{KHint, KKind};
 pub use maintain::{MaintainChooser, Pending, maintain};
 pub use prewarm::prewarm;
 pub use rerank::{
-    Hinted, Table, TableAhead, cosine_distance, exact_distance, how, rerank_heap, rerank_index,
-    rerank_index_by, unit_distance,
+    Cosine, Exact, Hinted, RowDistance, Table, TableAhead, Unit, exact_distance, how, rerank_heap,
+    rerank_index, unit_distance,
 };
 pub use search::{Candidates, MaxsimCandidate, SearchParams, default_search, maxsim_search};
 
