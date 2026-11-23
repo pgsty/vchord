@@ -98,9 +98,29 @@ SELECT sn_hint_p();
 ----
 exact 9
 
+# a user's implicit cast is the user's code: the hint is not given
+statement ok
+CREATE FUNCTION sn_txt8(t text) RETURNS int8 LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN RETURN t::numeric::int8; END $$;
+CREATE CAST (text AS int8) WITH FUNCTION sn_txt8(text) AS IMPLICIT;
+PREPARE sn_c(text) AS SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT $1;
+CREATE OR REPLACE FUNCTION sn_hint_p() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE plan json;
+BEGIN
+  EXECUTE $q$EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE sn_c('3')$q$ INTO plan;
+  RETURN coalesce(jsonb_path_query_first(plan::jsonb, '$.**."Row Hint"') #>> '{}', 'none');
+END $$;
+
+query T
+SELECT sn_hint_p();
+----
+none
+
 statement ok
 DEALLOCATE sn_p;
+DEALLOCATE sn_c;
 DROP FUNCTION sn_hint_p;
+DROP CAST (text AS int8);
+DROP FUNCTION sn_txt8;
 RESET plan_cache_mode;
 
 query T

@@ -89,7 +89,7 @@ impl Limit {
     }
 }
 
-/// A Const or Param, or an immutable implicit cast of one, such as an int4 parameter's to int8.
+/// A Const or Param, or a built-in immutable implicit cast of one, as of an int4 parameter to int8.
 unsafe fn plain(expr: *mut Node) -> bool {
     unsafe {
         match (*expr).type_ {
@@ -97,6 +97,7 @@ unsafe fn plain(expr: *mut Node) -> bool {
             NodeTag::T_FuncExpr => {
                 let f = expr.cast::<pg_sys::FuncExpr>();
                 (*f).funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+                    && u32::from((*f).funcid) < pg_sys::FirstNormalObjectId
                     && pg_sys::list_length((*f).args) == 1
                     && pg_sys::func_volatile((*f).funcid) == pg_sys::PROVOLATILE_IMMUTABLE as c_char
                     && plain(nth((*f).args, 0))
