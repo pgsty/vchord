@@ -155,7 +155,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    let query = (unprojected, raw);
+                    let query = (unprojected, FromOwned::from_owned(raw));
                     rerank::<_, Op>(index, candidates, query, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Vecf32, DistanceKind::Dot) => {
@@ -168,7 +168,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    let query = (unprojected, raw);
+                    let query = (unprojected, FromOwned::from_owned(raw));
                     rerank::<_, Op>(index, candidates, query, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Vecf16, DistanceKind::L2S) => {
@@ -181,7 +181,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    let query = (unprojected, raw);
+                    let query = (unprojected, FromOwned::from_owned(raw));
                     rerank::<_, Op>(index, candidates, query, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Vecf16, DistanceKind::Dot) => {
@@ -194,7 +194,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::new(projected), bound, options.search, bump)
                     );
-                    let query = (unprojected, raw);
+                    let query = (unprojected, FromOwned::from_owned(raw));
                     rerank::<_, Op>(index, candidates, query, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Rabitq8, DistanceKind::L2S) => {
@@ -206,7 +206,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    let query = (unprojected, raw);
+                    let query = (unprojected, FromOwned::from_owned(raw));
                     rerank::<_, Op>(index, candidates, query, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Rabitq8, DistanceKind::Dot) => {
@@ -218,7 +218,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    let query = (unprojected, raw);
+                    let query = (unprojected, FromOwned::from_owned(raw));
                     rerank::<_, Op>(index, candidates, query, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Rabitq4, DistanceKind::L2S) => {
@@ -230,7 +230,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    let query = (unprojected, raw);
+                    let query = (unprojected, FromOwned::from_owned(raw));
                     rerank::<_, Op>(index, candidates, query, reranking, fetcher, opfamily)
                 }
                 (VectorKind::Rabitq4, DistanceKind::Dot) => {
@@ -242,7 +242,7 @@ impl SearchBuilder for DefaultBuilder {
                         default_search::<_, Op>,
                         (index, Rc::clone(&unprojected), bound, options.search, bump)
                     );
-                    let query = (unprojected, raw);
+                    let query = (unprojected, FromOwned::from_owned(raw));
                     rerank::<_, Op>(index, candidates, query, reranking, fetcher, opfamily)
                 }
             };
@@ -330,7 +330,7 @@ where
 fn rerank<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
-    query: (impl Borrow<O::Vector> + 'b, OwnedVector),
+    query: (impl Borrow<O::Vector> + 'b, O::Vector),
     (io, prefilter, table, k): (Io, bool, TablePrefetch, KHint),
     fetcher: impl Fetcher + 'b,
     opfamily: Opfamily,
@@ -354,7 +354,7 @@ where
 fn rerank_on<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
-    (vector, raw): (impl Borrow<O::Vector> + 'b, OwnedVector),
+    (vector, raw): (impl Borrow<O::Vector> + 'b, O::Vector),
     (io, prefilter, table): (Io, bool, impl Table + 'b),
     mut fetcher: impl Fetcher + 'b,
     opfamily: Opfamily,
@@ -368,9 +368,8 @@ where
     if let RerankMethod::Heap = how(index) {
         let reranking = (io, prefilter, table);
         return match opfamily {
-            // a halfvec query's normal is rounded: the table rerank measures from the query as given
+            // a halfvec query's normal is rounded, so the rerank measures from the query as given
             Opfamily::HalfvecCosine => {
-                let raw = O::Vector::from_owned(raw);
                 let y2 = O::Vector::squared_norm(raw.as_borrowed());
                 let d = (opfamily, Cosine(raw, y2));
                 rerank_table::<_, O>(index, candidates, reranking, fetcher, d)
