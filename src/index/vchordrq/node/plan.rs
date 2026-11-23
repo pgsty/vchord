@@ -11,7 +11,7 @@
 
 use super::{SCAN_METHODS, cells, nth};
 use pgrx::pg_sys::{self, AttrNumber, List, Node, NodeTag, Oid, Plan};
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 use std::ptr::null_mut;
 use vchordrq::KKind;
 
@@ -62,15 +62,12 @@ struct Limit {
 }
 
 impl Limit {
-    /// A Limit whose count the scan node can evaluate again.
+    /// A Limit whose count and offset evaluate again without running code: Consts or Params.
     unsafe fn of(plan: *mut Plan) -> Option<Self> {
         unsafe {
             let limit = plan.cast::<pg_sys::Limit>();
             let (count, offset) = ((*limit).limitCount, (*limit).limitOffset);
-            if count.is_null()
-                || pg_sys::contain_volatile_functions(count)
-                || pg_sys::contain_volatile_functions(offset)
-            {
+            if count.is_null() || !plain(count) || !offset.is_null() && !plain(offset) {
                 return None;
             }
             let ties = (*limit).limitOption == pg_sys::LimitOption::LIMIT_OPTION_WITH_TIES;
@@ -85,6 +82,23 @@ impl Limit {
     fn and(self, kind: KKind) -> Option<Self> {
         let kind = self.kind.and(kind);
         (kind != KKind::Unknown).then_some(Self { kind, ..self })
+    }
+}
+
+/// A Const or Param, or an immutable implicit cast of one, such as an int4 parameter's to int8.
+unsafe fn plain(expr: *mut Node) -> bool {
+    unsafe {
+        match (*expr).type_ {
+            NodeTag::T_Const | NodeTag::T_Param => true,
+            NodeTag::T_FuncExpr => {
+                let f = expr.cast::<pg_sys::FuncExpr>();
+                (*f).funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+                    && pg_sys::list_length((*f).args) == 1
+                    && pg_sys::func_volatile((*f).funcid) == pg_sys::PROVOLATILE_IMMUTABLE as c_char
+                    && plain(nth((*f).args, 0))
+            }
+            _ => false,
+        }
     }
 }
 

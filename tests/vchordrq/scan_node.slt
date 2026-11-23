@@ -41,6 +41,34 @@ BEGIN
   RETURN plan::jsonb;
 END $$;
 
+# a function in LIMIT is not evaluated again
+statement ok
+CREATE FUNCTION sn_k(n int) RETURNS int LANGUAGE plpgsql STABLE AS $$
+BEGIN
+  PERFORM set_config('sn.calls', (current_setting('sn.calls')::int + 1)::text, false);
+  RETURN n;
+END $$;
+CREATE TABLE sn_calls (node bool, calls int);
+
+statement ok
+SET sn.calls = 0;
+SET vchordrq.scan_node = off;
+SELECT count(*) FROM (SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT sn_k(3)) s;
+INSERT INTO sn_calls VALUES (false, current_setting('sn.calls')::int);
+SET sn.calls = 0;
+SET vchordrq.scan_node = on;
+SELECT count(*) FROM (SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT sn_k(3)) s;
+INSERT INTO sn_calls VALUES (true, current_setting('sn.calls')::int);
+
+query B
+SELECT count(DISTINCT calls) = 1 FROM sn_calls;
+----
+t
+
+statement ok
+DROP TABLE sn_calls;
+DROP FUNCTION sn_k;
+
 # The scan returns the distance; the index scan below no longer computes it.
 query T
 EXPLAIN (VERBOSE, COSTS OFF) SELECT id, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3;

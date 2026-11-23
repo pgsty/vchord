@@ -236,10 +236,15 @@ unsafe fn start(state: *mut State) {
 #[inline(always)]
 unsafe fn fetch(state: *mut State) -> *mut pg_sys::TupleTableSlot {
     const EMPTY: u16 = pg_sys::TTS_FLAG_EMPTY as u16;
+    const SHOULDFREE: u16 = pg_sys::TTS_FLAG_SHOULDFREE as u16;
     unsafe {
         let child = (*state).child;
         let slot = (*state).css.ss.ss_ScanTupleSlot;
-        // a virtual slot holding no memory of its own: clearing and storing are its flags
+        // clearing a virtual slot is setting its flags, unless a parent has materialized it
+        if (*slot).tts_flags & SHOULDFREE != 0 {
+            #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+            pg_guard_ffi_boundary(|| (*(*slot).tts_ops).clear.unwrap_unchecked()(slot));
+        }
         (*slot).tts_flags |= EMPTY;
         (*slot).tts_nvalid = 0;
         if !(*state).started {
