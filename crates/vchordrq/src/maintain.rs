@@ -348,7 +348,7 @@ fn read_appendable<'b, R: RelationRead + 'b>(
     at: &mut (u32, u16),
     trace: &mut Vec<u32>,
     mut between: impl FnMut(),
-    callback: impl for<'a> FnMut(tape::Row<'a, (rabitq::bit::Code, f32)>),
+    callback: &mut impl for<'a> FnMut(tape::Row<'a, (rabitq::bit::Code, f32)>),
     dim: u32,
 ) -> usize
 where
@@ -700,18 +700,14 @@ mod tests {
         let accessor = || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _]));
         pages += tape::by_next(relation, jump_tuple.directory_first()).count() as u32;
         let frozen = tape::by_next(relation, jump_tuple.frozen_first()).inspect(|_| pages += 1);
-        tape::read_frozen_tape::<M, _, _>(frozen, tape::All, accessor, (), |row| {
+        tape::read_frozen_tape::<M, _, _>(frozen, tape::All, accessor, (), &mut |row| {
             payloads.push(row.payload.get())
         });
         let appendable =
             tape::by_next(relation, jump_tuple.appendable_first()).inspect(|_| pages += 1);
-        tape::read_appendable_tape::<M, _>(
-            appendable,
-            0,
-            |_, _, _| (),
-            (),
-            |row| payloads.push(row.payload.get()),
-        );
+        tape::read_appendable_tape::<M, _>(appendable, 0, |_, _, _| (), (), &mut |row| {
+            payloads.push(row.payload.get())
+        });
         let mut guard = relation.write(meta(relation).1, false);
         let mut id = *FreepagesTuple::deserialize_mut(guard.get_mut(1).unwrap()).first();
         drop(guard);
