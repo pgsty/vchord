@@ -23,21 +23,31 @@ static mut SCAN_METHODS: pg_sys::CustomScanMethods = pg_sys::CustomScanMethods {
     CreateCustomScanState: Some(create_state),
 };
 
-static mut EXEC_METHODS: pg_sys::CustomExecMethods = pg_sys::CustomExecMethods {
-    CustomName: c"VchordrqScan".as_ptr(),
-    BeginCustomScan: Some(begin),
-    ExecCustomScan: Some(exec),
-    EndCustomScan: Some(end),
-    ReScanCustomScan: Some(rescan),
-    MarkPosCustomScan: None,
-    RestrPosCustomScan: None,
-    EstimateDSMCustomScan: None,
-    InitializeDSMCustomScan: None,
-    ReInitializeDSMCustomScan: None,
-    InitializeWorkerCustomScan: None,
-    ShutdownCustomScan: None,
-    ExplainCustomScan: Some(explain),
-};
+/// by `direct`, then by `ordered`, as `begin` chooses for each scan
+static mut EXEC_METHODS: [[pg_sys::CustomExecMethods; 2]; 2] = [
+    [methods(exec::<false>), methods(exec::<true>)],
+    [methods(direct::<false>), methods(direct::<true>)],
+];
+
+type Exec = unsafe extern "C-unwind" fn(*mut pg_sys::CustomScanState) -> *mut TupleTableSlot;
+
+const fn methods(exec: Exec) -> pg_sys::CustomExecMethods {
+    pg_sys::CustomExecMethods {
+        CustomName: c"VchordrqScan".as_ptr(),
+        BeginCustomScan: Some(begin),
+        ExecCustomScan: Some(exec),
+        EndCustomScan: Some(end),
+        ReScanCustomScan: Some(rescan),
+        MarkPosCustomScan: None,
+        RestrPosCustomScan: None,
+        EstimateDSMCustomScan: None,
+        InitializeDSMCustomScan: None,
+        ReInitializeDSMCustomScan: None,
+        InitializeWorkerCustomScan: None,
+        ShutdownCustomScan: None,
+        ExplainCustomScan: Some(explain),
+    }
+}
 
 static mut PREV_PLANNER: pg_sys::planner_hook_type = None;
 
@@ -114,10 +124,6 @@ struct State {
     css: pg_sys::CustomScanState,
     child: *mut pg_sys::IndexScanState,
     columns: usize,
-    /// the scan tuple ends with the distance
-    ordered: bool,
-    /// no projection and no EvalPlanQual: rows go up without `ExecScan`
-    direct: bool,
     /// the child's scan has started since the last rescan
     started: bool,
     kind: KKind,
@@ -132,7 +138,7 @@ unsafe extern "C-unwind" fn create_state(_custom: *mut pg_sys::CustomScan) -> *m
     unsafe {
         let state = pg_sys::palloc0(size_of::<State>()).cast::<State>();
         (*state).css.ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*state).css.methods = &raw const EXEC_METHODS;
+        (*state).css.methods = &raw const EXEC_METHODS[0][0];
         state.cast()
     }
 }
@@ -160,8 +166,10 @@ unsafe extern "C-unwind" fn begin(
         let private = |i| (*nth((*custom).custom_private, i).cast::<pg_sys::Integer>()).ival;
         (*state).child = child;
         (*state).columns = columns;
-        (*state).ordered = pg_sys::list_length((*custom).custom_scan_tlist) as usize > columns;
-        (*state).direct = (*css).ss.ps.ps_ProjInfo.is_null() && !epq;
+        // the scan tuple ends with the distance
+        let ordered = pg_sys::list_length((*custom).custom_scan_tlist) as usize > columns;
+        // no projection and no EvalPlanQual: rows go up without `ExecScan`
+        let direct = (*css).ss.ps.ps_ProjInfo.is_null() && !epq;
         (*state).started = false;
         (*state).kind = KKind::try_from(private(0))
             .unwrap_or_else(|kind| pgrx::error!("the plan's row hint kind {kind} is unknown"));
@@ -169,6 +177,7 @@ unsafe extern "C-unwind" fn begin(
         (*state).count = expr(0);
         (*state).offset = expr(1);
         (*state).distance = if epq { expr(2) } else { null_mut() };
+        (*css).methods = &raw const EXEC_METHODS[direct as usize][ordered as usize];
         if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int == 0 {
             let scanner = crate::index::hook::begin_scan(child).cast::<Scanner>();
             (*scanner).hack = std::ptr::NonNull::new(child);
@@ -235,7 +244,7 @@ unsafe extern "C-unwind" fn start(state: *mut State) {
 
 /// The child's next row and its distance into the scan slot.
 #[inline(always)]
-unsafe fn fetch(state: *mut State) -> *mut TupleTableSlot {
+unsafe fn fetch<const ORDERED: bool>(state: *mut State) -> *mut TupleTableSlot {
     const EMPTY: u16 = pg_sys::TTS_FLAG_EMPTY as u16;
     const SHOULDFREE: u16 = pg_sys::TTS_FLAG_SHOULDFREE as u16;
     unsafe {
@@ -268,7 +277,7 @@ unsafe fn fetch(state: *mut State) -> *mut TupleTableSlot {
         let scanned = (*child).ss.ss_ScanTupleSlot;
         (*slot).tts_tid = (*scanned).tts_tid;
         (*slot).tts_tableOid = (*scanned).tts_tableOid;
-        if (*state).ordered {
+        if ORDERED {
             let scan = (*child).iss_ScanDesc;
             *(*slot).tts_values.add(n) = *(*scan).xs_orderbyvals;
             *(*slot).tts_isnull.add(n) = *(*scan).xs_orderbynulls;
@@ -277,23 +286,25 @@ unsafe fn fetch(state: *mut State) -> *mut TupleTableSlot {
     }
 }
 
-unsafe extern "C-unwind" fn next(ss: *mut pg_sys::ScanState) -> *mut TupleTableSlot {
-    unsafe { fetch(ss.cast()) }
+unsafe extern "C-unwind" fn next<const ORDERED: bool>(
+    ss: *mut pg_sys::ScanState,
+) -> *mut TupleTableSlot {
+    unsafe { fetch::<ORDERED>(ss.cast()) }
 }
 
 /// EvalPlanQual: the child returns the row to recheck once; its distance is the expression's.
 #[pgrx::pg_guard]
-unsafe extern "C-unwind" fn recheck(
+unsafe extern "C-unwind" fn recheck<const ORDERED: bool>(
     ss: *mut pg_sys::ScanState,
     _slot: *mut TupleTableSlot,
 ) -> bool {
     unsafe {
         let state = ss.cast::<State>();
-        let slot = fetch(state);
+        let slot = fetch::<ORDERED>(state);
         if (*slot).tts_flags & pg_sys::TTS_FLAG_EMPTY as u16 != 0 {
             return false;
         }
-        if (*state).ordered {
+        if ORDERED {
             let n = (*state).columns;
             let econtext = (*ss).ps.ps_ExprContext;
             (*econtext).ecxt_scantuple = slot;
@@ -309,14 +320,22 @@ unsafe extern "C-unwind" fn recheck(
     }
 }
 
-unsafe extern "C-unwind" fn exec(css: *mut pg_sys::CustomScanState) -> *mut TupleTableSlot {
+unsafe extern "C-unwind" fn exec<const ORDERED: bool>(
+    css: *mut pg_sys::CustomScanState,
+) -> *mut TupleTableSlot {
     unsafe {
-        let state = css.cast::<State>();
-        if (*state).direct {
-            return fetch(state);
-        }
-        ExecScan(&raw mut (*css).ss, Some(next), Some(recheck))
+        ExecScan(
+            &raw mut (*css).ss,
+            Some(next::<ORDERED>),
+            Some(recheck::<ORDERED>),
+        )
     }
+}
+
+unsafe extern "C-unwind" fn direct<const ORDERED: bool>(
+    css: *mut pg_sys::CustomScanState,
+) -> *mut TupleTableSlot {
+    unsafe { fetch::<ORDERED>(css.cast()) }
 }
 
 #[pgrx::pg_guard]
