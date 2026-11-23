@@ -16,12 +16,13 @@ use std::ptr::null_mut;
 use vchordrq::{KKind, RerankMethod, how};
 
 pub unsafe fn rewrite(stmt: *mut pg_sys::PlannedStmt) {
+    use pg_sys::CmdType::*;
     unsafe {
         let mut rewrite = Rewrite {
             stmt,
             next_id: None,
             // EvalPlanQual runs under these only; it computes the distance by the expression
-            epq: (*stmt).commandType != pg_sys::CmdType::CMD_SELECT
+            epq: matches!((*stmt).commandType, CMD_UPDATE | CMD_DELETE | CMD_MERGE)
                 || (*stmt).hasModifyingCTE
                 || !(*stmt).rowMarks.is_null(),
         };
@@ -166,7 +167,7 @@ impl Ordering {
             }
             let column = column.cast::<pg_sys::Var>();
             let array = pg_sys::get_element_type((*column).vartype) != pg_sys::InvalidOid;
-            ((*column).varno == (*scan).scan.scanrelid as c_int && !array).then(|| Self {
+            (!array).then(|| Self {
                 column,
                 op: (*op).opno,
                 query: nth((*op).args, 1),

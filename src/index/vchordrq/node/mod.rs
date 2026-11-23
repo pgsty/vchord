@@ -171,8 +171,8 @@ unsafe extern "C-unwind" fn begin(
         // no projection and no EvalPlanQual: rows go up without `ExecScan`
         let direct = (*css).ss.ps.ps_ProjInfo.is_null() && !epq;
         (*state).started = false;
-        (*state).kind = KKind::try_from(private(0))
-            .unwrap_or_else(|kind| pgrx::error!("the plan's row hint kind {kind} is unknown"));
+        // the plan holds a kind its rewrite wrote
+        (*state).kind = std::mem::transmute::<c_int, KKind>(private(0));
         (*state).ties = private(1) != 0;
         (*state).count = expr(0);
         (*state).offset = expr(1);
@@ -205,19 +205,18 @@ unsafe fn hint(state: &State) -> KHint {
             return KHint::UNKNOWN;
         }
         let econtext = state.css.ss.ps.ps_ExprContext;
-        // the Limit rejects negative values itself, and takes a null offset as none
-        let count = eval(state.count, econtext).and_then(|x| u64::try_from(x).ok());
+        // the Limit has rejected negative values; it takes a null count as all, a null offset as 0
+        let count = eval(state.count, econtext);
         let offset = match state.offset.is_null() {
-            true => Some(0),
-            false => eval(state.offset, econtext).map_or(Some(0), |x| u64::try_from(x).ok()),
+            true => None,
+            false => eval(state.offset, econtext),
         };
         pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
-        let (Some(count), Some(offset)) = (count, offset) else {
+        let Some(count) = count else {
             return KHint::UNKNOWN;
         };
-        let k = count.saturating_add(offset);
         KHint {
-            k: k.saturating_add(state.ties as u64),
+            k: count as u64 + offset.unwrap_or(0) as u64 + state.ties as u64,
             kind: state.kind,
         }
     }
@@ -363,8 +362,8 @@ unsafe extern "C-unwind" fn explain(
     es: *mut pg_sys::ExplainState,
 ) {
     unsafe {
-        let scan = (*(*css.cast::<State>()).child).iss_ScanDesc;
-        if scan.is_null() {
+        // the hint is what the scan used, so ANALYZE shows it; a plain EXPLAIN begins no scan
+        if !(*es).analyze {
             return;
         }
         let KHint { k, kind } = above((*css.cast::<State>()).child).k.get();
@@ -374,9 +373,7 @@ unsafe extern "C-unwind" fn explain(
             KKind::AtLeast => "at least",
             KKind::AtMost => "at most",
         };
-        if (*es).analyze {
-            let hint = CString::new(format!("{kind} {k}")).unwrap();
-            pg_sys::ExplainPropertyText(c"Row Hint".as_ptr(), hint.as_ptr(), es);
-        }
+        let hint = CString::new(format!("{kind} {k}")).unwrap();
+        pg_sys::ExplainPropertyText(c"Row Hint".as_ptr(), hint.as_ptr(), es);
     }
 }

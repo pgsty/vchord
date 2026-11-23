@@ -156,6 +156,18 @@ DROP CAST (text AS int8);
 DROP FUNCTION sn_txt8;
 RESET plan_cache_mode;
 
+# so is a cast by a volatile built-in function
+statement ok
+CREATE CAST (name AS int8) WITH FUNCTION pg_tablespace_size(name) AS ASSIGNMENT;
+
+query T
+SELECT sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 'pg_default'::name$$);
+----
+none
+
+statement ok
+DROP CAST (name AS int8);
+
 query T
 SELECT sn_hint($$SELECT a.id, x.id FROM sn_asset a CROSS JOIN LATERAL
   (SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT a.owner) x WHERE a.id IN (5, 6)$$);

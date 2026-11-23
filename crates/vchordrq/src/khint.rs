@@ -20,20 +20,6 @@ pub enum KKind {
     AtMost = 3,
 }
 
-impl TryFrom<i32> for KKind {
-    type Error = i32;
-
-    fn try_from(value: i32) -> Result<Self, i32> {
-        match value {
-            0 => Ok(Self::Unknown),
-            1 => Ok(Self::Exact),
-            2 => Ok(Self::AtLeast),
-            3 => Ok(Self::AtMost),
-            _ => Err(value),
-        }
-    }
-}
-
 impl KKind {
     /// The bound left after passing through `self`, then `other`.
     pub fn and(self, other: Self) -> Self {
