@@ -448,13 +448,25 @@ BEGIN
 END $$;
 SET plan_cache_mode = force_generic_plan;
 SET enable_sort = off;
+PREPARE sn_g(vector, int, int) AS SELECT s.id, s.v <=> $1 FROM sn s JOIN sn_asset a ON a.id = s.id
+WHERE a.visible ORDER BY s.v <=> $1 LIMIT $2 OFFSET $3;
 
 query BB
 SELECT sn_same($$SELECT * FROM sn_gen('[1,0,1]', 5, 3)$$), sn_same($$SELECT * FROM sn_cur()$$);
 ----
 t t
 
+# the node is in the generic plan of sn_gen's statement and in the plan of the cursor's statement
+query BB
+SELECT jsonb_path_exists(sn_explain($$EXECUTE sn_g('[1,0,1]', 5, 3)$$),
+    '$.** ? (@."Custom Plan Provider" == "VchordrqScan")'),
+  jsonb_path_exists(sn_explain($$SELECT s.id, s.v <=> '[0,1,1]' FROM sn s ORDER BY s.v <=> '[0,1,1]'$$),
+    '$.** ? (@."Custom Plan Provider" == "VchordrqScan")');
+----
+t t
+
 statement ok
+DEALLOCATE sn_g;
 RESET plan_cache_mode;
 RESET enable_sort;
 DROP FUNCTION sn_gen, sn_cur;
