@@ -488,6 +488,11 @@ unsafe fn max_id(stmt: *mut pg_sys::PlannedStmt) -> c_int {
     }
 }
 
+/// Whether one evaluation of `node` stands for its equals: no volatile or stable call, no SubPlan.
+unsafe fn shared(node: *mut Node) -> bool {
+    unsafe { !pg_sys::contain_mutable_functions(node) && !pg_sys::contain_subplans(node) }
+}
+
 /// Replaces `Var(varno, vec) <op> query` by `Var(to)`, and what `columns` holds by its column.
 struct Subst {
     varno: c_int,
@@ -522,10 +527,12 @@ impl Subst {
                 self.columns
                     .iter()
                     .position(|&c| ours && is_var(c, self.varno, attno))
-            } else {
+            } else if shared(node) {
                 self.columns
                     .iter()
                     .position(|&c| pg_sys::equal(c.cast(), node.cast()))
+            } else {
+                self.columns.iter().position(|&c| c == node)
             };
             Some(at? as AttrNumber + 1)
         }

@@ -154,6 +154,24 @@ SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]
 ----
 t
 
+# equal volatile entries are each evaluated, as without the node
+query I
+SELECT count(*) FILTER (WHERE a = b) FROM (SELECT random() a, random() b FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.5)) s;
+----
+0
+
+statement ok
+CREATE SEQUENCE sn_seq;
+SELECT count(*) FROM (SELECT nextval('sn_seq') a, nextval('sn_seq') b FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.5)) s;
+
+query I
+SELECT currval('sn_seq') - 2 * (SELECT count(*) FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.5));
+----
+0
+
+statement ok
+DROP SEQUENCE sn_seq;
+
 # what does not read the distance the index scan computes as before; the node adds the distance
 query T
 EXPLAIN (VERBOSE, COSTS OFF) SELECT id + 1, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3;
