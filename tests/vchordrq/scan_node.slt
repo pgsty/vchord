@@ -16,13 +16,16 @@ SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET max_parallel_workers_per_gather = 0;
 
-# rows of `q` with the node and without: the same ids in the same order, distances within rounding
+# rows of `q` with the node and without: the same ids in the same order, distances within rounding;
+# plans a function in `q` caches are made again for each
 statement ok
 CREATE FUNCTION sn_same(q text) RETURNS bool LANGUAGE plpgsql AS $$
 DECLARE a int[]; b int[]; x float8[]; y float8[];
 BEGIN
+  DISCARD PLANS;
   PERFORM set_config('vchordrq.scan_node', 'on', true);
   EXECUTE format('SELECT array_agg(id), array_agg(d) FROM (%s) r', q) INTO a, x;
+  DISCARD PLANS;
   PERFORM set_config('vchordrq.scan_node', 'off', true);
   EXECUTE format('SELECT array_agg(id), array_agg(d) FROM (%s) r', q) INTO b, y;
   RETURN cardinality(a) > 0 AND a = b
@@ -392,80 +395,35 @@ SELECT array_agg(id ORDER BY id) = (SELECT array_agg(id ORDER BY id) FROM sn_del
 ----
 t
 
-# generic plans and cursors
+# generic plans and cursors: a function's cached plan with its parameters, a cursor fetched by row
 statement ok
+CREATE FUNCTION sn_gen(q vector, k int, o int) RETURNS TABLE (id int, d float8) LANGUAGE plpgsql AS $$
+BEGIN
+  RETURN QUERY SELECT s.id, s.v <=> q FROM sn s JOIN sn_asset a ON a.id = s.id
+    WHERE a.visible ORDER BY s.v <=> q LIMIT k OFFSET o;
+END $$;
+CREATE FUNCTION sn_cur() RETURNS TABLE (id int, d float8) LANGUAGE plpgsql AS $$
+DECLARE c CURSOR FOR SELECT s.id, s.v <=> '[0,1,1]' FROM sn s ORDER BY s.v <=> '[0,1,1]';
+BEGIN
+  OPEN c;
+  FOR i IN 1..8 LOOP
+    FETCH c INTO id, d;
+    RETURN NEXT;
+  END LOOP;
+  CLOSE c;
+END $$;
 SET plan_cache_mode = force_generic_plan;
-SET vchordrq.scan_node = off;
-PREPARE sn_off(vector, int, int) AS SELECT s.id FROM sn s JOIN sn_asset a ON a.id = s.id
-WHERE a.visible ORDER BY s.v <=> $1 LIMIT $2 OFFSET $3;
-SET vchordrq.scan_node = on;
-PREPARE sn_on(vector, int, int) AS SELECT s.id FROM sn s JOIN sn_asset a ON a.id = s.id
-WHERE a.visible ORDER BY s.v <=> $1 LIMIT $2 OFFSET $3;
+SET enable_sort = off;
 
-query I
-EXECUTE sn_off('[1,0,1]', 5, 3);
+query BB
+SELECT sn_same($$SELECT * FROM sn_gen('[1,0,1]', 5, 3)$$), sn_same($$SELECT * FROM sn_cur()$$);
 ----
-1277
-523
-146
-2452
-209
-
-query I
-EXECUTE sn_on('[1,0,1]', 5, 3);
-----
-1277
-523
-146
-2452
-209
+t t
 
 statement ok
-DEALLOCATE sn_off;
-DEALLOCATE sn_on;
 RESET plan_cache_mode;
-
-statement ok
-BEGIN;
-SET LOCAL vchordrq.scan_node = off;
-DECLARE sn_c1 CURSOR FOR SELECT id FROM sn ORDER BY v <=> '[0,1,1]';
-SET LOCAL vchordrq.scan_node = on;
-DECLARE sn_c2 CURSOR FOR SELECT id FROM sn ORDER BY v <=> '[0,1,1]';
-
-query I
-FETCH 4 FROM sn_c1;
-----
-1753
-1797
-1420
-2130
-
-query I
-FETCH 4 FROM sn_c1;
-----
-1376
-2174
-1043
-2507
-
-query I
-FETCH 4 FROM sn_c2;
-----
-1753
-1797
-1420
-2130
-
-query I
-FETCH 4 FROM sn_c2;
-----
-1376
-2174
-1043
-2507
-
-statement ok
-COMMIT;
+RESET enable_sort;
+DROP FUNCTION sn_gen, sn_cur;
 
 # a NULL ORDER BY vector with a sphere: the scan searches around the sphere's centre, and the distance is NULL
 statement ok
