@@ -264,8 +264,9 @@ unsafe fn fetch(state: *mut State) -> *mut pg_sys::TupleTableSlot {
         (*slot).tts_tid = (*scanned).tts_tid;
         (*slot).tts_tableOid = (*scanned).tts_tableOid;
         if (*state).ordered {
-            *(*slot).tts_values.add(n) = *(*(*child).iss_ScanDesc).xs_orderbyvals;
-            *(*slot).tts_isnull.add(n) = false;
+            let scan = (*child).iss_ScanDesc;
+            *(*slot).tts_values.add(n) = *(*scan).xs_orderbyvals;
+            *(*slot).tts_isnull.add(n) = *(*scan).xs_orderbynulls;
         }
         slot
     }

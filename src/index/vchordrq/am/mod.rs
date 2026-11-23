@@ -694,6 +694,9 @@ pub unsafe extern "C-unwind" fn amrescan(
         if !orderbys.is_null() && (*scan).numberOfOrderBys > 0 {
             std::ptr::copy(orderbys, (*scan).orderByData, (*scan).numberOfOrderBys as _);
         }
+        // a NULL ORDER BY vector has no distance; the scan searches around a sphere's centre
+        *(*scan).xs_orderbynulls = (*scan).numberOfOrderBys > 0
+            && (*(*scan).orderByData).sk_flags & pgrx::pg_sys::SK_ISNULL as i32 != 0;
         let keys = if (*scan).numberOfKeys > 0 {
             std::slice::from_raw_parts((*scan).keyData, (*scan).numberOfKeys as _)
         } else {

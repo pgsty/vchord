@@ -20,8 +20,30 @@ SELECT bool_and(d >= l - 1e-7) FROM (SELECT d, lag(d) OVER () l FROM
 ----
 t
 
+# the scan node hands up that distance: the operator's, to f32 rounding
+query B
+SELECT max(abs(n - o)) < 1e-6 FROM (SELECT h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' n,
+  '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]'::halfvec <=> h o FROM hc ORDER BY h <=> '[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]' LIMIT 2000) s;
+----
+t
+
+# with the normalized copies in the index, PostgreSQL rechecks a sphere's rows with the operator
+statement ok
+CREATE TABLE hci AS SELECT * FROM hc;
+CREATE INDEX ON hci USING vchordrq (h halfvec_cosine_ops) WITH (options = $$
+[build.internal]
+lists = []
+$$);
+
+query II
+SELECT (SELECT count(*) FROM hci WHERE h <<=>> sphere('[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]'::halfvec, r)),
+  (SELECT count(*) FROM hci WHERE ('[0.5,-0.3,0.8,0.1,-0.6,0.2,0.4,-0.1]'::halfvec <=> h) < r)
+FROM unnest('{0.255}'::real[]) r;
+----
+19 19
+
 statement ok
 RESET enable_seqscan;
 
 statement ok
-DROP TABLE hc;
+DROP TABLE hc, hci;

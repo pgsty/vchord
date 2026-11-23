@@ -127,7 +127,10 @@ impl SearchBuilder for DefaultBuilder {
                 _ => others = true,
             }
         }
-        let owned = options.owned && !others;
+        // a halfvec copy normalized in the index is within its rounding of the operator's cosine
+        let halfvec = matches!(opfamily, Opfamily::HalfvecCosine);
+        let rounded = halfvec && !matches!(how(index), RerankMethod::Heap);
+        let owned = options.owned && !others && !rounded;
         let recheck = others || (threshold.is_some() && !owned);
         if recheck {
             options.table.k = options.table.k.and(KKind::AtLeast);

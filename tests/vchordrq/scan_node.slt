@@ -217,6 +217,21 @@ FETCH 4 FROM sn_c2;
 statement ok
 COMMIT;
 
+# a NULL ORDER BY vector with a sphere: the scan searches around the sphere's centre, and the distance is NULL
+statement ok
+SET plan_cache_mode = force_generic_plan;
+PREPARE sn_n(vector, vector) AS SELECT count(*) FILTER (WHERE d IS NULL), count(*) FROM
+(SELECT v <=> $1 AS d FROM sn WHERE v <<=>> sphere($2, 0.05) ORDER BY v <=> $1 LIMIT 10) s;
+
+query II
+EXECUTE sn_n(NULL, '[1,0,0]');
+----
+10 10
+
+statement ok
+DEALLOCATE sn_n;
+RESET plan_cache_mode;
+
 # a cursor's current row
 statement ok
 BEGIN;
