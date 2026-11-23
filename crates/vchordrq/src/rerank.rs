@@ -294,7 +294,7 @@ pub fn rerank_heap<
 
 /// The distance from `query` to `row`.
 #[inline]
-pub fn exact_distance<O: Operator>(
+fn exact_distance<O: Operator>(
     query: <O::Vector as VectorOwned>::Borrowed<'_>,
     row: <O::Vector as VectorOwned>::Borrowed<'_>,
 ) -> Distance {
@@ -344,7 +344,7 @@ impl<O: Operator, Q: Borrow<O::Vector>> RowDistance<O> for Cosine<Q> {
 
 /// The dot product distance from `query` to `row` scaled to unit length, as a cosine index stores it.
 #[inline]
-pub fn unit_distance<O: Operator>(
+fn unit_distance<O: Operator>(
     query: <O::Vector as VectorOwned>::Borrowed<'_>,
     row: <O::Vector as VectorOwned>::Borrowed<'_>,
 ) -> Distance {
