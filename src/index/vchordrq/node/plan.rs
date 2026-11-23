@@ -255,7 +255,7 @@ impl Rewrite {
                 T_SubqueryScan => {
                     let scan = plan.cast::<pg_sys::SubqueryScan>();
                     let rti = (*scan).scan.scanrelid;
-                    // EvalPlanQual fills a marked subquery's scan from its row copy, which has no junk
+                    // EvalPlanQual refills a marked subquery's scan from a row copy, without junk
                     let marks = cells((*self.stmt).rowMarks);
                     let copied = marks
                         .iter()
@@ -392,9 +392,11 @@ impl Rewrite {
             (*custom).scan.plan.plan_node_id = self.next_id();
             (*custom).scan.plan.targetlist = tlist;
             (*custom).scan.plan.qual = null_mut();
-            (*custom).scan.plan.initPlan = null_mut();
             (*custom).scan.plan.extParam = pg_sys::bms_copy((*scan).scan.plan.extParam);
             (*custom).scan.plan.allParam = pg_sys::bms_copy((*scan).scan.plan.allParam);
+            // the scan's InitPlans go to the node, where EXPLAIN looks for what sets their params
+            (*scan).scan.plan.initPlan = null_mut();
+            (*scan).scan.plan.extParam = pg_sys::bms_copy((*scan).scan.plan.allParam);
             (*custom).scan.scanrelid = 0;
             (*custom).custom_plans = pg_sys::lappend(null_mut(), scan.cast());
             for expr in [count, offset, distance] {

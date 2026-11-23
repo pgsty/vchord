@@ -32,12 +32,12 @@ BEGIN
     AND (SELECT bool_and(abs(i - j) < 1e-6) FROM unnest(x, y) u(i, j));
 END $$;
 
-# the plan of `q`, run
+# the plan of `q`, run, with each node's output
 statement ok
 CREATE FUNCTION sn_explain(q text) RETURNS jsonb LANGUAGE plpgsql AS $$
 DECLARE plan json;
 BEGIN
-  EXECUTE 'EXPLAIN (ANALYZE, FORMAT JSON) ' || q INTO plan;
+  EXECUTE 'EXPLAIN (ANALYZE, VERBOSE, FORMAT JSON) ' || q INTO plan;
   RETURN plan::jsonb;
 END $$;
 
@@ -370,6 +370,23 @@ FETCH sn_e;
 
 statement ok
 COMMIT;
+
+# a query vector from an InitPlan on the scan itself: the node's distance prints as the scan's ORDER BY
+query B
+SELECT position(jsonb_path_query_first(p, '$.** ? (@."Index Name" == "sn_v")."Order By"') #>> '{}'
+  IN jsonb_path_query_first(p, '$.** ? (@."Custom Plan Provider" == "VchordrqScan")."Output"[1]') #>> '{}') > 0
+FROM sn_explain($$SELECT id FROM sn ORDER BY v <=> (SELECT v FROM sn WHERE id = 1)$$) p;
+----
+t
+
+# and those InitPlans run again on each rescan, under LATERAL
+query B
+SELECT sn_same($$SELECT a.id * 10000 + x.id AS id, x.d FROM sn_asset a CROSS JOIN LATERAL
+  (SELECT s.id, s.v <=> (SELECT v FROM sn WHERE id = a.owner + 1) AS d FROM sn s
+    WHERE s.v <<=>> sphere((SELECT v FROM sn WHERE id = a.owner + 1), 0.01)
+    ORDER BY s.v <=> (SELECT v FROM sn WHERE id = a.owner + 1) OFFSET 0) x WHERE a.id <= 20$$);
+----
+t
 
 # spheres: membership by the scan's distance, without a recheck
 query B
