@@ -124,8 +124,6 @@ struct State {
     count: *mut pg_sys::ExprState,
     offset: *mut pg_sys::ExprState,
     distance: *mut pg_sys::ExprState,
-    /// the hint the scan last received
-    hint: KHint,
 }
 
 #[pgrx::pg_guard]
@@ -170,7 +168,6 @@ unsafe extern "C-unwind" fn begin(
         (*state).count = expr(0);
         (*state).offset = expr(1);
         (*state).distance = if epq { expr(2) } else { null_mut() };
-        (*state).hint = KHint::UNKNOWN;
         if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as c_int == 0 {
             let scanner = crate::index::hook::begin_scan(child).cast::<Scanner>();
             (*scanner).hack = std::ptr::NonNull::new(child);
@@ -221,9 +218,10 @@ unsafe fn hint(state: &State) -> KHint {
 unsafe extern "C-unwind" fn start(state: *mut State) {
     unsafe {
         (*state).started = true;
-        (*state).hint = hint(&*state);
         let child = (*state).child;
-        (*(*(*child).iss_ScanDesc).opaque.cast::<Scanner>()).k = (*state).hint;
+        (*(*(*child).iss_ScanDesc).opaque.cast::<Scanner>())
+            .k
+            .set(hint(&*state));
         pg_sys::ExecReScan(child.cast());
     }
 }
@@ -331,7 +329,7 @@ unsafe extern "C-unwind" fn rescan(css: *mut pg_sys::CustomScanState) {
     }
 }
 
-/// EXPLAIN ANALYZE shows the hint the scan last received.
+/// EXPLAIN ANALYZE shows the hint the scan last used, after its own recheck.
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn explain(
     css: *mut pg_sys::CustomScanState,
@@ -339,7 +337,11 @@ unsafe extern "C-unwind" fn explain(
     es: *mut pg_sys::ExplainState,
 ) {
     unsafe {
-        let KHint { k, kind } = (*css.cast::<State>()).hint;
+        let scan = (*(*css.cast::<State>()).child).iss_ScanDesc;
+        if scan.is_null() {
+            return;
+        }
+        let KHint { k, kind } = (*(*scan).opaque.cast::<Scanner>()).k.get();
         let kind = match kind {
             KKind::Unknown => return,
             KKind::Exact => "exact",

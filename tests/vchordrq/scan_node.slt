@@ -67,13 +67,46 @@ SET enable_mergejoin = off;
 query TTT
 SELECT sn_hint($$SELECT s.id FROM sn s JOIN sn_asset a ON a.id = s.id WHERE a.visible ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$),
   sn_hint($$SELECT s.id FROM sn s LEFT JOIN sn_tag t ON t.id = s.id ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$),
-  sn_hint($$SELECT s.id FROM sn s LEFT JOIN sn_asset a ON a.id = s.id ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$);
+  sn_hint($$SELECT s.id, a.visible FROM sn s LEFT JOIN sn_asset a ON a.id = s.id ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$);
 ----
 at least 10 at most 10 exact 10
 
+query TT
+SELECT sn_hint($$SELECT s.id FROM sn s WHERE NOT EXISTS (SELECT 1 FROM sn_tag t WHERE t.id = s.id AND t.tag > 5)
+  ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$),
+  sn_hint($$SELECT s.id FROM sn s JOIN sn_tag t ON t.id = s.id ORDER BY s.v <=> '[1,0,0]' LIMIT 10$$);
+----
+at least 10 none
+
 statement ok
 RESET enable_hashjoin;
+SET enable_nestloop = off;
+
+query T
+SELECT sn_hint($$SELECT s.id, a.owner FROM sn s LEFT JOIN sn_asset a ON a.id = s.id + 0 AND a.id < 50
+  WHERE s.v <<=>> sphere('[1,0,0]'::vector, 0.05) LIMIT 10$$);
+----
+at least 10
+
+statement ok
+RESET enable_nestloop;
 RESET enable_mergejoin;
+
+# a filter between the Limit and the scan drops rows; a gating Result passes them, LockRows may drop
+query TTT
+SELECT sn_hint($$SELECT id FROM (SELECT id, random() r FROM sn ORDER BY v <=> '[1,0,0]') s WHERE r < 2 LIMIT 10$$),
+  sn_hint($$SELECT id FROM sn WHERE current_setting('sn.x', true) IS NULL ORDER BY v <=> '[1,0,0]' LIMIT 10$$),
+  sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 10 FOR UPDATE$$);
+----
+at least 10 exact 10 at least 10
+
+# the scan's own recheck: a second sphere's rows are rechecked, so the scan reads for at least k
+query TT
+SELECT sn_hint($$SELECT id FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.5) AND v <<=>> sphere('[0,1,0]'::vector, 1.9)
+  ORDER BY v <=> '[1,0,0]' LIMIT 10$$),
+  sn_hint($$SELECT id, row_number() OVER () FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.5) LIMIT 3$$);
+----
+at least 10 none
 
 query TTT
 SELECT sn_hint($$SELECT id FROM sn WHERE v <<=>> sphere('[1,0,0]'::vector, 0.3) ORDER BY owner LIMIT 5$$),
@@ -430,6 +463,11 @@ SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn_part ORDER BY v <=> '[1
 ----
 t
 
+query T
+SELECT sn_hint($$SELECT id FROM sn_part ORDER BY v <=> '[1,0,0]' LIMIT 8$$);
+----
+at most 8
+
 # Left alone: the setting off, vchordg and maxsim.
 statement ok
 SET vchordrq.scan_node = off;
@@ -494,6 +532,12 @@ SELECT jsonb_path_query_first(sn_explain($$SELECT id FROM sn ORDER BY v <=> '[1,
   '$.**."Workers Launched"')::int > 0;
 ----
 t
+
+# Row Hint is the leader's own: a node that only a worker ran shows none
+query T
+SELECT sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3$$);
+----
+none
 
 statement ok
 SELECT set_config(CASE WHEN current_setting('server_version_num')::int >= 160000

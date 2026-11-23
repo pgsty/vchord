@@ -127,11 +127,9 @@ impl SearchBuilder for DefaultBuilder {
         }
         let owned = options.owned && !others;
         let recheck = others || (threshold.is_some() && !owned);
-        let k = if recheck {
-            options.k.and(KKind::AtLeast)
-        } else {
-            options.k
-        };
+        let k = options.k.get();
+        let k = if recheck { k.and(KKind::AtLeast) } else { k };
+        options.k.set(k);
         let bound = threshold.map(|radius| opfamily.bound(radius));
         let Some((vector, raw)) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;

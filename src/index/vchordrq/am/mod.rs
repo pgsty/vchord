@@ -19,11 +19,12 @@ use crate::index::vchordrq::scanners::*;
 use crate::recorder::DefaultRecorder;
 use pgrx::pg_sys::Datum;
 use rand::RngExt;
-use std::cell::LazyCell;
+use std::cell::{Cell, LazyCell};
 use std::ffi::CStr;
 use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
+use std::rc::Rc;
 use std::sync::OnceLock;
 use vchordrq::{InsertChooser, KHint, SearchParams};
 
@@ -648,7 +649,7 @@ pub unsafe extern "C-unwind" fn ambeginscan(
         opfamily,
         value: opfamily.value(),
         owned: false,
-        k: KHint::UNKNOWN,
+        k: Rc::new(Cell::new(KHint::UNKNOWN)),
         #[cfg(any(feature = "pg18", feature = "pg19"))]
         searched: false,
         scanning: None,
@@ -780,7 +781,7 @@ pub unsafe extern "C-unwind" fn amrescan(
             prefilter: prefilter(scanner.hack),
             table: TablePrefetch::new(scan),
             owned: scanner.owned,
-            k: scanner.k,
+            k: Rc::clone(&scanner.k),
         };
         let fetcher = {
             let hack = scanner.hack;
@@ -935,8 +936,8 @@ pub struct Scanner {
     value: OrderByValue,
     /// The scan node above owns the sphere around the vector.
     pub owned: bool,
-    /// How many rows the scan node above will take.
-    pub k: KHint,
+    /// How many rows the scan node above will take, and then what the scan used.
+    pub k: Rc<Cell<KHint>>,
     #[cfg(any(feature = "pg18", feature = "pg19"))]
     searched: bool,
     scanning: Option<LazyCell<Iter, Box<dyn FnOnce() -> Iter>>>,
