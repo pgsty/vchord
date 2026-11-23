@@ -29,8 +29,8 @@ use vchordrq::KKind;
 use vchordrq::operator::{Operator, Vector};
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
 use vchordrq::{
-    Candidates, RerankMethod, TableAhead, cosine_distance, default_search, exact_distance, how,
-    rerank_heap, rerank_index_by, unit_distance,
+    Candidates, Hinted, KHint, RerankMethod, Table, TableAhead, cosine_distance, default_search,
+    exact_distance, how, rerank_heap, rerank_index_by, unit_distance,
 };
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
@@ -90,7 +90,7 @@ impl SearchBuilder for DefaultBuilder {
     fn build<'b, R>(
         self,
         index: &'b R,
-        mut options: SearchOptions,
+        options: SearchOptions,
         fetcher: impl Fetcher + 'b,
         bump: &'b impl Bump,
         recorder: impl Recorder,
@@ -132,11 +132,13 @@ impl SearchBuilder for DefaultBuilder {
         let rounded = halfvec && !matches!(how(index), RerankMethod::Heap);
         let owned = options.owned && !others && !rounded;
         let recheck = others || (threshold.is_some() && !owned);
-        if recheck {
-            options.table.k = options.table.k.and(KKind::AtLeast);
-        }
+        let k = if recheck {
+            options.k.and(KKind::AtLeast)
+        } else {
+            options.k
+        };
         #[cfg(debug_assertions)]
-        crate::index::vchordrq::node::record(options.table.k);
+        crate::index::vchordrq::node::record(k);
         let bound = threshold.map(|radius| opfamily.bound(radius));
         let Some((vector, raw)) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
@@ -146,7 +148,7 @@ impl SearchBuilder for DefaultBuilder {
         if !opfamily.valid_cosine_query(&vector) {
             return Box::new(std::iter::empty());
         }
-        let reranking = (options.io_rerank, options.prefilter, options.table);
+        let reranking = (options.io_rerank, options.prefilter, options.table, k);
         let iter: Box<dyn Iterator<Item = (f32, NonZero<u64>)>> =
             match (opfamily.vector_kind(), opfamily.distance_kind()) {
                 (VectorKind::Vecf32, DistanceKind::L2S) => {
@@ -304,7 +306,7 @@ fn rerank_table<'b, R, O, D>(
     index: &'b R,
     candidates: Candidates<'b>,
     vector: impl Borrow<O::Vector> + 'b,
-    (io, prefilter, table): (Io, bool, TablePrefetch),
+    (io, prefilter, table): (Io, bool, impl Table + 'b),
     mut fetcher: impl Fetcher + 'b,
     (opfamily, d): (Opfamily, D),
 ) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
@@ -349,7 +351,7 @@ fn rerank<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
     vector: impl Borrow<O::Vector> + 'b,
-    reranking: (Io, bool, TablePrefetch),
+    reranking: (Io, bool, TablePrefetch, KHint),
     fetcher: impl Fetcher + 'b,
     opfamily: Opfamily,
 ) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
@@ -370,14 +372,53 @@ where
     }
 }
 
-/// [`rerank`] with each copy in the index measured by a new `accessor()`, and each row of the
-/// table by `d`.
+/// [`rerank`] measuring copies in the index with `accessor()` and rows in the table with `d`.
 fn rerank_by<'b, R, O, A, D>(
     index: &'b R,
     candidates: Candidates<'b>,
     vector: impl Borrow<O::Vector> + 'b,
+    ((io, prefilter, table, k), accessor, d): (
+        (Io, bool, TablePrefetch, KHint),
+        impl Fn() -> A + Copy + 'b,
+        D,
+    ),
+    fetcher: impl Fetcher + 'b,
+    opfamily: Opfamily,
+) -> Box<dyn Iterator<Item = (f32, NonZero<u64>)> + 'b>
+where
+    R: RelationRead + RelationPrefetch + RelationReadStream,
+    R::Page: Page<Opaque = vchordrq::Opaque>,
+    O: Operator,
+    O::Vector: FromOwned,
+    A: Accessor2<
+            <O::Vector as Vector>::Element,
+            <O::Vector as Vector>::Element,
+            <O::Vector as Vector>::Metadata,
+            <O::Vector as Vector>::Metadata,
+            Output = Distance,
+        > + 'b,
+    D: Fn(
+            <O::Vector as VectorOwned>::Borrowed<'_>,
+            <O::Vector as VectorOwned>::Borrowed<'_>,
+        ) -> Distance
+        + 'b,
+{
+    if k.kind == KKind::Unknown {
+        let reranking = ((io, prefilter, table), accessor, d);
+        rerank_on::<_, O, _, _>(index, candidates, vector, reranking, fetcher, opfamily)
+    } else {
+        let reranking = ((io, prefilter, Hinted(table, k)), accessor, d);
+        rerank_on::<_, O, _, _>(index, candidates, vector, reranking, fetcher, opfamily)
+    }
+}
+
+/// [`rerank_by`] with the table read ahead as `table` does.
+fn rerank_on<'b, R, O, A, D>(
+    index: &'b R,
+    candidates: Candidates<'b>,
+    vector: impl Borrow<O::Vector> + 'b,
     ((io, prefilter, table), accessor, d): (
-        (Io, bool, TablePrefetch),
+        (Io, bool, impl Table + 'b),
         impl Fn() -> A + Copy + 'b,
         D,
     ),

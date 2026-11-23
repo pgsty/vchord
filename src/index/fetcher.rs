@@ -11,7 +11,6 @@ use std::cell::LazyCell;
 use std::num::NonZero;
 use std::ops::DerefMut;
 use std::ptr::NonNull;
-use vchordrq::KHint;
 
 pub trait FilterableTuple: Tuple {
     fn filter(&mut self) -> bool;
@@ -235,8 +234,6 @@ impl FilterableTuple for HeapTuple<'_> {
 pub struct TablePrefetch {
     relation: pgrx::pg_sys::Relation,
     window: usize,
-    /// How many rows the executor will take.
-    pub k: KHint,
 }
 
 impl TablePrefetch {
@@ -251,11 +248,7 @@ impl TablePrefetch {
             } else {
                 0
             };
-            Self {
-                relation,
-                window,
-                k: KHint::UNKNOWN,
-            }
+            Self { relation, window }
         }
     }
 }
@@ -263,10 +256,6 @@ impl TablePrefetch {
 impl vchordrq::Table for TablePrefetch {
     fn window(&self) -> usize {
         self.window
-    }
-
-    fn k(&self) -> KHint {
-        self.k
     }
 
     fn prefetch(&mut self, payload: NonZero<u64>) {

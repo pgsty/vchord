@@ -57,6 +57,8 @@ pub struct SearchOptions {
     pub table: crate::index::fetcher::TablePrefetch,
     /// The scan node above owns the sphere around the vector.
     pub owned: bool,
+    /// How many rows the scan node above will take.
+    pub k: vchordrq::KHint,
 }
 
 /// An opfamily's own vector type, taken out of an `OwnedVector` or read in place from a datum.

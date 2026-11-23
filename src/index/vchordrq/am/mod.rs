@@ -775,10 +775,11 @@ pub unsafe extern "C-unwind" fn amrescan(
             prefilter: gucs::vchordrq_prefilter() && prefilter_safe(scanner.hack),
             table: TablePrefetch::new(scan),
             owned: scanner.owned,
+            k: scanner.k,
         };
         // The executor drops rows that fail a qual the scan does not evaluate itself.
         let qual = (scanner.hack).is_some_and(|hack| !(*hack.as_ptr()).ss.ps.qual.is_null());
-        options.table.k = if qual && !options.prefilter {
+        options.k = if qual && !options.prefilter {
             scanner.k.and(KKind::AtLeast)
         } else {
             scanner.k
@@ -907,7 +908,9 @@ pub unsafe extern "C-unwind" fn amgettuple(
             (*scan).xs_heaptid = key_to_ctid(key);
             (*scan).xs_recheck = recheck;
             (*scan).xs_recheckorderby = false;
-            *(*scan).xs_orderbyvals = scanner.value.datum(distance);
+            if scanner.owned {
+                *(*scan).xs_orderbyvals = scanner.value.datum(distance);
+            }
         }
         true
     } else {

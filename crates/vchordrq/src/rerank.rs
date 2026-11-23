@@ -44,7 +44,9 @@ pub trait Table {
     /// The most rows to read ahead; zero reads none.
     fn window(&self) -> usize;
     /// How many rows will be fetched, as the executor hints it.
-    fn k(&self) -> KHint;
+    fn k(&self) -> KHint {
+        KHint::UNKNOWN
+    }
     fn prefetch(&mut self, payload: NonZero<u64>);
 }
 
@@ -53,11 +55,24 @@ impl Table for () {
         0
     }
 
-    fn k(&self) -> KHint {
-        KHint::UNKNOWN
+    fn prefetch(&mut self, _: NonZero<u64>) {}
+}
+
+/// A table with the executor's hint, chosen per scan so that a scan without one reads as before.
+pub struct Hinted<T>(pub T, pub KHint);
+
+impl<T: Table> Table for Hinted<T> {
+    fn window(&self) -> usize {
+        self.0.window()
     }
 
-    fn prefetch(&mut self, _: NonZero<u64>) {}
+    fn k(&self) -> KHint {
+        self.1
+    }
+
+    fn prefetch(&mut self, payload: NonZero<u64>) {
+        self.0.prefetch(payload)
+    }
 }
 
 /// Rows to read ahead after `n`: as many as `k` says are still to come, else doubling so that a
