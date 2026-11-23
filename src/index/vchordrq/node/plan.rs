@@ -350,7 +350,7 @@ impl Rewrite {
             subst.to.1 = n + 1;
             let copy = |node: *mut Node| pg_sys::copyObjectImpl(node.cast()).cast::<Node>();
             let (mut child_tlist, mut scan_tlist) = (null_mut(), null_mut());
-            for &column in &subst.columns {
+            for &(column, _) in &subst.columns {
                 push_entry(&mut child_tlist, copy(column), false);
                 push_entry(&mut scan_tlist, copy(column), false);
             }
@@ -499,11 +499,6 @@ unsafe fn max_id(stmt: *mut pg_sys::PlannedStmt) -> c_int {
     }
 }
 
-/// Whether one evaluation of `node` stands for its equals: no volatile or stable call, no SubPlan.
-unsafe fn shared(node: *mut Node) -> bool {
-    unsafe { !pg_sys::contain_mutable_functions(node) && !pg_sys::contain_subplans(node) }
-}
-
 /// Replaces `Var(varno, vec) <op> query` by `Var(to)`, and what `columns` holds by its column.
 struct Subst {
     varno: c_int,
@@ -512,7 +507,8 @@ struct Subst {
     query: *mut Node,
     to: (c_int, AttrNumber),
     ty: Oid,
-    columns: Vec<*mut Node>,
+    /// the node's tuple; each column with whether one evaluation stands for its equals
+    columns: Vec<(*mut Node, bool)>,
 }
 
 impl Subst {
@@ -529,7 +525,7 @@ impl Subst {
         }
     }
 
-    /// The place of `node` in `columns`, from one: a column of `varno` by number, else by `equal`.
+    /// Where `node` is in `columns`, from one: Vars by number, shared columns by `equal`.
     unsafe fn position(&self, node: *mut Node) -> Option<AttrNumber> {
         unsafe {
             let at = if (*node).type_ == NodeTag::T_Var {
@@ -537,22 +533,24 @@ impl Subst {
                 let ours = is_var(node, self.varno, attno);
                 self.columns
                     .iter()
-                    .position(|&c| ours && is_var(c, self.varno, attno))
-            } else if shared(node) {
-                self.columns
-                    .iter()
-                    .position(|&c| pg_sys::equal(c.cast(), node.cast()))
+                    .position(|&(c, _)| ours && is_var(c, self.varno, attno))
             } else {
-                self.columns.iter().position(|&c| c == node)
+                let equal = |&(c, shared): &(*mut Node, bool)| {
+                    c == node || shared && pg_sys::equal(c.cast(), node.cast())
+                };
+                self.columns.iter().position(equal)
             };
             Some(at? as AttrNumber + 1)
         }
     }
 
+    /// Adds an entry or a column, shared if it has no volatile or stable call nor SubPlan.
     unsafe fn add(&mut self, node: *mut Node) {
         unsafe {
             if self.position(node).is_none() {
-                self.columns.push(node);
+                let shared =
+                    !pg_sys::contain_mutable_functions(node) && !pg_sys::contain_subplans(node);
+                self.columns.push((node, shared));
             }
         }
     }

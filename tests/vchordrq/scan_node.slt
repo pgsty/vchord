@@ -225,6 +225,35 @@ SELECT currval('sn_seq') - 2 * (SELECT count(*) FROM sn WHERE v <<=>> sphere('[1
 statement ok
 DROP SEQUENCE sn_seq;
 
+# subtrees PostgreSQL's mutator visits bare (CASE arms, JSON formats), in the scan's list and above it
+statement ok
+CREATE FUNCTION sn_rows(q text) RETURNS bool LANGUAGE plpgsql AS $$
+DECLARE a text; b text;
+BEGIN
+  PERFORM set_config('vchordrq.scan_node', 'on', true);
+  EXECUTE format('SELECT string_agg(r::text, '','') FROM (%s) r', q) INTO a;
+  PERFORM set_config('vchordrq.scan_node', 'off', true);
+  EXECUTE format('SELECT string_agg(r::text, '','') FROM (%s) r', q) INTO b;
+  RETURN a IS NOT NULL AND a = b;
+END $$;
+
+query BBBB
+SELECT sn_rows($$SELECT id, CASE WHEN v <=> '[1,0,0]' < 0.05 THEN 'near' ELSE 'far' END FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 20$$),
+  sn_rows($$SELECT id, CASE WHEN id > 5 THEN 'a' ELSE 'b' END FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 20$$),
+  sn_rows($$SELECT s.id, CASE WHEN a.visible THEN 'v' ELSE 'h' END FROM sn s JOIN sn_asset a ON a.id = s.id
+    ORDER BY s.v <=> '[1,0,0]' LIMIT 20$$),
+  sn_rows($$SELECT id FROM (SELECT id, owner FROM sn ORDER BY v <=> '[1,0,0]' OFFSET 0) s
+    WHERE CASE WHEN id > 5 THEN owner < 4 ELSE true END LIMIT 20$$);
+----
+t t t t
+
+skipif pg15
+query BB
+SELECT sn_rows($$SELECT id, json_object('d': round((v <=> '[1,0,0]')::numeric, 4) RETURNING text) FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 20$$),
+  sn_rows($$SELECT id, json_object('i': id RETURNING text) FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 20$$);
+----
+t t
+
 # what does not read the distance the index scan computes as before; the node adds the distance
 query T
 EXPLAIN (VERBOSE, COSTS OFF) SELECT id + 1, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3;
@@ -575,5 +604,5 @@ RESET enable_seqscan;
 RESET enable_bitmapscan;
 
 statement ok
-DROP FUNCTION sn_same, sn_hint, sn_explain;
+DROP FUNCTION sn_same, sn_hint, sn_explain, sn_rows;
 DROP TABLE sn, sn_asset, sn_tag, sn_del1, sn_del2, sn_part, sn_g, sn_m;
