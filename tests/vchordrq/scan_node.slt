@@ -154,6 +154,23 @@ SELECT sn_same($$SELECT id, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]
 ----
 t
 
+# what does not read the distance the index scan computes as before; the node adds the distance
+query T
+EXPLAIN (VERBOSE, COSTS OFF) SELECT id + 1, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 3;
+----
+Limit
+  Output: ((id + 1)), ((v <=> '[1,0,0]'::vector))
+  ->  Custom Scan (VchordrqScan)
+        Output: ((id + 1)), ((v <=> '[1,0,0]'::vector))
+        ->  Index Scan using sn_v on public.sn
+              Output: (id + 1)
+              Order By: (sn.v <=> '[1,0,0]'::vector)
+
+query B
+SELECT sn_same($$SELECT id + 1 AS id, v <=> '[1,0,0]' AS d FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 50$$);
+----
+t
+
 # above joins, subqueries and sorts, as Immich's statements have it
 query B
 SELECT sn_same($$SELECT s.id, s.v <=> '[0,1,0]' AS d FROM sn s JOIN sn_asset a ON a.id = s.id

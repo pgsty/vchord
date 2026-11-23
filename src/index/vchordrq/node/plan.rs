@@ -228,7 +228,9 @@ impl Rewrite {
                     let mut up = None;
                     for (varno, side) in [(pg_sys::OUTER_VAR, outer), (pg_sys::INNER_VAR, inner)] {
                         let Some(side) = side else { continue };
-                        Subst::above(varno, side).apply((*plan.cast::<pg_sys::Join>()).joinqual);
+                        let join = plan.cast::<pg_sys::Join>();
+                        let subst = Subst::above(varno, side);
+                        (*join).joinqual = subst.mutate((*join).joinqual.cast()).cast();
                         let side = project(plan, varno, side, want && up.is_none());
                         up = up.or(side);
                     }
@@ -318,20 +320,28 @@ impl Rewrite {
                 ty: ordering.map_or(pg_sys::InvalidOid, |o| o.ty),
                 columns: Vec::new(),
             };
-            // the node's tuple: the columns the target list reads but for the distance, then it
+            // the node's tuple: what the child computes as before, the columns read, the distance
             let tlist = (*scan).scan.plan.targetlist;
+            for cell in cells(tlist) {
+                let expr = (*cell.ptr_value.cast::<pg_sys::TargetEntry>())
+                    .expr
+                    .cast::<Node>();
+                if !reads(expr, (&raw mut subst).cast()) {
+                    subst.add(expr);
+                }
+            }
             collect(tlist.cast(), (&raw mut subst).cast());
             let epq = ordering.filter(|_| self.epq);
             if let Some(o) = epq {
-                subst.add(o.column);
+                subst.add(o.column.cast());
             }
             let n = subst.columns.len() as AttrNumber;
             subst.to.1 = n + 1;
             let copy = |node: *mut Node| pg_sys::copyObjectImpl(node.cast()).cast::<Node>();
             let (mut child_tlist, mut scan_tlist) = (null_mut(), null_mut());
-            for &var in &subst.columns {
-                push_entry(&mut child_tlist, copy(var.cast()), false);
-                push_entry(&mut scan_tlist, copy(var.cast()), false);
+            for &column in &subst.columns {
+                push_entry(&mut child_tlist, copy(column), false);
+                push_entry(&mut scan_tlist, copy(column), false);
             }
             if let Some(o) = ordering {
                 push_entry(&mut scan_tlist, copy(o.expr), false);
@@ -382,7 +392,7 @@ impl Rewrite {
             (*scan).scan.plan.targetlist = child_tlist;
             *slot = custom.cast();
             let ordering = ordering?;
-            let at = subst.position((*ordering.column).varattno);
+            let at = subst.position(ordering.column.cast());
             let vec = at.and_then(|at| find(tlist, pg_sys::INDEX_VAR, at));
             let tlist = &mut (*custom).scan.plan.targetlist;
             let dist = want.then(|| output(tlist, pg_sys::INDEX_VAR, n + 1, ordering.ty));
@@ -420,8 +430,8 @@ unsafe fn output(tlist: &mut *mut List, varno: c_int, attno: AttrNumber, ty: Oid
 unsafe fn project(plan: *mut Plan, varno: c_int, side: Up, want: bool) -> Option<Up> {
     unsafe {
         let subst = Subst::above(varno, side);
-        subst.apply((*plan).targetlist);
-        subst.apply((*plan).qual);
+        (*plan).targetlist = subst.mutate((*plan).targetlist.cast()).cast();
+        (*plan).qual = subst.mutate((*plan).qual.cast()).cast();
         let dist = side.dist.filter(|_| want)?;
         let vec = (side.vec).and_then(|vec| find((*plan).targetlist, varno, vec));
         let dist = output(&mut (*plan).targetlist, varno, dist, side.ordering.ty);
@@ -478,7 +488,7 @@ unsafe fn max_id(stmt: *mut pg_sys::PlannedStmt) -> c_int {
     }
 }
 
-/// Replaces `Var(varno, vec) <op> query` by `Var(to)`; renumbers the Vars of `varno` by `columns`.
+/// Replaces `Var(varno, vec) <op> query` by `Var(to)`, and what `columns` holds by its column.
 struct Subst {
     varno: c_int,
     vec: AttrNumber,
@@ -486,7 +496,7 @@ struct Subst {
     query: *mut Node,
     to: (c_int, AttrNumber),
     ty: Oid,
-    columns: Vec<*mut pg_sys::Var>,
+    columns: Vec<*mut Node>,
 }
 
 impl Subst {
@@ -503,18 +513,28 @@ impl Subst {
         }
     }
 
-    /// The place of column `attno` in `columns`, from one.
-    unsafe fn position(&self, attno: AttrNumber) -> Option<AttrNumber> {
+    /// The place of `node` in `columns`, from one: a column of `varno` by number, else by `equal`.
+    unsafe fn position(&self, node: *mut Node) -> Option<AttrNumber> {
         unsafe {
-            let at = self.columns.iter().position(|&v| (*v).varattno == attno)?;
-            Some(at as AttrNumber + 1)
+            let at = if (*node).type_ == NodeTag::T_Var {
+                let attno = (*node.cast::<pg_sys::Var>()).varattno;
+                let ours = is_var(node, self.varno, attno);
+                self.columns
+                    .iter()
+                    .position(|&c| ours && is_var(c, self.varno, attno))
+            } else {
+                self.columns
+                    .iter()
+                    .position(|&c| pg_sys::equal(c.cast(), node.cast()))
+            };
+            Some(at? as AttrNumber + 1)
         }
     }
 
-    unsafe fn add(&mut self, var: *mut pg_sys::Var) {
+    unsafe fn add(&mut self, node: *mut Node) {
         unsafe {
-            if self.position((*var).varattno).is_none() {
-                self.columns.push(var);
+            if self.position(node).is_none() {
+                self.columns.push(node);
             }
         }
     }
@@ -534,30 +554,20 @@ impl Subst {
     unsafe fn mutate(&self, node: *mut Node) -> *mut Node {
         unsafe { subst(node, (self as *const Self).cast_mut().cast()) }
     }
+}
 
-    /// Replaces the distance in a target list or qual, in place.
-    unsafe fn apply(&self, list: *mut List) {
-        use NodeTag::*;
-        unsafe {
-            if self.op == pg_sys::InvalidOid {
-                return;
-            }
-            for cell in cells(list) {
-                let node = cell.ptr_value.cast::<Node>();
-                let expr = if (*node).type_ == T_TargetEntry {
-                    (&raw mut (*node.cast::<pg_sys::TargetEntry>()).expr).cast::<*mut Node>()
-                } else {
-                    (&raw mut cell.ptr_value).cast::<*mut Node>()
-                };
-                if !matches!((**expr).type_, T_Var | T_Const | T_Param) {
-                    *expr = self.mutate(*expr);
-                }
-            }
+/// Whether `node` reads the distance.
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn reads(node: *mut Node, context: *mut c_void) -> bool {
+    unsafe {
+        !node.is_null() && {
+            let cx = context.cast::<Subst>().as_ref().unwrap_unchecked();
+            cx.matches(node) || pg_sys::expression_tree_walker(node, Some(reads), context)
         }
     }
 }
 
-/// Collects the columns of `varno` that `node` reads but for the distance.
+/// Collects the columns of `varno` that `node` reads but for the distance and what `columns` holds.
 #[pgrx::pg_guard]
 unsafe extern "C-unwind" fn collect(node: *mut Node, context: *mut c_void) -> bool {
     unsafe {
@@ -565,13 +575,13 @@ unsafe extern "C-unwind" fn collect(node: *mut Node, context: *mut c_void) -> bo
             return false;
         }
         let cx = context.cast::<Subst>().as_mut().unwrap_unchecked();
-        if cx.matches(node) {
+        if cx.matches(node) || cx.position(node).is_some() {
             return false;
         }
         if (*node).type_ == NodeTag::T_Var {
             let var = node.cast::<pg_sys::Var>();
             if (*var).varno == cx.varno && (*var).varlevelsup == 0 {
-                cx.add(var);
+                cx.add(node);
             }
             return false;
         }
@@ -589,15 +599,10 @@ unsafe extern "C-unwind" fn subst(node: *mut Node, context: *mut c_void) -> *mut
         if cx.matches(node) {
             return distance_var(cx.to.0, cx.to.1, cx.ty);
         }
-        if (*node).type_ == NodeTag::T_Var {
-            let var = node.cast::<pg_sys::Var>();
-            if (*var).varno == cx.varno && (*var).varlevelsup == 0 {
-                if let Some(at) = cx.position((*var).varattno) {
-                    let copy = pg_sys::copyObjectImpl(var.cast()).cast::<pg_sys::Var>();
-                    ((*copy).varno, (*copy).varattno) = (cx.to.0, at);
-                    return copy.cast();
-                }
-            }
+        if let Some(at) = cx.position(node) {
+            let (ty, typmod) = (pg_sys::exprType(node), pg_sys::exprTypmod(node));
+            let var = pg_sys::makeVar(cx.to.0, at, ty, typmod, pg_sys::exprCollation(node), 0);
+            return var.cast();
         }
         pg_sys::expression_tree_mutator(node, Some(subst), context)
     }
