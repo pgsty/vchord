@@ -14,6 +14,7 @@ one dedicated database; reads its SQLite files to check post-commit cleanup.
 
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 
@@ -46,11 +47,21 @@ with psycopg.connect(dbname='postgres', autocommit=True, options='-c client_enco
                 c.execute('SET vchordrq.query_sampling_enable=off')
 
             def stored(index_oid):
-                with sqlite3.connect(f'file:{file}?mode=ro', uri=True) as db:
+                with closing(sqlite3.connect(f'file:{file}?mode=ro', uri=True)) as db:
                     return db.execute('SELECT count(*) FROM sqlite_master WHERE type=\'table\' AND name=?', (f'index_{index_oid}',)).fetchone()[0] == 1
 
+            file.parent.mkdir(exist_ok=True)
+            assert not file.exists()
+            with closing(sqlite3.connect(file)) as db:
+                db.execute('PRAGMA user_version=1')
+            with file.open('r+b') as damaged:
+                damaged.write(b'bad sqlite magic')
+            assert c.execute("SELECT * FROM vchordrq_sampled_values('ti')").fetchall() == []
+            assert not file.exists(), 'invalid sampling database survived initialization'
             sample()
             assert stored(oid)
+            assert c.execute("SELECT * FROM vchordrq_sampled_values('ti')").fetchall() == [('[4,5,6]',)]
+            results['invalid_sqlite_header_recovers_on_next_sample'] = True
             try:
                 admin.execute(sql.SQL('DROP DATABASE {}').format(sql.Identifier(name)))
                 raise AssertionError('DROP DATABASE unexpectedly succeeded')

@@ -37,7 +37,7 @@ crossbeam-channel = "0.5.17"
 dary_heap.workspace = true
 humansize = "2.1.3"
 paste.workspace = true
-pgrx = { version = "=0.20.0", default-features = false, features = ["cshim"] }
+pgrx = { version = "=0.20.1", default-features = false, features = ["cshim"] }
 rand.workspace = true
 rayon.workspace = true
 rusqlite = { version = "0.43.0", features = ["bundled"] }

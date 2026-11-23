@@ -8,7 +8,7 @@ publish = false
 [dependencies]
 clap = { version = "4.6.9", features = ["derive", "env"] }
 object = { version = "0.41.0", features = ["read", "wasm"] }
-pgrx-sql-entity-graph = "=0.20.0"
+pgrx-sql-entity-graph = "=0.20.1"
 serde.workspace = true
 serde_json = "1.0.154"
 target-tuple = "1.0.2"

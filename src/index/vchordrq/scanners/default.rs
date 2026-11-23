@@ -18,7 +18,7 @@ use distance::Distance;
 use index::bump::Bump;
 use index::filter::filter;
 use index::packed::PackedRefMut4;
-use index::prefetcher::*;
+use index::prefetcher::{PlainPrefetcher, SimplePrefetcher, StreamPrefetcher};
 use index::relation::{Hints, Page, RelationPrefetch, RelationRead, RelationReadStream};
 use index_accessor::{Dot, L2S};
 use simd::f16;
@@ -28,7 +28,7 @@ use std::rc::Rc;
 use vchordrq::operator::Operator;
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
 use vchordrq::{
-    Candidates, RerankMethod, TableAhead, default_search, exact_distance, how, rerank_heap,
+    Candidates, RerankMethod, Table, TableAhead, default_search, exact_distance, how, rerank_heap,
     rerank_index, unit_distance,
 };
 use vector::VectorOwned;
@@ -120,6 +120,10 @@ impl SearchBuilder for DefaultBuilder {
             }
         }
         let opfamily = self.opfamily;
+        let threshold = threshold.map(|radius| match opfamily {
+            Opfamily::VectorL2 | Opfamily::HalfvecL2 if radius > 0.0 => radius.next_up(),
+            _ => radius,
+        });
         let bound = threshold.map(|radius| opfamily.bound(radius));
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
@@ -129,7 +133,12 @@ impl SearchBuilder for DefaultBuilder {
         if !opfamily.valid_cosine_query(&vector) {
             return Box::new(std::iter::empty());
         }
-        let reranking = (options.io_rerank, options.prefilter, options.table);
+        let reranking = RerankOptions {
+            method: how(index),
+            io: options.io_rerank,
+            prefilter: options.prefilter,
+            table: options.table,
+        };
         let finish = Finish {
             ordered,
             threshold,
@@ -260,6 +269,14 @@ impl SearchBuilder for DefaultBuilder {
 
 type Ranked<'b> = Box<dyn Iterator<Item = (Distance, NonZero<u64>)> + 'b>;
 
+#[derive(Clone, Copy)]
+struct RerankOptions {
+    method: RerankMethod,
+    io: Io,
+    prefilter: bool,
+    table: TablePrefetch,
+}
+
 struct Finish {
     ordered: bool,
     threshold: Option<f32>,
@@ -273,7 +290,7 @@ impl Finish {
         index: &'b R,
         search: vchordrq::Search<'b>,
         vector: impl Borrow<O::Vector> + 'b,
-        options: (Io, bool, TablePrefetch),
+        options: RerankOptions,
         mut fetcher: impl Fetcher + 'b,
         opfamily: Opfamily,
     ) -> Ranked<'b>
@@ -304,12 +321,16 @@ impl Finish {
                 let mut scratch = bumpalo::Bump::new();
                 if self.ordered {
                     let mut sorted = unsafe { SortedRows::new(self.context, self.max_scan_tuples) };
+                    let mut fill_options = options;
+                    if matches!(options.method, RerankMethod::Index) {
+                        fill_options.table.disable();
+                    }
                     while let Some(candidates) = refill(&scratch) {
                         let rows = rerank::<_, O>(
                             index,
                             candidates,
                             vector.borrow(),
-                            options,
+                            fill_options,
                             &mut fetcher,
                             opfamily,
                         );
@@ -321,7 +342,19 @@ impl Finish {
                     unsafe {
                         pgrx::pg_sys::tuplesort_performsort(sorted.sort);
                     }
-                    Box::new(sorted)
+                    let mut table = options.table;
+                    if matches!(options.io, Io::Plain) || table.window() == 0 {
+                        return Box::new(sorted);
+                    }
+                    let limit = self.max_scan_tuples.map_or(usize::MAX, |n| n as usize);
+                    let mut rows = sorted.take(limit).peekable();
+                    Box::new(std::iter::from_fn(move || {
+                        let row = rows.next()?;
+                        if let Some(&(_, payload)) = rows.peek() {
+                            table.prefetch(payload);
+                        }
+                        Some(row)
+                    }))
                 } else {
                     let mut rows = Vec::new().into_iter();
                     Box::new(std::iter::from_fn(move || {
@@ -491,7 +524,7 @@ fn rerank<'b, R, O>(
     index: &'b R,
     candidates: Candidates<'b>,
     vector: impl Borrow<O::Vector> + 'b,
-    (io, prefilter, table): (Io, bool, TablePrefetch),
+    options: RerankOptions,
     mut fetcher: impl Fetcher + 'b,
     opfamily: Opfamily,
 ) -> Ranked<'b>
@@ -501,8 +534,8 @@ where
     O: Operator,
     O::Vector: FromOwned,
 {
-    if let RerankMethod::Heap = how(index) {
-        let reranking = (io, prefilter, table);
+    if let RerankMethod::Heap = options.method {
+        let reranking = (options.io, options.prefilter, options.table);
         return if opfamily.is_cosine() {
             rerank_table::<_, O, _>(
                 index,
@@ -531,7 +564,7 @@ where
         tuple.filter()
     });
     let hints = Hints::default().full(false);
-    match (io, prefilter) {
+    match (options.io, options.prefilter) {
         (Io::Plain, false) => {
             let prefetcher = PlainPrefetcher::new(index, candidates);
             Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
@@ -542,7 +575,11 @@ where
         }
         (Io::Simple, false) => {
             let prefetcher = SimplePrefetcher::new(index, candidates);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table))
+            Box::new(rerank_index::<O, _, _, _>(
+                vector,
+                prefetcher,
+                options.table,
+            ))
         }
         (Io::Simple, true) => {
             let prefetcher = SimplePrefetcher::new(index, filter(candidates, predicate));
@@ -550,7 +587,11 @@ where
         }
         (Io::Stream, false) => {
             let prefetcher = StreamPrefetcher::new(index, candidates, hints);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, table))
+            Box::new(rerank_index::<O, _, _, _>(
+                vector,
+                prefetcher,
+                options.table,
+            ))
         }
         (Io::Stream, true) => {
             let prefetcher = StreamPrefetcher::new(index, filter(candidates, predicate), hints);

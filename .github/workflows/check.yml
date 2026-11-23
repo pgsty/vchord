@@ -65,7 +65,7 @@ jobs:
         run: cargo fmt --check -- --config-path /dev/null --config imports_granularity=Module
 
       - name: Deny
-        run: cargo deny check
+        run: cargo deny --workspace check
 
       - name: License Header
         run: |

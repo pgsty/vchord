@@ -6,6 +6,87 @@
 // Copyright (c) 2026 PGSTY PTE. LTD.
 // Maintained by Ruohang Feng @ PGSTY (rh@vonng.com)
 
+use pgrx::pg_sys::Expr;
+
+unsafe fn null_propagates_to_key(key: *mut Expr, input: *mut Expr) -> bool {
+    use pgrx::pg_sys::{self, NodeTag};
+    unsafe {
+        pg_sys::check_stack_depth();
+        if pg_sys::equal(key.cast(), input.cast()) {
+            return true;
+        }
+        if (*input).type_ == NodeTag::T_RelabelType {
+            return null_propagates_to_key(key, (*input.cast::<pg_sys::RelabelType>()).arg);
+        }
+        let args = match (*key).type_ {
+            NodeTag::T_RelabelType => {
+                return null_propagates_to_key((*key.cast::<pg_sys::RelabelType>()).arg, input);
+            }
+            NodeTag::T_CoerceViaIO => {
+                return null_propagates_to_key((*key.cast::<pg_sys::CoerceViaIO>()).arg, input);
+            }
+            NodeTag::T_FuncExpr => {
+                let func = &*key.cast::<pg_sys::FuncExpr>();
+                if !pg_sys::func_strict(func.funcid) {
+                    return false;
+                }
+                func.args
+            }
+            NodeTag::T_OpExpr => {
+                let op = &*key.cast::<pg_sys::OpExpr>();
+                if !pg_sys::op_strict(op.opno) {
+                    return false;
+                }
+                op.args
+            }
+            _ => return false,
+        };
+        pgrx::PgList::<Expr>::from_pg(args)
+            .iter_ptr()
+            .any(|arg| null_propagates_to_key(arg, input))
+    }
+}
+
+unsafe fn tests_null_key(clause: *mut Expr, key: *mut Expr, negated: bool) -> bool {
+    use pgrx::pg_sys::{self, NodeTag};
+    unsafe {
+        pg_sys::check_stack_depth();
+        match (*clause).type_ {
+            NodeTag::T_RestrictInfo => tests_null_key(
+                (*clause.cast::<pg_sys::RestrictInfo>()).clause,
+                key,
+                negated,
+            ),
+            NodeTag::T_BoolExpr => {
+                let expr = &*clause.cast::<pg_sys::BoolExpr>();
+                let negated = negated ^ (expr.boolop == pg_sys::BoolExprType::NOT_EXPR);
+                pgrx::PgList::<Expr>::from_pg(expr.args)
+                    .iter_ptr()
+                    .any(|arg| tests_null_key(arg, key, negated))
+            }
+            NodeTag::T_NullTest => {
+                let test = &*clause.cast::<pg_sys::NullTest>();
+                !test.argisrow
+                    && (test.nulltesttype == pg_sys::NullTestType::IS_NULL) != negated
+                    && null_propagates_to_key(key, test.arg)
+            }
+            NodeTag::T_DistinctExpr => {
+                let args = pgrx::PgList::<Expr>::from_pg((*clause.cast::<pg_sys::OpExpr>()).args);
+                let left = args.get_ptr(0).unwrap();
+                let right = args.get_ptr(1).unwrap();
+                [(left, right), (right, left)]
+                    .into_iter()
+                    .any(|(arg, other)| {
+                        ((*other).type_ != NodeTag::T_Const
+                            || (*other.cast::<pg_sys::Const>()).constisnull == negated)
+                            && null_propagates_to_key(key, arg)
+                    })
+            }
+            _ => false,
+        }
+    }
+}
+
 pub(super) unsafe fn usable_path(path: *mut pgrx::pg_sys::IndexPath) -> bool {
     use pgrx::pg_sys::{self, IndexClause, NodeTag, NullTest, NullTestType, RestrictInfo};
     unsafe {
@@ -29,21 +110,33 @@ pub(super) unsafe fn usable_path(path: *mut pgrx::pg_sys::IndexPath) -> bool {
             .as_ref()
             .map_or(std::ptr::null_mut(), |p| p.ppi_clauses);
         let quals = [base_quals, join_quals, (*index).indpred];
-        if quals.iter().any(|q| !q.is_null()) {
-            let mut test = NullTest::default();
-            test.xpr.type_ = NodeTag::T_NullTest;
+        let restrictions = [
+            base_quals,
+            join_quals,
+            (*index).indpred,
+            (*(*index).rel).joininfo,
+        ];
+        if restrictions.iter().any(|q| !q.is_null()) {
             let column = pgrx::PgList::<pg_sys::TargetEntry>::from_pg((*index).indextlist)
                 .get_ptr(0)
                 .unwrap();
-            test.arg = (*column).expr;
-            test.nulltesttype = NullTestType::IS_NULL;
-            let mut predicate = pgrx::PgList::new();
-            predicate.push(&raw mut test);
-            if quals
-                .into_iter()
-                .any(|q| !q.is_null() && pg_sys::predicate_implied_by(predicate.as_ptr(), q, false))
-            {
-                return false;
+            let key = (*column).expr;
+            if restrictions.into_iter().any(|list| {
+                pgrx::PgList::<Expr>::from_pg(list)
+                    .iter_ptr()
+                    .any(|qual| tests_null_key(qual, key, false))
+            }) {
+                let mut test = NullTest::default();
+                test.xpr.type_ = NodeTag::T_NullTest;
+                test.arg = key;
+                test.nulltesttype = NullTestType::IS_NOT_NULL;
+                let mut predicate = pgrx::PgList::new();
+                predicate.push(&raw mut test);
+                if !quals.into_iter().any(|list| {
+                    !list.is_null() && pg_sys::predicate_implied_by(predicate.as_ptr(), list, false)
+                }) {
+                    return false;
+                }
             }
         }
         !(*path).indexorderbys.is_null()

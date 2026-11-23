@@ -248,6 +248,10 @@ pub struct TablePrefetch {
 }
 
 impl TablePrefetch {
+    pub fn disable(&mut self) {
+        self.window = 0;
+    }
+
     /// Reads ahead by the tablespace's `effective_io_concurrency`, for a heap table only.
     pub unsafe fn new(scan: pgrx::pg_sys::IndexScanDesc) -> Self {
         unsafe {

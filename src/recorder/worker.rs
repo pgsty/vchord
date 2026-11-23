@@ -62,7 +62,10 @@ fn get<'a>(create: bool) -> Option<RefMut<'a, rusqlite::Connection>> {
             Ok(())
         }()
     {
-        if err.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseCorrupt) {
+        if matches!(
+            err.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase)
+        ) {
             delete_database(database_oid);
         }
         pgrx::debug1!("Recorder: Error initializing database: {}", err);

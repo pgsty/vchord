@@ -146,3 +146,47 @@ DROP FUNCTION rq_sphere_order_rechecked;
 
 statement ok
 DROP TABLE rq_sphere_order;
+
+statement ok
+CREATE TABLE rq_sphere_edge (id int, v vector(16), tenant int);
+INSERT INTO rq_sphere_edge VALUES
+  (1, (ARRAY[6.9999995::real] || array_fill(0.000665::real, ARRAY[15]))::vector, 1),
+  (2, (ARRAY[7::real] || array_fill(0::real, ARRAY[15]))::vector, 1),
+  (3, (ARRAY[7.0000005::real] || array_fill(0::real, ARRAY[15]))::vector, 1);
+CREATE VIEW rq_sphere_edge_hits AS SELECT id FROM rq_sphere_edge WHERE tenant=1
+  AND v <<->> sphere(array_fill(0::real, ARRAY[16])::vector, 7.0)
+  ORDER BY v <-> array_fill(0::real, ARRAY[16])::vector;
+
+query I
+TABLE rq_sphere_edge_hits;
+----
+1
+
+statement ok
+SET enable_seqscan=off;
+SET vchordrq.epsilon=4;
+CREATE INDEX rq_sphere_edge_idx ON rq_sphere_edge USING vchordrq (v vector_l2_ops);
+
+query I
+TABLE rq_sphere_edge_hits;
+----
+1
+
+statement ok
+DROP INDEX rq_sphere_edge_idx;
+SET vchordrq.probes='1';
+CREATE INDEX rq_sphere_edge_idx ON rq_sphere_edge USING vchordrq (v vector_l2_ops, tenant)
+  WITH (options='rerank_in_table=true
+build.internal.lists=[2]');
+
+query I
+TABLE rq_sphere_edge_hits;
+----
+1
+
+statement ok
+DROP VIEW rq_sphere_edge_hits;
+DROP TABLE rq_sphere_edge;
+RESET vchordrq.probes;
+RESET vchordrq.epsilon;
+RESET enable_seqscan;

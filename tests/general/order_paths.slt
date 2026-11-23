@@ -13,6 +13,9 @@ BEGIN
   RETURN plan::text;
 END $$;
 CREATE VIEW order_nulls AS SELECT id FROM order_rows WHERE v IS NULL ORDER BY v <-> '[0,0]';
+CREATE VIEW order_mixed_nulls AS SELECT id FROM order_rows WHERE v IS NULL OR id=1 ORDER BY v <-> '[0,0]';
+CREATE VIEW order_null_join AS SELECT r.id FROM order_rows r JOIN (VALUES (NULL::vector), ('[1,0]')) p(v)
+  ON r.v IS NOT DISTINCT FROM p.v ORDER BY r.v <-> '[0,0]';
 CREATE VIEW order_two AS SELECT id FROM order_rows ORDER BY v <-> '[0,0]', v <-> '[-2,0]' LIMIT 2;
 CREATE VIEW order_one AS SELECT id FROM order_rows ORDER BY v <-> '[-1,0]' LIMIT 1;
 PREPARE parameter_order(vector) AS SELECT id FROM order_rows ORDER BY v <-> $1 LIMIT 2;
@@ -33,6 +36,13 @@ SELECT count(*), order_plan('TABLE order_nulls') NOT LIKE '%order_rq_idx%',
   order_plan('TABLE order_one') LIKE '%order_rq_idx%' FROM order_nulls;
 ----
 705 t t
+
+query IITT
+SELECT (SELECT count(*) FROM order_mixed_nulls), (SELECT count(*) FROM order_null_join),
+  order_plan('TABLE order_mixed_nulls') NOT LIKE '%order_rq_idx%',
+  order_plan('TABLE order_null_join') NOT LIKE '%order_rq_idx%';
+----
+706 706 t t
 
 query T
 SELECT ARRAY(TABLE order_two);
@@ -80,6 +90,13 @@ SELECT count(*), order_plan('TABLE order_nulls') NOT LIKE '%order_g_idx%',
   order_plan('TABLE order_one') LIKE '%order_g_idx%' FROM order_nulls;
 ----
 705 t t
+
+query IITT
+SELECT (SELECT count(*) FROM order_mixed_nulls), (SELECT count(*) FROM order_null_join),
+  order_plan('TABLE order_mixed_nulls') NOT LIKE '%order_g_idx%',
+  order_plan('TABLE order_null_join') NOT LIKE '%order_g_idx%';
+----
+706 706 t t
 
 query T
 SELECT ARRAY(TABLE order_two);
@@ -138,6 +155,48 @@ t t
 
 statement ok
 DROP INDEX order_partial_idx, order_btree_idx;
+CREATE VIEW order_expr_nulls AS SELECT id FROM order_rows WHERE v IS NULL
+  ORDER BY l2_normalize(v)::vector(2) <#> '[1,0]' LIMIT 10;
+CREATE INDEX order_expr_rq ON order_rows USING vchordrq ((l2_normalize(v)::vector(2)) vector_ip_ops);
+
+query IT
+SELECT count(*), order_plan('TABLE order_expr_nulls') NOT LIKE '%order_expr_rq%' FROM order_expr_nulls;
+----
+10 t
+
+statement ok
+DROP INDEX order_expr_rq;
+CREATE INDEX order_expr_g ON order_rows USING vchordg ((l2_normalize(v)::vector(2)) vector_ip_ops);
+
+query IT
+SELECT count(*), order_plan('TABLE order_expr_nulls') NOT LIKE '%order_expr_g%' FROM order_expr_nulls;
+----
+10 t
+
+statement ok
+DROP INDEX order_expr_g;
+CREATE INDEX order_expr_op ON order_rows USING vchordg (((v+'[0,0]')::vector(2)) vector_l2_ops);
+CREATE VIEW order_op_nulls AS SELECT id FROM order_rows WHERE v IS NOT DISTINCT FROM NULL::vector
+  ORDER BY (v+'[0,0]')::vector(2) <-> '[0,0]' LIMIT 10;
+
+query IT
+SELECT count(*), order_plan('TABLE order_op_nulls') NOT LIKE '%order_expr_op%' FROM order_op_nulls;
+----
+10 t
+
+statement ok
+DROP INDEX order_expr_op;
+CREATE INDEX order_non_strict ON order_rows USING vchordrq ((COALESCE(v,'[0,0]')::vector(2)) vector_l2_ops);
+CREATE VIEW order_coalesce AS SELECT id FROM order_rows WHERE v IS NULL
+  ORDER BY COALESCE(v,'[0,0]')::vector(2) <-> '[1,0]' LIMIT 10;
+
+query IT
+SELECT count(*), order_plan('TABLE order_coalesce') LIKE '%order_non_strict%' FROM order_coalesce;
+----
+10 t
+
+statement ok
+DROP INDEX order_non_strict;
 ALTER TABLE order_rows ADD COLUMN owner int;
 UPDATE order_rows SET owner=id%2;
 CREATE INDEX order_key_idx ON order_rows USING vchordrq (v vector_l2_ops, owner) WHERE id<10;
@@ -177,7 +236,7 @@ DEALLOCATE parameter_sphere;
 DEALLOCATE parameter_all;
 DEALLOCATE parameter_order;
 DEALLOCATE parameter_order_count;
-DROP VIEW order_one, order_two, order_nulls, order_rescans;
+DROP VIEW order_one, order_two, order_nulls, order_rescans, order_mixed_nulls, order_null_join, order_expr_nulls, order_op_nulls, order_coalesce;
 DROP TABLE order_rows, order_multis;
 DROP FUNCTION order_plan(text);
 RESET plan_cache_mode;

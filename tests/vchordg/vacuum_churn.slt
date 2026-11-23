@@ -7,7 +7,7 @@ statement ok
 SELECT setseed(0.37);
 
 statement ok
-CREATE TABLE vchordg_churn (id int, v vector(16)) WITH (autovacuum_enabled = off);
+CREATE TEMP TABLE vchordg_churn (id int, v vector(16));
 
 statement ok
 INSERT INTO vchordg_churn
