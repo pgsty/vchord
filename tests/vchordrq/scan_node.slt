@@ -52,6 +52,23 @@ SELECT sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 10 OFFSET 20$$
 ----
 exact 30
 
+# auto_explain sets ANALYZE for an EXPLAIN with BUFFERS alone, which begins no scan (where it is built);
+# PostgreSQL 19 crashes on this EXPLAIN itself, with the node off as well
+skipif pg19
+statement ok
+DO $$
+BEGIN
+  BEGIN
+    LOAD 'auto_explain';
+  EXCEPTION WHEN undefined_file THEN
+    RETURN;
+  END;
+  SET LOCAL auto_explain.log_min_duration = 0;
+  SET LOCAL auto_explain.log_analyze = on;
+  SET LOCAL auto_explain.log_nested_statements = on;
+  EXECUTE $q$EXPLAIN (BUFFERS, COSTS OFF) SELECT id FROM sn ORDER BY v <=> '[1,0,0]' LIMIT 5$q$;
+END $$;
+
 query T
 SELECT sn_hint($$SELECT id FROM sn ORDER BY v <=> '[1,0,0]' FETCH FIRST 10 ROWS WITH TIES$$);
 ----

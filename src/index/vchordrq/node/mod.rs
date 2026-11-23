@@ -362,11 +362,12 @@ unsafe extern "C-unwind" fn explain(
     es: *mut pg_sys::ExplainState,
 ) {
     unsafe {
-        // the hint is what the scan used, so ANALYZE shows it; a plain EXPLAIN begins no scan
-        if !(*es).analyze {
+        // the hint is what the scan used; auto_explain sets ANALYZE for an EXPLAIN that begins none
+        let child = (*css.cast::<State>()).child;
+        if !(*es).analyze || (*child).iss_ScanDesc.is_null() {
             return;
         }
-        let KHint { k, kind } = above((*css.cast::<State>()).child).k.get();
+        let KHint { k, kind } = above(child).k.get();
         let kind = match kind {
             KKind::Unknown => return,
             KKind::Exact => "exact",
