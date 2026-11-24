@@ -31,6 +31,49 @@ CREATE VIEW order_rescans AS SELECT array_agg(n ORDER BY i) FROM
 CREATE INDEX order_rq_idx ON order_rows USING vchordrq (v vector_l2_ops);
 UPDATE order_rows SET id=1000 WHERE id=4;
 
+statement ok
+PREPARE order_distinct(vector) AS SELECT count(*) FROM (
+  SELECT id FROM order_rows WHERE v IS DISTINCT FROM $1 ORDER BY v <-> '[0,0]' LIMIT 10
+) s;
+
+query I
+EXECUTE order_distinct('[1,0]');
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT id FROM order_rows WHERE v IS DISTINCT FROM '[1,0]' ORDER BY v <-> '[0,0]' LIMIT 10) s;
+----
+10
+
+query T
+SELECT order_plan($q$SELECT id FROM order_rows WHERE v IS NOT NULL AND v IS DISTINCT FROM '[1,0]' ORDER BY v <-> '[0,0]' LIMIT 2$q$) LIKE '%order_rq_idx%';
+----
+t
+
+skipif pg15
+skipif pg16
+skipif pg17
+statement ok
+ALTER TABLE order_rows ADD CONSTRAINT order_v_nn NOT NULL v NOT VALID;
+
+skipif pg15
+skipif pg16
+skipif pg17
+query I
+SELECT count(*) FROM (SELECT id FROM order_rows WHERE v IS NULL ORDER BY v <-> '[0,0]' LIMIT 10) s;
+----
+10
+
+skipif pg15
+skipif pg16
+skipif pg17
+statement ok
+ALTER TABLE order_rows DROP CONSTRAINT order_v_nn;
+
+statement ok
+DEALLOCATE order_distinct;
+
 query ITT
 SELECT count(*), order_plan('TABLE order_nulls') NOT LIKE '%order_rq_idx%',
   order_plan('TABLE order_one') LIKE '%order_rq_idx%' FROM order_nulls;
@@ -229,7 +272,7 @@ EXECUTE parameter_multi(NULL);
 ----
 2
 
-# IS DISTINCT FROM keeps the vector index on both NOT NULL and nullable columns;
+# IS DISTINCT FROM keeps the vector index when the column is known nonnull;
 # literal ORDER BY v <-> NULL without a sphere falls back to streaming SeqScan.
 statement ok
 CREATE TABLE order_not_null (id int, v vector(2) NOT NULL);

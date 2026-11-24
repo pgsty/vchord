@@ -82,18 +82,22 @@ s = p.read_text()
 anchor = '            let state = std::mem::replace(&mut first.state, std::ptr::null_mut());'
 assert s.count(anchor) == 1
 s = s.replace(anchor, '''            if std::fs::read_to_string(''' + json.dumps(str(control)) + ''').ok().as_deref()
-                == Some(format!("stale:{}", std::process::id()).as_str()) {
+                == Some(format!("stale:{}", std::process::id()).as_str()) && first.tracking_freespace {
                 // Model an FSM hint surviving ahead of page/link WAL. The real
                 // page is still zero; the controller persists just the FSM.
                 pgrx::pg_sys::RecordPageWithFreeSpace(second.raw, second.id, second_space as _);
                 pgrx::pg_sys::FreeSpaceMapVacuumRange(second.raw, second.id, second.id + 1);
                 recovery_probe("stale", first.id, second.id);
             }
-            recovery_probe("before", first.id, second.id);
+            if first.tracking_freespace {
+                recovery_probe("before", first.id, second.id);
+            } else {
+                recovery_probe("vector-before", first.id, second.id);
+            }
 ''' + anchor)
 anchor = '            // The images above are freed by Finish/Abort.'
 assert s.count(anchor) == 1
-s = s.replace(anchor, '            recovery_probe("after", first.id, second.id);\n' + anchor)
+s = s.replace(anchor, '            recovery_probe(if first.tracking_freespace { "after" } else { "vector-after" }, first.id, second.id);\n' + anchor)
 anchor = '            second.record_freespace(second_space);\n        }'
 assert s.count(anchor) == 1
 s = s.replace(anchor, '            second.record_freespace(second_space);\n            recovery_probe("fsm", first.id, second.id);\n        }')
@@ -175,19 +179,25 @@ def vector_ctids(c, idx, blocks=None):
     return sorted(ctids)
 
 
-def graph_chain(c, idx):
-    """Return the vchordg vertex-page chain starting at the meta page."""
-    raw = page(c, idx, 0)
-    special = struct.unpack_from('<H', raw, 16)[0]
-    current = struct.unpack_from('<II', raw, special)[1]
-    pages = []
-    while current != 2**32 - 1:
-        assert current not in pages, 'cycle in graph vertex chain'
-        pages.append(current)
-        raw = page(c, idx, current)
+def graph_chain(c, idx, vectors=False):
+    """Walk vertex pages and, when requested, their vector tapes."""
+    def links(block):
+        raw = page(c, idx, block)
         special = struct.unpack_from('<H', raw, 16)[0]
-        current = struct.unpack_from('<II', raw, special)[0]
-    return pages
+        return struct.unpack_from('<II', raw, special)
+
+    current = links(0)[1]
+    vertices, tapes = [], []
+    while current != 2**32 - 1:
+        assert current not in vertices, 'cycle in graph vertex chain'
+        vertices.append(current)
+        current, vector = links(current)
+        if vectors:
+            while vector != 2**32 - 1:
+                assert vector not in tapes, 'repeated graph vector page'
+                tapes.append(vector)
+                vector = links(vector)[0]
+    return tapes if vectors else vertices
 
 
 def graph_query(c, table):
@@ -312,7 +322,9 @@ try:
             print(stage, mode, 'passed', flush=True)
 
     # Cover both durable paired WAL and an FSM hint surviving without it.
-    for graph_stage in ['after', 'stale']:
+    for graph_stage in ['after', 'stale', 'vector-before', 'vector-after']:
+        vectors = graph_stage.startswith('vector-')
+        durable = graph_stage.endswith('after')
         graph_table, graph_idx = 'graph_recovery', 'graph_recovery_idx'
         with connect() as c:
             c.execute(f'DROP TABLE IF EXISTS {graph_table}')
@@ -323,7 +335,7 @@ try:
                 "SELECT i, array_fill((i::real / 1000), ARRAY[128])::vector "
                 'FROM generate_series(1, 400) i'
             )
-            before = graph_chain(c, graph_idx)
+            before = graph_chain(c, graph_idx, vectors)
             c.execute('CHECKPOINT')
             wal_start = c.execute('SELECT pg_current_wal_insert_lsn()::text').fetchone()[0]
 
@@ -344,9 +356,9 @@ try:
             assert tail in before, (tail, before)
             saved_fsm = None
             with connect() as c:
-                if graph_stage == 'after':
+                if durable:
                     c.execute('SELECT pg_switch_wal()')
-                else:
+                elif graph_stage == 'stale':
                     assert c.execute('SELECT pg_freespace(%s,%s)', (graph_idx, fresh)).fetchone()[0] > 0
                     path = c.execute('SELECT pg_relation_filepath(%s::regclass)', (graph_idx,)).fetchone()[0]
                     count = c.execute("SELECT pg_relation_size(%s::regclass,'fsm')/8192", (graph_idx,)).fetchone()[0]
@@ -370,10 +382,10 @@ try:
         start()
         with connect() as c:
             assert sorted(row[0] for row in c.execute(f'SELECT id FROM {graph_table}')) == list(range(1, 401))
-            chain = graph_chain(c, graph_idx)
-            assert (fresh in chain) == (graph_stage == 'after'), (fresh, before, chain)
+            chain = graph_chain(c, graph_idx, vectors)
+            assert (fresh in chain) == durable, (fresh, before, chain)
             paired_wal = []
-            if graph_stage == 'after':
+            if durable:
                 records = c.execute("SELECT block_ref FROM pg_get_wal_records_info(%s,pg_current_wal_lsn()) WHERE resource_manager='Generic'", (wal_start,)).fetchall()
                 paired_wal = [r[0] for r in records if re.search(rf'blk {tail}\b', r[0] or '') and re.search(rf'blk {fresh}\b', r[0] or '')]
                 assert paired_wal, 'graph initialization/link not found in one WAL record'
@@ -405,7 +417,7 @@ try:
                 assert c.execute('SELECT pg_freespace(%s,%s)', (graph_idx, fresh)).fetchone()[0] == 0
             results.append(dict(
                 stage='vchordg-' + graph_stage, tail=tail, fresh=fresh,
-                vertex_pages_before=before, vertex_pages_after=chain,
+                pages_before=before, pages_after=chain,
                 recovered_rows=400, recovered_ids_match=True, paired_wal=paired_wal,
                 reused_heap_tids=reused, impostors_in_top10=0,
             ))

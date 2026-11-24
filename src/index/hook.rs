@@ -9,7 +9,7 @@
 use pgrx::pg_sys::Expr;
 
 unsafe fn key_is_not_null(root: *mut pgrx::pg_sys::PlannerInfo, mut key: *mut Expr) -> bool {
-    use pgrx::pg_sys::{self, FormData_pg_attribute, NodeTag, SysCacheIdentifier};
+    use pgrx::pg_sys::{self, NodeTag};
     unsafe {
         if root.is_null() || (*root).simple_rte_array.is_null() {
             return false;
@@ -25,21 +25,32 @@ unsafe fn key_is_not_null(root: *mut pgrx::pg_sys::PlannerInfo, mut key: *mut Ex
         if var.varattno <= 0 || varno <= 0 || varno >= i64::from((*root).simple_rel_array_size) {
             return false;
         }
-        let rte = *(*root).simple_rte_array.add(varno as usize);
-        if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
-            return false;
+        #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
+        {
+            let rel = *(*root).simple_rel_array.add(varno as usize);
+            !rel.is_null() && pg_sys::bms_is_member(i32::from(var.varattno), (*rel).notnullattnums)
         }
-        let tp = pg_sys::SearchSysCache2(
-            SysCacheIdentifier::ATTNUM as _,
-            (*rte).relid.into(),
-            var.varattno.into(),
-        );
-        if tp.is_null() {
-            return false;
+        #[cfg(any(feature = "pg15", feature = "pg16"))]
+        {
+            let rte = *(*root).simple_rte_array.add(varno as usize);
+            if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
+                return false;
+            }
+            let tp = pg_sys::SearchSysCache2(
+                pg_sys::SysCacheIdentifier::ATTNUM as _,
+                (*rte).relid.into(),
+                var.varattno.into(),
+            );
+            if tp.is_null() {
+                return false;
+            }
+            let not_null = (*pg_sys::GETSTRUCT!(tp)
+                .get()
+                .cast::<pg_sys::FormData_pg_attribute>())
+            .attnotnull;
+            pg_sys::ReleaseSysCache(tp);
+            not_null
         }
-        let not_null = (*(pg_sys::GETSTRUCT(tp) as *const FormData_pg_attribute)).attnotnull;
-        pg_sys::ReleaseSysCache(tp);
-        not_null
     }
 }
 
@@ -122,9 +133,7 @@ unsafe fn tests_null_key(clause: *mut Expr, key: *mut Expr, negated: bool) -> bo
                     && (test.nulltesttype == pg_sys::NullTestType::IS_NULL) != negated
                     && null_propagates_to_key(key, test.arg)
             }
-            // Only `IS NOT DISTINCT FROM` (`negated == true`) matches NULL keys intentionally;
-            // `IS DISTINCT FROM` (`negated == false`) excludes a vector and should keep the index.
-            NodeTag::T_DistinctExpr if negated => {
+            NodeTag::T_DistinctExpr => {
                 let args = pgrx::PgList::<Expr>::from_pg((*clause.cast::<pg_sys::OpExpr>()).args);
                 let left = args.get_ptr(0).unwrap();
                 let right = args.get_ptr(1).unwrap();
@@ -132,7 +141,7 @@ unsafe fn tests_null_key(clause: *mut Expr, key: *mut Expr, negated: bool) -> bo
                     .into_iter()
                     .any(|(arg, other)| {
                         ((*other).type_ != NodeTag::T_Const
-                            || (*other.cast::<pg_sys::Const>()).constisnull)
+                            || (*other.cast::<pg_sys::Const>()).constisnull == negated)
                             && null_propagates_to_key(key, arg)
                     })
             }

@@ -142,3 +142,18 @@ RESET enable_seqscan;
 
 statement ok
 DROP TABLE vchordg_sphere, vchordg_sphere_c;
+
+statement ok
+CREATE TABLE g_sphere_half (id int, v halfvec(3));
+INSERT INTO g_sphere_half VALUES (1,'[100,100,100]'), (2,'[100,99.9375,99.9375]');
+CREATE INDEX g_sphere_half_idx ON g_sphere_half USING vchordg (v halfvec_l2_ops);
+SET enable_seqscan = off;
+
+query I
+SELECT id FROM g_sphere_half WHERE v <<->> sphere('[100,100,100]'::halfvec, 0.04);
+----
+1
+
+statement ok
+DROP TABLE g_sphere_half;
+RESET enable_seqscan;

@@ -3,12 +3,12 @@
 [![Website: vchord.pgsty.com](https://img.shields.io/badge/Website-vchord.pgsty.com-slategray?style=flat&logo=cilium&logoColor=white)](https://vchord.pgsty.com/)
 [![Docs: vchord](https://img.shields.io/badge/Docs-vchord-slategray?style=flat)](https://vchord.pgsty.com/docs/vchord/)
 [![Catalog: vchord](https://img.shields.io/badge/Catalog-vchord-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](https://pgext.cloud/ext/vchord)
-[![Version: 1.4.0](https://img.shields.io/badge/Version-1.4.0-slategray?style=flat)](docs/release-notes/1.4.0.md)
+[![Version: 1.5.0](https://img.shields.io/badge/Version-1.5.0-slategray?style=flat)](docs/release-notes/1.5.0.md)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-slategray?style=flat&logo=gnu&logoColor=white)](https://github.com/pgsty/vchord/blob/main/LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/pgsty/vchord?style=flat&logo=github&logoColor=black&color=slategray)](https://star-history.com/#pgsty/vchord&Date)
 [![PostgreSQL: 15-19](https://img.shields.io/badge/PostgreSQL-15--19-%233E668F?style=flat&logo=postgresql&logoColor=white&labelColor=3E668F)](#build-from-source)
 
-vchord 1.4.0 provides disk-friendly vector similarity search for PostgreSQL 15–19 on `x86_64` and `aarch64`. It requires the `vector` extension from [pgvector](https://github.com/pgvector/pgvector).
+vchord 1.5.0 provides disk-friendly vector similarity search for PostgreSQL 15–19 on `x86_64` and `aarch64`. It requires the `vector` extension from [pgvector](https://github.com/pgvector/pgvector).
 
 [Documentation](https://vchord.pgsty.com/docs/vchord/) · [Releases](https://github.com/pgsty/vchord/releases) · [Issues](https://github.com/pgsty/vchord/issues)
 
@@ -19,7 +19,7 @@ vchord 1.4.0 provides disk-friendly vector similarity search for PostgreSQL 15�
 - L2, inner-product, cosine, range search, and multi-vector MaxSim operators.
 - `vector`, `halfvec`, and quantized `rabitq4` / `rabitq8` types.
 
-ANN routing can trade small distance errors for speed. On ARM CPUs with FP16 and on x86 CPUs with AVX-512 FP16, `halfvec` L2 centroid selection and graph pruning round differences to `f16` and accumulate in `f32`, retrying in `f32` if a difference overflows. Final reranking, sphere predicates, and the residual-quantization lower bounds that decide reranking order keep `f32` differences and accumulation. Tune probes and search breadth against recall on your own data.
+ANN routing can trade small distance errors for speed. On ARM CPUs with FP16 and on x86 CPUs with AVX-512 FP16, `halfvec` L2 routing, graph pruning, and final ANN reranking round differences to `f16` and accumulate in `f32`, retrying in `f32` if a difference overflows. Residual lower bounds account for this rounding. The SQL sphere predicate computes differences in `f32`. Tune probes and search breadth against recall on your own data.
 
 Combine with [vchord_bm25](https://github.com/pgsty/vchord_bm25) and [pg_tokenizer](https://github.com/pgsty/pg_tokenizer) for hybrid vector and full-text search.
 
@@ -60,14 +60,14 @@ For a query such as `WHERE tenant_id = 42 ORDER BY embedding <-> $1 LIMIT 10`, a
 
 Because further lists are read lazily only after earlier rounds are exhausted, rows from later rounds can be nearer than rows already returned, and RQ ranks candidates using `f32` distances. If strict SQL distance order is required, overfetch in a materialized CTE or subquery and re-sort by the SQL distance operator. Set `vchordrq.max_probes` to cap worst-case expansion on very selective or absent keys (or to `0` to disable expansion beyond the initial probes).
 
-Sphere searches through either ANN index can miss matching rows. PostgreSQL rechecks the strict radius for candidates the index returns. For an exhaustive range query, use `EXPLAIN` to verify that a sequential scan evaluates the sphere predicate on the table. See [issue #29](https://github.com/pgsty/vchord/issues/29).
+Sphere searches through either ANN index can miss matching rows. PostgreSQL rechecks sphere candidates unless an RQ scan with exact filter keys evaluates a single f32 L2 sphere using the same whole-vector reduction as the SQL predicate. For an exhaustive range query, use `EXPLAIN` to verify that a sequential scan evaluates the sphere predicate on the table. See [issue #29](https://github.com/pgsty/vchord/issues/29).
 
 ## Build from Source
 
 Requires PostgreSQL 15–19 development headers, pgvector, Rust 1.100.0+, GNU Make, and matching Clang, libclang, and LLVM tools on `x86_64` or `aarch64`. Built with pgrx 0.20.1.
 
 ```bash
-git clone --branch 1.4.0 --depth 1 https://github.com/pgsty/vchord.git
+git clone --branch 1.5.0 --depth 1 https://github.com/pgsty/vchord.git
 cd vchord
 PG_CONFIG=/path/to/pg_config make build
 sudo make PG_CONFIG=/path/to/pg_config install
@@ -83,7 +83,7 @@ Install the new library and SQL files, restart PostgreSQL, then run in each data
 ALTER EXTENSION vchord UPDATE;
 ```
 
-1.4.0 reads ordinary 1.3.0 RQ indexes and writes the same format (`1001`). Adding filter key columns requires a new RQ index, which uses format `1003`. Before restoring a 1.3.0 binary, remove or replace every keyed index while 1.4.0 is still running, and restore a compatible 1.3.0 extension catalog or database backup. The distribution provides a forward SQL upgrade. PostgreSQL 14 installations must also move to a supported server major. See the [1.4.0 release notes](docs/release-notes/1.4.0.md).
+1.5.0 opens existing 1.4.0 indexes. Ordinary RQ indexes use format `1001` and keyed RQ indexes use `1003`. For a graph that lost recall after an earlier VACUUM removed a bridge, run `REINDEX INDEX CONCURRENTLY index_name`. See the [1.5.0 release notes](docs/release-notes/1.5.0.md) and the [1.4.0 migration notes](docs/release-notes/1.4.0.md).
 
 ## Testing
 

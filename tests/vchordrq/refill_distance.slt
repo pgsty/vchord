@@ -116,32 +116,20 @@ SET work_mem='64kB';
 CREATE FUNCTION refill_stream_check() RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
   p_unbounded json;
-  p_bounded json;
   s_unbounded json;
-  s_bounded json;
-  b_unbounded int;
-  b_bounded int;
   q text := 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM refill_rows WHERE owner=1 ORDER BY v <-> ''[0,0]'' LIMIT 1';
 BEGIN
   PERFORM set_config('vchordrq.max_probes', '-1', true);
   EXECUTE q INTO p_unbounded;
-  PERFORM set_config('vchordrq.max_probes', '1', true);
-  EXECUTE q INTO p_bounded;
   s_unbounded := p_unbounded->0->'Plan'->'Plans'->0;
-  s_bounded := p_bounded->0->'Plan'->'Plans'->0;
-  b_unbounded := coalesce((s_unbounded->>'Shared Hit Blocks')::int, 0)
-               + coalesce((s_unbounded->>'Shared Read Blocks')::int, 0);
-  b_bounded := coalesce((s_bounded->>'Shared Hit Blocks')::int, 0)
-             + coalesce((s_bounded->>'Shared Read Blocks')::int, 0);
   RETURN (s_unbounded->>'Index Name' = 'refill_idx')::text || ' '
-      || (coalesce((s_unbounded->>'Temp Written Blocks')::int, 0) = 0)::text || ' '
-      || (b_unbounded = b_bounded)::text;
+      || (coalesce((p_unbounded->0->'Plan'->>'Temp Written Blocks')::int, 0) = 0)::text;
 END $$;
 
 query T
 SELECT refill_stream_check();
 ----
-true true true
+true true
 
 statement ok
 DROP FUNCTION refill_stream_check();

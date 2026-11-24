@@ -468,12 +468,6 @@ where
         let outs_iter = outs
             .iter()
             .map(|&(Reverse(dis_u), AlwaysEqual((_, u)))| (u, dis_u));
-        // Skip vertex-page and vector-page locks altogether when pruning keeps `u` unchanged.
-        if outs_iter.clone().eq(neighbours_u.iter().copied()) {
-            return Backlink::Done;
-        }
-        // Check `u` is still the selected vertex before taking the vector write lock,
-        // without holding the vertex-page share lock across WAL insertion.
         {
             let vertex_guard = index.read(u.0);
             let Some(vertex_bytes) = vertex_guard.get(u.1) else {
@@ -483,6 +477,9 @@ where
             if vertex_tuple.payload() != payload_u || vertex_tuple.pointers() != pointers_u {
                 return Backlink::Stale;
             }
+        }
+        if outs_iter.clone().eq(neighbours_u.iter().copied()) {
+            return Backlink::Done;
         }
         let updated = update::<R, O>((index, pointers_u), (version, neighbours_u), outs_iter);
         match updated {
@@ -576,7 +573,6 @@ where
                 return Pointer::new((write.id(), i));
             }
             if write.get_opaque().next == u32::MAX {
-                // Populate and WAL-log the new page in one record before linking it.
                 let mut extend = index.extend(
                     Opaque {
                         next: u32::MAX,
@@ -588,8 +584,8 @@ where
                     .alloc(bytes)
                     .expect("implementation: a clear page cannot accommodate a single tuple");
                 let id = extend.id();
-                drop(extend);
                 write.get_opaque_mut().next = id;
+                index.commit_pair(write, extend);
                 return Pointer::new((id, i));
             }
             current = write.get_opaque().next
@@ -616,6 +612,28 @@ mod tests {
         let link = r.read(vertex).get_opaque().link;
         assert!(link != u32::MAX && link != vertex);
     }
+    #[test]
+    fn extended_vector_page_is_published_with_its_tuple() {
+        let r = fixture(false).with_full_page(3);
+        let pointer = append_vector_tuple(&r, 3, &[42; 64]);
+        let (block, slot) = pointer.into_inner();
+        assert_eq!(*r.pairs.borrow(), vec![(3, block)]);
+        assert_eq!(r.read(3).get_opaque().next, block);
+        assert_eq!(r.read(block).get(slot).unwrap(), &[42; 64]);
+    }
+
+    #[test]
+    fn unchanged_backlink_checks_vertex_identity() {
+        let r = fixture(false);
+        let result = backlink::<_, TestOp>(
+            &r,
+            (2, 4, &[1.2]),
+            (&[Pointer::new((2, 1))], (1, 1), NonZero::new(99)),
+            ((1, 99), Distance::from_f32(1.0)),
+        );
+        assert_eq!(result, Backlink::Stale);
+    }
+
     #[test]
     fn backlink_conflicts_must_not_report_success() {
         let r = fixture(true);

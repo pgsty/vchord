@@ -65,6 +65,27 @@ SELECT array_agg(id) FROM (
 ----
 {1,2,3}
 
+statement ok
+CREATE FUNCTION pf_tick(bigint, int) RETURNS bigint LANGUAGE sql VOLATILE AS
+$$ SELECT nextval('pf_seq') $$;
+CREATE AGGREGATE pf_ticks(int) (SFUNC = pf_tick, STYPE = bigint, INITCOND = '0');
+SELECT setval('pf_seq', 1, false);
+
+query I
+SELECT id FROM pf WHERE (SELECT pf_ticks(s.id) FROM pf_side s WHERE s.id=pf.id) > 0
+ORDER BY v <-> '[1,1,1]' LIMIT 1;
+----
+1
+
+query I
+SELECT currval('pf_seq');
+----
+1
+
+statement ok
+DROP AGGREGATE pf_ticks(int);
+DROP FUNCTION pf_tick(bigint, int);
+
 # A non-volatile correlated SubPlan still prefilters inside the index scan
 # (no rejected rows reach the executor's Filter).
 statement ok

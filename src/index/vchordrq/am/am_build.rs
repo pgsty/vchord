@@ -999,6 +999,9 @@ unsafe fn parallel_build(
         k: usize,
     }
     impl MaintainChooser for ChooseSome {
+        fn participants(&self) -> usize {
+            self.n
+        }
         fn choose(&mut self, i: usize) -> bool {
             i % self.n == self.k
         }

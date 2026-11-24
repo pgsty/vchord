@@ -20,8 +20,8 @@ use std::collections::{HashSet, VecDeque};
 use std::hash::Hash;
 use vector::VectorOwned;
 
-/// Deleted vertices an isolated non-start vertex may expand past 2 hops.
-const DEEP_EXPANSION_CAP: usize = 64;
+/// Deleted vertices a non-start vertex with spare degree may expand past 2 hops.
+const DEEP_EXPANSION_CAP: usize = 256;
 
 /// Deleted vertices an isolated start vertex may expand before falling back to
 /// the live-vertex sample collected during the linear page scan.
@@ -190,9 +190,7 @@ where
                             let dis_v = O::distance(vector_u.as_borrowed(), vector_v.as_borrowed());
                             trace.push(((Reverse(dis_v), AlwaysEqual((pointers_v, v))), vector_v));
                         }
-                        // Only expand past 2 hops when 2-hop repair found zero live
-                        // neighbours, with a tight cap; never run unbounded BFS.
-                        if trace.is_empty() && !deleted.is_empty() {
+                        if trace.len() < m as usize && !deleted.is_empty() {
                             let cap = if u == s {
                                 START_EXPANSION_CAP
                             } else {

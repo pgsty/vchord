@@ -42,51 +42,52 @@ fn check_for_interrupts() {
 /// structural exclusion (#32).
 pub const UNUSABLE_PATH_COST: f64 = 1.0e30;
 
-/// Parallel workers for CPU-bound vector index builds.
-///
-/// Uses PostgreSQL's `plan_create_index_workers` for all parallel-safety gates
-/// with `min_parallel_table_scan_size` temporarily zeroed so TOASTed
-/// high-dimensional vector tables whose main heap stays under 8 MB are not
-/// starved to a single worker.
+/// Vector builds size parallel scans by heap blocks and share the keyed sort budget.
 pub(crate) unsafe fn compute_parallel_workers(
     heap_relation: pgrx::pg_sys::Relation,
     index_relation: pgrx::pg_sys::Relation,
 ) -> i32 {
-    struct RestoreScanSize(i32);
-    impl Drop for RestoreScanSize {
-        fn drop(&mut self) {
-            unsafe {
-                pgrx::pg_sys::min_parallel_table_scan_size = self.0;
-            }
-        }
-    }
+    use pgrx::pg_sys::*;
     unsafe {
-        use pgrx::pg_sys::*;
-        let heap_blocks = RelationGetNumberOfBlocksInFork(heap_relation, ForkNumber::MAIN_FORKNUM);
-        if heap_blocks <= 1 {
+        if !IsUnderPostmaster
+            || max_parallel_maintenance_workers == 0
+            || (*(*heap_relation).rd_rel).relpersistence == RELPERSISTENCE_TEMP as std::ffi::c_char
+        {
             return 0;
         }
-        let guard = RestoreScanSize(min_parallel_table_scan_size);
-        min_parallel_table_scan_size = 0;
-        let planned = plan_create_index_workers((*heap_relation).rd_id, (*index_relation).rd_id);
-        drop(guard);
-        if planned == 0 {
-            return 0;
-        }
-        let requested = if !(*heap_relation).rd_options.is_null() {
-            let std_options = (*heap_relation).rd_options.cast::<StdRdOptions>();
-            if (*std_options).parallel_workers >= 0 {
-                std::cmp::min(
-                    (*std_options).parallel_workers,
-                    max_parallel_maintenance_workers,
-                )
-            } else {
-                max_parallel_maintenance_workers
-            }
-        } else {
+        let options = (*heap_relation).rd_options.cast::<StdRdOptions>().as_ref();
+        let requested = options.map_or(-1, |o| o.parallel_workers);
+        let workers = if requested < 0 {
             max_parallel_maintenance_workers
+        } else {
+            requested.min(max_parallel_maintenance_workers)
         };
-        std::cmp::min(requested, (heap_blocks - 1).min(i32::MAX as u32) as i32)
+        let blocks = RelationGetNumberOfBlocksInFork(heap_relation, ForkNumber::MAIN_FORKNUM);
+        let workers = workers.min(blocks.saturating_sub(1).min(i32::MAX as u32) as i32);
+        if workers == 0 {
+            return 0;
+        }
+        let expressions = RelationGetIndexExpressions(index_relation);
+        let predicate = RelationGetIndexPredicate(index_relation);
+        if !expressions.is_null() || !predicate.is_null() {
+            // An index build has no query-level InitPlans or known-safe execution parameters.
+            let mut glob = PlannerGlobal {
+                type_: NodeTag::T_PlannerGlobal,
+                maxParallelHazard: PROPARALLEL_UNSAFE as _,
+                ..Default::default()
+            };
+            let mut root = PlannerInfo {
+                type_: NodeTag::T_PlannerInfo,
+                glob: &raw mut glob,
+                ..Default::default()
+            };
+            if !is_parallel_safe(&raw mut root, expressions.cast())
+                || !is_parallel_safe(&raw mut root, predicate.cast())
+            {
+                return 0;
+            }
+        }
+        workers
     }
 }
 

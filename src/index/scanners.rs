@@ -174,7 +174,7 @@ impl Iterator for NullOrderRows {
                 if let Some(remaining) = &mut self.remaining {
                     *remaining -= 1;
                 }
-                let mut tid = (*self.slot).tts_tid;
+                let mut key = crate::index::fetcher::ctid_to_key((*self.slot).tts_tid);
                 // `index_getnext_slot` rejects heap-only TIDs; map them to their HOT root.
                 if std::ptr::eq(
                     (*self.slot).tts_ops,
@@ -186,8 +186,8 @@ impl Iterator for NullOrderRows {
                         && !(*tuple).t_data.is_null()
                         && ((*(*tuple).t_data).t_infomask2 & pg_sys::HEAP_ONLY_TUPLE as u16) != 0
                     {
-                        let blkno = pg_sys::ItemPointerGetBlockNumber(&tid);
-                        let offnum = pg_sys::ItemPointerGetOffsetNumber(&tid);
+                        let blkno = (u32::from(key[0]) << 16) | u32::from(key[1]);
+                        let offnum = key[2];
                         if self.root_block != Some(blkno) {
                             if self.root_offsets.is_empty() {
                                 self.root_offsets.resize(
@@ -206,11 +206,11 @@ impl Iterator for NullOrderRows {
                         }
                         let root_off = self.root_offsets[(offnum - 1) as usize];
                         if root_off != 0 {
-                            pg_sys::ItemPointerSetOffsetNumber(&mut tid, root_off);
+                            key[2] = root_off;
                         }
                     }
                 }
-                return Some((0.0, crate::index::fetcher::ctid_to_key(tid), true));
+                return Some((0.0, key, true));
             }
         }
     }

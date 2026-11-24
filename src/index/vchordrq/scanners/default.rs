@@ -31,10 +31,10 @@ use vchordrq::{
     Candidates, RerankMethod, TableAhead, default_search, exact_distance, how, rerank_heap,
     rerank_index, unit_distance,
 };
-use vector::VectorOwned;
 use vector::rabitq4::Rabitq4Owned;
 use vector::rabitq8::Rabitq8Owned;
 use vector::vect::VectOwned;
+use vector::{VectorBorrowed, VectorOwned};
 
 pub struct DefaultBuilder {
     opfamily: Opfamily,
@@ -138,32 +138,30 @@ impl SearchBuilder for DefaultBuilder {
             _ => radius,
         });
         let bound = threshold.map(|radius| opfamily.bound(radius));
-        // Recheck all rows for multiple/unbounded spheres or inexact filter keys;
-        // for a single bounding sphere, only recheck near the boundary (and zero-vector
-        // distance 1.0 under cosine) so interior hits skip TOAST detoasting.
         let needs_recheck = has_spheres || filter_inexact;
-        let safe_interior = if filter_inexact || !single_sphere {
-            None
-        } else {
-            raw_radius.filter(|r| r.is_finite()).map(|r| {
-                let (rel, abs) = match opfamily {
-                    Opfamily::HalfvecL2 | Opfamily::HalfvecIp | Opfamily::HalfvecCosine => {
-                        (5e-3_f32, 1e-3_f32)
-                    }
-                    _ => (1e-4_f32, 1e-4_f32),
-                };
-                r - rel * r.abs() - abs
-            })
-        };
-        let is_cosine = opfamily.is_cosine();
         if self.empty {
             return Box::new(std::iter::empty());
         }
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
+        let method = how(index);
+        // A single whole f32 L2 reduction uses the SQL sphere operator's kernel.
+        let exact_radius = match (&vector, opfamily) {
+            (OwnedVector::Vecf32(v), Opfamily::VectorL2)
+                if single_sphere
+                    && !filter_inexact
+                    && (matches!(method, RerankMethod::Heap)
+                        || <VectOwned<f32> as vchordrq::operator::Vector>::count(
+                            v.as_borrowed().dim(),
+                        ) == 1) =>
+            {
+                raw_radius
+            }
+            _ => None,
+        };
         let reranking = RerankOptions {
-            method: how(index),
+            method,
             io: options.io_rerank,
             prefilter: options.prefilter,
             table: options.table,
@@ -291,11 +289,7 @@ impl SearchBuilder for DefaultBuilder {
         Box::new(iter.map(move |(distance, pointer)| {
             let (key, _) = pointer_to_kv(pointer);
             let out = opfamily.output(distance);
-            let recheck = if let Some(limit) = safe_interior {
-                !(out < limit && (!is_cosine || (out - 1.0).abs() > 1e-2))
-            } else {
-                needs_recheck
-            };
+            let recheck = needs_recheck && !exact_radius.is_some_and(|radius| out < radius);
             (out, key, recheck)
         }))
     }

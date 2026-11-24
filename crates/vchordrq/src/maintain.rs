@@ -23,6 +23,9 @@ use std::num::NonZero;
 
 pub trait MaintainChooser {
     fn choose(&mut self, i: usize) -> bool;
+    fn participants(&self) -> usize {
+        1
+    }
     /// Whether a chosen list whose compaction would reproduce its tapes
     /// unchanged may be skipped (VACUUM); parallel build compaction always
     /// rewrites.
@@ -121,6 +124,7 @@ where
     let keyed = !keys.is_empty();
     let summarized = keys.summaries() != 0;
     let exclusive = chooser.is_exclusive();
+    let memory = memory / chooser.participants();
 
     type State = Vec<u32>;
     let mut state: State = vec![meta_tuple.first()];
@@ -558,14 +562,13 @@ where
                 held.in_flight.clear();
                 held.reusable.extend(trace);
             }
+            pending.free_reusable(index, freepages_first, &check);
             check();
         }
     }
 
     if exclusive {
         pending.free_reusable(index, freepages_first, || ());
-    } else {
-        pending.free_reusable(index, freepages_first, &check);
     }
 
     let buffers = RefCell::into_inner(buffers);
@@ -623,12 +626,17 @@ where
     let stop_at = match limit {
         ReadLimit::InitialTail => {
             let guard = index.read(first);
-            let next_id = guard.get_opaque().next;
+            let opaque = *guard.get_opaque();
             drop(guard);
-            if next_id == u32::MAX {
+            if opaque.next == u32::MAX {
                 Some(first)
             } else {
-                Some(tape::by_next(index, next_id).last().expect("a page").id())
+                let hint = if opaque.skip == first {
+                    opaque.next
+                } else {
+                    opaque.skip
+                };
+                Some(tape::by_next(index, hint).last().expect("a page").id())
             }
         }
         ReadLimit::MaxPages(_) | ReadLimit::ToEnd => None,

@@ -683,3 +683,48 @@ where
     }
     (results.into_vec(), estimation_by_threshold)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use index::prefetcher::PlainPrefetcher;
+    use index::test_support::MemoryRelation;
+    use std::cell::Cell;
+
+    #[test]
+    fn rerank_refills_only_after_the_initial_rows_are_consumed() {
+        let index = MemoryRelation::<Opaque>::new([]);
+        let reads = Cell::new(0);
+        let row = |id| {
+            (
+                NonZero::new(id).unwrap(),
+                0,
+                BorrowedIter::from_slice(&[], |_| &[]),
+            )
+        };
+        let mut first = row(1);
+        let mut second = row(2);
+        let candidate = |r| {
+            (
+                (Reverse(Distance::from_f32(0.0)), AlwaysEqual(())),
+                AlwaysEqual(PackedRefMut4(r)),
+            )
+        };
+        let mut later = Some(Heap::from(vec![candidate(&mut second)]));
+        let refill = || {
+            reads.set(reads.get() + 1);
+            later.take()
+        };
+        let candidates = Candidates::new(
+            Heap::from(vec![candidate(&mut first)]),
+            Some(Box::new(refill)),
+        );
+        let mut rows = crate::rerank_heap(PlainPrefetcher::new(&index, candidates), |_| {
+            Some(Distance::from_f32(1.0))
+        });
+        assert_eq!(rows.next().unwrap().1.get(), 1);
+        assert_eq!(reads.get(), 0);
+        assert_eq!(rows.next().unwrap().1.get(), 2);
+        assert_eq!(reads.get(), 1);
+    }
+}

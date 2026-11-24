@@ -689,7 +689,6 @@ unsafe extern "C-unwind" fn planstate_has_volatile(
             | NodeTag::T_Unique
             | NodeTag::T_SetOp
             | NodeTag::T_Group
-            | NodeTag::T_Agg
             | NodeTag::T_Append
             | NodeTag::T_MergeAppend
             | NodeTag::T_Gather

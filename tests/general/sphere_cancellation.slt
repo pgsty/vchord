@@ -1,0 +1,36 @@
+statement ok
+CREATE TABLE sphere_ip_rows (id int, v vector(1024));
+CREATE TABLE sphere_ip_query AS SELECT array_fill(1::real, ARRAY[1024])::vector(1024) AS q;
+INSERT INTO sphere_ip_rows SELECT i, array(
+  SELECT CASE WHEN (j + i) % 4 = 0 THEN 1e12::real
+              WHEN (j + i) % 4 = 2 THEN -1e12::real ELSE 1::real END
+  FROM generate_series(1,1024) j
+)::vector FROM generate_series(1,32) i;
+INSERT INTO sphere_ip_rows SELECT 0, q FROM sphere_ip_query;
+SET enable_seqscan = off;
+CREATE VIEW sphere_ip_hits AS WITH hits AS MATERIALIZED (
+  SELECT r.id, r.v FROM sphere_ip_rows r
+  WHERE r.v <<#>> sphere((SELECT q FROM sphere_ip_query), -1)
+) SELECT count(*) > 0, count(*) FILTER (WHERE NOT (v <<#>> sphere((SELECT q FROM sphere_ip_query), -1))) FROM hits;
+
+statement ok
+CREATE INDEX sphere_ip_rq ON sphere_ip_rows USING vchordrq (v vector_ip_ops);
+
+query TI
+TABLE sphere_ip_hits;
+----
+t 0
+
+statement ok
+DROP INDEX sphere_ip_rq;
+CREATE INDEX sphere_ip_g ON sphere_ip_rows USING vchordg (v vector_ip_ops);
+
+query TI
+TABLE sphere_ip_hits;
+----
+t 0
+
+statement ok
+DROP VIEW sphere_ip_hits;
+DROP TABLE sphere_ip_rows, sphere_ip_query;
+RESET enable_seqscan;

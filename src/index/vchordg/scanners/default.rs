@@ -100,7 +100,6 @@ impl SearchBuilder for DefaultBuilder {
         let mut vector = None;
         let mut raw_radius = None;
         let has_spheres = !self.spheres.is_empty();
-        let single_sphere = self.spheres.len() == 1 && self.spheres[0].is_some();
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
                 vector = Some(orderby_vector);
@@ -129,20 +128,6 @@ impl SearchBuilder for DefaultBuilder {
                 r
             }
         });
-        // Only recheck near the boundary (and zero-vector distance 0.5 under cosine)
-        // for a single bounding sphere so interior hits skip TOAST detoasting.
-        let safe_interior = single_sphere
-            .then_some(raw_radius)
-            .flatten()
-            .filter(|r| r.is_finite())
-            .map(|r| r - rel * r.abs() - abs);
-        let is_cosine = matches!(
-            opfamily,
-            Opfamily::VectorCosine
-                | Opfamily::HalfvecCosine
-                | Opfamily::Rabitq8Cosine
-                | Opfamily::Rabitq4Cosine
-        );
         if self.empty {
             return Box::new(std::iter::empty());
         }
@@ -974,12 +959,7 @@ impl SearchBuilder for DefaultBuilder {
         Box::new(iter.map(move |(distance, pointer)| {
             let (key, _) = pointer_to_kv(pointer);
             let out = opfamily.output(distance);
-            let recheck = if let Some(limit) = safe_interior {
-                !(out < limit && (!is_cosine || (out - 0.5).abs() > 1e-2))
-            } else {
-                has_spheres
-            };
-            (out, key, recheck)
+            (out, key, has_spheres)
         }))
     }
 }
