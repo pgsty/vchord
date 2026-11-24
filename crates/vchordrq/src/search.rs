@@ -21,7 +21,7 @@ use index::fetch::{BorrowedIter, Fetch};
 use index::packed::{PackedRefMut4, PackedRefMut8};
 use index::prefetcher::{Prefetcher, PrefetcherHeapFamily, PrefetcherSequenceFamily, Sequence};
 use index::relation::{Page, Relation, RelationRead, RelationReadTypes};
-use index_accessor::{DefaultWithDimension, FunctionalAccessor, LAccess};
+use index_accessor::{Accessor1, DefaultWithDimension, FunctionalAccessor, LAccess};
 use rabitq::bit::binary::BinaryLut;
 use rabitq::bit::block::BlockLut;
 use std::borrow::Borrow;
@@ -35,7 +35,13 @@ use vector::{VectorBorrowed, VectorOwned};
 
 type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
 
-type List = (Reverse<Distance>, AlwaysEqual<f32>, AlwaysEqual<u32>);
+/// (distance, norm, first, K): K is the centroid while routing ranks, then whether it is skipped.
+type List<K = ()> = (
+    Reverse<Distance>,
+    AlwaysEqual<f32>,
+    AlwaysEqual<u32>,
+    AlwaysEqual<K>,
+);
 
 pub type Candidate<'b> = (
     (Reverse<Distance>, AlwaysEqual<()>),
@@ -76,8 +82,8 @@ struct Searcher<'b, R, O, V, B, H1, H0> {
     _operator: PhantomData<fn() -> O>,
 }
 
-struct Route<I> {
-    lists: Vec<List>,
+struct Route<K, I> {
+    lists: Vec<List<K>>,
     complete: bool,
     /// The other lists of the bottom level, nearest first, if `sorted`.
     rest: I,
@@ -132,13 +138,19 @@ where
                     O::DistanceAccessor::default_with_dimension(dim),
                 ),
             );
-            (Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))
+            (
+                Reverse(distance),
+                AlwaysEqual(norm),
+                AlwaysEqual(first),
+                AlwaysEqual(()),
+            )
         } else {
             // fast path
             (
                 Reverse(Distance::ZERO),
                 AlwaysEqual(norm),
                 AlwaysEqual(first),
+                AlwaysEqual(()),
             )
         };
         drop(meta_guard);
@@ -160,11 +172,13 @@ where
         }
     }
 
-    fn route(
+    fn route<S: Scope<'b, O>>(
         &mut self,
         probes: &[u32],
         sorted: bool,
-    ) -> Route<impl Iterator<Item = List> + use<'b, R, O, V, B, H1, H0>> {
+        scope: &S,
+    ) -> Route<S::Skipped, impl Iterator<Item = List<S::Skipped>> + use<'b, R, O, V, B, H1, H0, S>>
+    {
         let Self {
             ref vector,
             index,
@@ -178,9 +192,9 @@ where
             ref mut prefetch_h1_vectors,
             ..
         } = *self;
-        let mut step = |lists: Vec<List>| {
+        let mut step = |lists: Vec<List<S::Skipped>>| {
             let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
-            for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in lists {
+            for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in lists {
                 let residual =
                     is_residual.then(|| O::routing_residual(&lut.0, dis_f.to_f32(), norm));
                 tape::read_h1_tape::<R, _, _>(
@@ -201,29 +215,41 @@ where
                 );
             }
             let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
-            let mut cache = BinaryHeap::<(_, _, _)>::new();
+            let mut cache = BinaryHeap::<List<S::Centroid>>::new();
             let vector = vector.clone();
+            let mut scope = scope.clone();
             std::iter::from_fn(move || {
                 while let Some((
                     (Reverse(_), AlwaysEqual(&mut (first, norm, head, ..))),
                     prefetch,
                 )) = heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
                 {
-                    let distance = centroids::read::<R, O, _>(
+                    let (distance, centroid) = centroids::read::<R, O, _>(
                         prefetch,
                         head,
-                        LAccess::new(
-                            O::Vector::unpack(vector.borrow().as_borrowed()),
-                            O::DistanceAccessor::default_with_dimension(dim),
+                        (
+                            LAccess::new(
+                                O::Vector::unpack(vector.borrow().as_borrowed()),
+                                O::DistanceAccessor::default_with_dimension(dim),
+                            ),
+                            scope.keep(bump, dim),
                         ),
                     );
-                    cache.push((Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first)));
+                    cache.push((
+                        Reverse(distance),
+                        AlwaysEqual(norm),
+                        AlwaysEqual(first),
+                        AlwaysEqual(centroid),
+                    ));
                 }
-                cache.pop()
+                let (distance, norm, first, AlwaysEqual(centroid)) = cache.pop()?;
+                let skipped = scope.offer(distance.0, centroid);
+                Some((distance, norm, first, AlwaysEqual(skipped)))
             })
         };
         let levels = probes.len();
-        let mut lists = vec![root];
+        let (distance, norm, first, _) = root;
+        let mut lists = vec![(distance, norm, first, AlwaysEqual(S::Skipped::default()))];
         let mut rest = None;
         let mut complete = true;
         for (i, (&probes, &cells)) in
@@ -236,7 +262,7 @@ where
             } else {
                 // fast path
                 let mut results = LinkedVec::new();
-                for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first)) in lists {
+                for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first), _) in lists {
                     tape::read_h1_tape::<R, _, _>(
                         by_next(index, first),
                         || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
@@ -245,6 +271,7 @@ where
                                 Reverse(Distance::ZERO),
                                 AlwaysEqual(norm),
                                 AlwaysEqual(first),
+                                AlwaysEqual(S::Skipped::default()),
                             ));
                         },
                     );
@@ -288,7 +315,7 @@ where
             list: Cell::new(0),
         };
         let mut tuples = 0;
-        for (i, (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first))) in
+        for (i, (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _)) in
             lists.into_iter().enumerate()
         {
             // Between lists nothing is locked (#28).
@@ -381,12 +408,13 @@ where
         Heap::from(results.into_vec())
     }
 
-    /// The rest of [`default_search`], with the bound chosen at compile time.
+    /// The rest of [`default_search`], with what it reads chosen at compile time.
     #[inline(always)]
-    fn search(mut self, params: SearchParams, bound: impl Bound) -> Candidates<'b>
+    fn search<S: Scope<'b, O> + 'b>(mut self, params: SearchParams, scope: S) -> Candidates<'b>
     where
         Self: 'b,
     {
+        let bound = scope.rows();
         let SearchParams {
             mut probes,
             filter,
@@ -397,16 +425,16 @@ where
             lists,
             mut complete,
             rest,
-        } = self.route(&probes, false);
+        } = self.route(&probes, scope.ranks(), &scope);
         let Some(filter) = filter else {
-            return Candidates::new(self.read(lists, (), bound), None);
+            return Candidates::new(self.read(S::unskipped(lists), (), bound), None);
         };
         let max_probes = max_probes.map_or(usize::MAX, |x| x as usize);
         if complete || lists.len() >= max_probes {
-            return Candidates::new(self.read(lists, &filter, bound), None);
+            return Candidates::new(self.read(S::unskipped(lists), &filter, bound), None);
         }
         let mut read = lists.iter().map(|list| list.2.0).collect::<HashSet<_>>();
-        let heap = self.read(lists, &filter, bound);
+        let heap = self.read(S::unskipped(lists), &filter, bound);
         // Below a root alone, routing's ranking of every list gives each round its further lists.
         let mut rest = (probes.len() == 1).then_some(rest);
         let refill = move || {
@@ -418,7 +446,7 @@ where
                     complete = probes[0] >= self.cells[0];
                     rest.take(probes[0] as usize - read.len()).collect()
                 } else {
-                    let route = self.route(&probes, false);
+                    let route = self.route(&probes, scope.ranks(), &scope);
                     complete = route.complete;
                     let mut lists = route.lists;
                     lists.retain(|list| !read.contains(&list.2.0));
@@ -427,7 +455,7 @@ where
                 lists.truncate(max_probes - read.len());
                 read.extend(lists.iter().map(|list| list.2.0));
                 if !lists.is_empty() {
-                    return Some(self.read(lists, &filter, bound));
+                    return Some(self.read(S::unskipped(lists), &filter, bound));
                 }
             }
             None
@@ -597,6 +625,65 @@ impl Bound for Distance {
     }
 }
 
+type Element<O> = <<O as Operator>::Vector as Vector>::Element;
+type Metadata<O> = <<O as Operator>::Vector as Vector>::Metadata;
+
+/// What a search reads of the lists routing offers and of their rows.
+trait Scope<'b, O: Operator>: Clone {
+    type Rows: Bound;
+    /// What routing keeps of a centroid it reads until it offers the list.
+    type Centroid;
+    /// Whether an offered list is skipped.
+    type Skipped: Default;
+
+    fn rows(&self) -> Self::Rows;
+
+    /// Whether routing ranks the lists even where it would read them all.
+    fn ranks(&self) -> bool;
+
+    fn keep(
+        &mut self,
+        bump: &'b impl Bump,
+        dim: u32,
+    ) -> impl Accessor1<Element<O>, Metadata<O>, Output = Self::Centroid>;
+
+    fn offer(&mut self, distance: Distance, centroid: Self::Centroid) -> Self::Skipped;
+
+    fn unskipped(lists: Vec<List<Self::Skipped>>) -> Vec<List>;
+}
+
+impl<'b, O: Operator, B: Bound> Scope<'b, O> for B {
+    type Rows = B;
+    type Centroid = ();
+    type Skipped = ();
+
+    #[inline(always)]
+    fn rows(&self) -> B {
+        *self
+    }
+
+    #[inline(always)]
+    fn ranks(&self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    fn keep(
+        &mut self,
+        _: &'b impl Bump,
+        _: u32,
+    ) -> impl Accessor1<Element<O>, Metadata<O>, Output = ()> {
+    }
+
+    #[inline(always)]
+    fn offer(&mut self, _: Distance, (): ()) {}
+
+    #[inline(always)]
+    fn unskipped(lists: Vec<List>) -> Vec<List> {
+        lists
+    }
+}
+
 /// Candidates past `bound` are dropped; with a filter, refills double the probes to `max_probes`.
 // Inlined into each scanner arm, which compiles the halfvec search to fewer instructions.
 #[inline(always)]
@@ -647,7 +734,7 @@ where
         prefetch_h0_tuples,
     );
     let epsilon = params.epsilon;
-    let Route { lists, rest, .. } = searcher.route(&params.probes, threshold != 0);
+    let Route { lists, rest, .. } = searcher.route(&params.probes, threshold != 0, &());
     let mut results = LinkedVec::<(_, AlwaysEqual<_>)>::new();
     let tuples = searcher.read_lists(
         lists,
@@ -670,7 +757,7 @@ where
     let mut estimation_by_threshold = Distance::NEG_INFINITY;
     // Remaining routing distances only estimate missing MaxSim terms; they are
     // not lower bounds and never reach the reranker.
-    for (Reverse(distance), AlwaysEqual(_), AlwaysEqual(first)) in rest {
+    for (Reverse(distance), AlwaysEqual(_), AlwaysEqual(first), _) in rest {
         if threshold == 0 {
             break;
         }
