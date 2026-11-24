@@ -11,16 +11,19 @@ SET vchordrq.probes='1';
 CREATE VIEW refill_order AS SELECT id FROM refill_rows WHERE owner=1 ORDER BY v <-> '[0,0]';
 CREATE VIEW refill_sphere AS SELECT id FROM refill_rows WHERE owner=1 AND v <<->> sphere('[0,0]'::vector,7);
 
+# Refill streams one round at a time; rows from further lists can be nearer than rows already returned.
 query T
 SELECT ARRAY(TABLE refill_order);
 ----
-{1,6,7,9}
+{1,9,6,7}
 
+# When the initial probes satisfy LIMIT, further lists are not read.
 query T
 SELECT ARRAY(SELECT id FROM refill_order LIMIT 2);
 ----
-{1,6}
+{1,9}
 
+# Out-of-radius rows in an earlier list do not stop refill from reading matching rows in later lists.
 query T
 SELECT ARRAY(SELECT id FROM refill_sphere ORDER BY id);
 ----
@@ -37,7 +40,7 @@ SET vchordrq.max_scan_tuples=2;
 query T
 SELECT ARRAY(TABLE refill_order);
 ----
-{1,6}
+{1,9}
 
 statement ok
 SET vchordrq.max_scan_tuples=0;
@@ -63,6 +66,26 @@ SELECT ARRAY(TABLE refill_sphere);
 
 statement ok
 RESET vchordrq.max_probes;
+BEGIN;
+DECLARE refill_cursor CURSOR FOR SELECT id FROM refill_order;
+
+query I
+FETCH 2 FROM refill_cursor;
+----
+1
+9
+
+query I
+FETCH 2 FROM refill_cursor;
+----
+6
+7
+
+statement ok
+CLOSE refill_cursor;
+COMMIT;
+
+statement ok
 DROP INDEX refill_idx;
 UPDATE refill_centers SET parent=id+2;
 INSERT INTO refill_centers VALUES (3,5,'[0,0]'),(4,5,'[10,0]'),(5,NULL,'[5,0]');
@@ -75,55 +98,54 @@ SET vchordrq.prefilter=on;
 query T
 SELECT ARRAY(SELECT id FROM refill_rows WHERE owner=1 AND id <> 7 ORDER BY v <-> '[0,0]');
 ----
-{1,6,9}
+{1,9,6}
 
 query T
 SELECT ARRAY(SELECT id FROM refill_sphere ORDER BY id);
 ----
 {1,6}
 
+# With default max_probes = -1, LIMIT 1 streams from the initial probes without reading later lists or spilling.
 statement ok
 INSERT INTO refill_rows SELECT 100+i, ARRAY[10+i%5,0]::real[]::vector, 1 FROM generate_series(1,8000) i;
+ANALYZE refill_rows;
+RESET vchordrq.prefilter;
+RESET enable_seqscan;
+RESET enable_sort;
 SET work_mem='64kB';
-CREATE FUNCTION refill_spills() RETURNS boolean LANGUAGE plpgsql AS $$
-DECLARE plan json; scan json;
+CREATE FUNCTION refill_stream_check() RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+  p_unbounded json;
+  p_bounded json;
+  s_unbounded json;
+  s_bounded json;
+  b_unbounded int;
+  b_bounded int;
+  q text := 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM refill_rows WHERE owner=1 ORDER BY v <-> ''[0,0]'' LIMIT 1';
 BEGIN
-  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) SELECT id FROM refill_rows WHERE owner=1 ORDER BY v <-> ''[0,0]'' LIMIT 1' INTO plan;
-  scan := plan->0->'Plan'->'Plans'->0;
-  RETURN scan->>'Index Name' = 'refill_idx' AND (scan->>'Temp Written Blocks')::int > 0;
+  PERFORM set_config('vchordrq.max_probes', '-1', true);
+  EXECUTE q INTO p_unbounded;
+  PERFORM set_config('vchordrq.max_probes', '1', true);
+  EXECUTE q INTO p_bounded;
+  s_unbounded := p_unbounded->0->'Plan'->'Plans'->0;
+  s_bounded := p_bounded->0->'Plan'->'Plans'->0;
+  b_unbounded := coalesce((s_unbounded->>'Shared Hit Blocks')::int, 0)
+               + coalesce((s_unbounded->>'Shared Read Blocks')::int, 0);
+  b_bounded := coalesce((s_bounded->>'Shared Hit Blocks')::int, 0)
+             + coalesce((s_bounded->>'Shared Read Blocks')::int, 0);
+  RETURN (s_unbounded->>'Index Name' = 'refill_idx')::text || ' '
+      || (coalesce((s_unbounded->>'Temp Written Blocks')::int, 0) = 0)::text || ' '
+      || (b_unbounded = b_bounded)::text;
 END $$;
 
 query T
-SELECT refill_spills();
+SELECT refill_stream_check();
 ----
-t
+true true true
 
 statement ok
-BEGIN;
-DECLARE refill_cursor CURSOR FOR SELECT id FROM refill_order;
-
-query I
-FETCH 2 FROM refill_cursor;
-----
-1
-6
-
-query I
-FETCH 2 FROM refill_cursor;
-----
-7
-9
-
-statement ok
-CLOSE refill_cursor;
-COMMIT;
-DROP FUNCTION refill_spills();
+DROP FUNCTION refill_stream_check();
 RESET work_mem;
-
-statement ok
 DROP VIEW refill_order, refill_sphere;
 DROP TABLE refill_centers, refill_rows;
-RESET vchordrq.prefilter;
 RESET vchordrq.probes;
-RESET enable_seqscan;
-RESET enable_sort;

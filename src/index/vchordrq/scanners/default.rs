@@ -28,7 +28,7 @@ use std::rc::Rc;
 use vchordrq::operator::Operator;
 use vchordrq::types::{DistanceKind, OwnedVector, VectorKind};
 use vchordrq::{
-    Candidates, RerankMethod, Table, TableAhead, default_search, exact_distance, how, rerank_heap,
+    Candidates, RerankMethod, TableAhead, default_search, exact_distance, how, rerank_heap,
     rerank_index, unit_distance,
 };
 use vector::VectorOwned;
@@ -104,7 +104,6 @@ impl SearchBuilder for DefaultBuilder {
         // bounds the search.
         let recheck = !self.spheres.is_empty()
             || (options.search.filter.as_ref()).is_some_and(|filter| !filter.exact());
-        let ordered = !self.orderbys.is_empty();
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
                 vector = Some(orderby_vector);
@@ -138,105 +137,104 @@ impl SearchBuilder for DefaultBuilder {
             io: options.io_rerank,
             prefilter: options.prefilter,
             table: options.table,
-        };
-        let finish = Finish {
-            ordered,
             threshold,
-            context: options.scan_context,
-            max_scan_tuples: options.max_scan_tuples,
         };
-        let iter = match (opfamily.vector_kind(), opfamily.distance_kind()) {
-            (VectorKind::Vecf32, DistanceKind::L2S) => {
-                type Op = vchordrq::operator::Op<VectOwned<f32>, L2S>;
-                let unprojected = VectOwned::<f32>::from_owned(vector.clone());
-                let projected = RandomProject::project(unprojected.as_borrowed());
-                let candidates = prefetched!(
-                    index,
-                    options.io_search,
-                    default_search::<_, Op>,
-                    (index, Rc::new(projected), bound, options.search, bump)
-                );
-                finish.rows::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
-            }
-            (VectorKind::Vecf32, DistanceKind::Dot) => {
-                type Op = vchordrq::operator::Op<VectOwned<f32>, Dot>;
-                let unprojected = VectOwned::<f32>::from_owned(vector.clone());
-                let projected = RandomProject::project(unprojected.as_borrowed());
-                let candidates = prefetched!(
-                    index,
-                    options.io_search,
-                    default_search::<_, Op>,
-                    (index, Rc::new(projected), bound, options.search, bump)
-                );
-                finish.rows::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
-            }
-            (VectorKind::Vecf16, DistanceKind::L2S) => {
-                type Op = vchordrq::operator::Op<VectOwned<f16>, L2S>;
-                let unprojected = VectOwned::<f16>::from_owned(vector.clone());
-                let projected = RandomProject::project(unprojected.as_borrowed());
-                let candidates = prefetched!(
-                    index,
-                    options.io_search,
-                    default_search::<_, Op>,
-                    (index, Rc::new(projected), bound, options.search, bump)
-                );
-                finish.rows::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
-            }
-            (VectorKind::Vecf16, DistanceKind::Dot) => {
-                type Op = vchordrq::operator::Op<VectOwned<f16>, Dot>;
-                let unprojected = VectOwned::<f16>::from_owned(vector.clone());
-                let projected = RandomProject::project(unprojected.as_borrowed());
-                let candidates = prefetched!(
-                    index,
-                    options.io_search,
-                    default_search::<_, Op>,
-                    (index, Rc::new(projected), bound, options.search, bump)
-                );
-                finish.rows::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
-            }
-            (VectorKind::Rabitq8, DistanceKind::L2S) => {
-                type Op = vchordrq::operator::Op<Rabitq8Owned, L2S>;
-                let unprojected = Rc::new(Rabitq8Owned::from_owned(vector.clone()));
-                let candidates = prefetched!(
-                    index,
-                    options.io_search,
-                    default_search::<_, Op>,
-                    (index, Rc::clone(&unprojected), bound, options.search, bump)
-                );
-                finish.rows::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
-            }
-            (VectorKind::Rabitq8, DistanceKind::Dot) => {
-                type Op = vchordrq::operator::Op<Rabitq8Owned, Dot>;
-                let unprojected = Rc::new(Rabitq8Owned::from_owned(vector.clone()));
-                let candidates = prefetched!(
-                    index,
-                    options.io_search,
-                    default_search::<_, Op>,
-                    (index, Rc::clone(&unprojected), bound, options.search, bump)
-                );
-                finish.rows::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
-            }
-            (VectorKind::Rabitq4, DistanceKind::L2S) => {
-                type Op = vchordrq::operator::Op<Rabitq4Owned, L2S>;
-                let unprojected = Rc::new(Rabitq4Owned::from_owned(vector.clone()));
-                let candidates = prefetched!(
-                    index,
-                    options.io_search,
-                    default_search::<_, Op>,
-                    (index, Rc::clone(&unprojected), bound, options.search, bump)
-                );
-                finish.rows::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
-            }
-            (VectorKind::Rabitq4, DistanceKind::Dot) => {
-                type Op = vchordrq::operator::Op<Rabitq4Owned, Dot>;
-                let unprojected = Rc::new(Rabitq4Owned::from_owned(vector.clone()));
-                let candidates = prefetched!(
-                    index,
-                    options.io_search,
-                    default_search::<_, Op>,
-                    (index, Rc::clone(&unprojected), bound, options.search, bump)
-                );
-                finish.rows::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+        let iter: Ranked = if options.max_scan_tuples == Some(0) {
+            Box::new(std::iter::empty())
+        } else {
+            match (opfamily.vector_kind(), opfamily.distance_kind()) {
+                (VectorKind::Vecf32, DistanceKind::L2S) => {
+                    type Op = vchordrq::operator::Op<VectOwned<f32>, L2S>;
+                    let unprojected = VectOwned::<f32>::from_owned(vector.clone());
+                    let projected = RandomProject::project(unprojected.as_borrowed());
+                    let candidates = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::new(projected), bound, options.search, bump)
+                    );
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                }
+                (VectorKind::Vecf32, DistanceKind::Dot) => {
+                    type Op = vchordrq::operator::Op<VectOwned<f32>, Dot>;
+                    let unprojected = VectOwned::<f32>::from_owned(vector.clone());
+                    let projected = RandomProject::project(unprojected.as_borrowed());
+                    let candidates = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::new(projected), bound, options.search, bump)
+                    );
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                }
+                (VectorKind::Vecf16, DistanceKind::L2S) => {
+                    type Op = vchordrq::operator::Op<VectOwned<f16>, L2S>;
+                    let unprojected = VectOwned::<f16>::from_owned(vector.clone());
+                    let projected = RandomProject::project(unprojected.as_borrowed());
+                    let candidates = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::new(projected), bound, options.search, bump)
+                    );
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                }
+                (VectorKind::Vecf16, DistanceKind::Dot) => {
+                    type Op = vchordrq::operator::Op<VectOwned<f16>, Dot>;
+                    let unprojected = VectOwned::<f16>::from_owned(vector.clone());
+                    let projected = RandomProject::project(unprojected.as_borrowed());
+                    let candidates = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::new(projected), bound, options.search, bump)
+                    );
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                }
+                (VectorKind::Rabitq8, DistanceKind::L2S) => {
+                    type Op = vchordrq::operator::Op<Rabitq8Owned, L2S>;
+                    let unprojected = Rc::new(Rabitq8Owned::from_owned(vector.clone()));
+                    let candidates = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::clone(&unprojected), bound, options.search, bump)
+                    );
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                }
+                (VectorKind::Rabitq8, DistanceKind::Dot) => {
+                    type Op = vchordrq::operator::Op<Rabitq8Owned, Dot>;
+                    let unprojected = Rc::new(Rabitq8Owned::from_owned(vector.clone()));
+                    let candidates = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::clone(&unprojected), bound, options.search, bump)
+                    );
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                }
+                (VectorKind::Rabitq4, DistanceKind::L2S) => {
+                    type Op = vchordrq::operator::Op<Rabitq4Owned, L2S>;
+                    let unprojected = Rc::new(Rabitq4Owned::from_owned(vector.clone()));
+                    let candidates = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::clone(&unprojected), bound, options.search, bump)
+                    );
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                }
+                (VectorKind::Rabitq4, DistanceKind::Dot) => {
+                    type Op = vchordrq::operator::Op<Rabitq4Owned, Dot>;
+                    let unprojected = Rc::new(Rabitq4Owned::from_owned(vector.clone()));
+                    let candidates = prefetched!(
+                        index,
+                        options.io_search,
+                        default_search::<_, Op>,
+                        (index, Rc::clone(&unprojected), bound, options.search, bump)
+                    );
+                    rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
+                }
             }
         };
         let iter = if let Some(max_scan_tuples) = options.max_scan_tuples {
@@ -275,203 +273,7 @@ struct RerankOptions {
     io: Io,
     prefilter: bool,
     table: TablePrefetch,
-}
-
-struct Finish {
-    ordered: bool,
     threshold: Option<f32>,
-    context: pgrx::pg_sys::MemoryContext,
-    max_scan_tuples: Option<u32>,
-}
-
-impl Finish {
-    fn rows<'b, R, O>(
-        self,
-        index: &'b R,
-        search: vchordrq::Search<'b>,
-        vector: impl Borrow<O::Vector> + 'b,
-        options: RerankOptions,
-        mut fetcher: impl Fetcher + 'b,
-        opfamily: Opfamily,
-    ) -> Ranked<'b>
-    where
-        R: RelationRead + RelationPrefetch + RelationReadStream,
-        R::Page: Page<Opaque = vchordrq::Opaque>,
-        O: Operator,
-        O::Vector: FromOwned,
-    {
-        if self.max_scan_tuples == Some(0) {
-            return Box::new(std::iter::empty());
-        }
-        // `<=`: the index's distance may round up to the radius where the operator's is under it.
-        let within = move |(distance, _): &(Distance, NonZero<u64>)| {
-            self.threshold
-                .is_none_or(|r| opfamily.output(*distance) <= r)
-        };
-        match search {
-            vchordrq::Search::Single(candidates) => {
-                let rows = rerank::<_, O>(index, candidates, vector, options, fetcher, opfamily);
-                if self.threshold.is_some() {
-                    Box::new(rows.take_while(within))
-                } else {
-                    rows
-                }
-            }
-            vchordrq::Search::Refill(mut refill) => {
-                let mut scratch = bumpalo::Bump::new();
-                if self.ordered {
-                    let mut sorted = unsafe { SortedRows::new(self.context, self.max_scan_tuples) };
-                    let mut fill_options = options;
-                    if matches!(options.method, RerankMethod::Index) {
-                        fill_options.table.disable();
-                    }
-                    while let Some(candidates) = refill(&scratch) {
-                        let rows = rerank::<_, O>(
-                            index,
-                            candidates,
-                            vector.borrow(),
-                            fill_options,
-                            &mut fetcher,
-                            opfamily,
-                        );
-                        for (distance, payload) in rows.filter(within) {
-                            sorted.push(distance, payload);
-                        }
-                        scratch.reset();
-                    }
-                    unsafe {
-                        pgrx::pg_sys::tuplesort_performsort(sorted.sort);
-                    }
-                    let mut table = options.table;
-                    if matches!(options.io, Io::Plain) || table.window() == 0 {
-                        return Box::new(sorted);
-                    }
-                    let limit = self.max_scan_tuples.map_or(usize::MAX, |n| n as usize);
-                    let mut rows = sorted.take(limit).peekable();
-                    Box::new(std::iter::from_fn(move || {
-                        let row = rows.next()?;
-                        if let Some(&(_, payload)) = rows.peek() {
-                            table.prefetch(payload);
-                        }
-                        Some(row)
-                    }))
-                } else {
-                    let mut rows = Vec::new().into_iter();
-                    Box::new(std::iter::from_fn(move || {
-                        loop {
-                            if let Some(row) = rows.next() {
-                                return Some(row);
-                            }
-                            scratch.reset();
-                            let candidates = refill(&scratch)?;
-                            let list = rerank::<_, O>(
-                                index,
-                                candidates,
-                                vector.borrow(),
-                                options,
-                                &mut fetcher,
-                                opfamily,
-                            );
-                            rows = list.filter(within).collect::<Vec<_>>().into_iter();
-                        }
-                    }))
-                }
-            }
-        }
-    }
-}
-
-struct SortedRows {
-    sort: *mut pgrx::pg_sys::Tuplesortstate,
-    slot: *mut pgrx::pg_sys::TupleTableSlot,
-    desc: pgrx::pg_sys::TupleDesc,
-}
-
-impl SortedRows {
-    unsafe fn new(context: pgrx::pg_sys::MemoryContext, bound: Option<u32>) -> Self {
-        use pgrx::pg_sys;
-        use std::ptr::{null, null_mut};
-        unsafe {
-            let _switch = crate::index::MemoryContextSwitch::new(context);
-            let desc = pg_sys::CreateTemplateTupleDesc(2);
-            pg_sys::TupleDescInitEntry(desc, 1, null(), pg_sys::FLOAT4OID, -1, 0);
-            pg_sys::TupleDescInitEntry(desc, 2, null(), pg_sys::INT8OID, -1, 0);
-            #[cfg(feature = "pg19")]
-            pg_sys::TupleDescFinalize(desc);
-            let slot =
-                pg_sys::MakeSingleTupleTableSlot(desc, &raw const pg_sys::TTSOpsMinimalTuple);
-            let float = pg_sys::lookup_type_cache(pg_sys::FLOAT4OID, pg_sys::TYPECACHE_LT_OPR as _);
-            let sort = pg_sys::tuplesort_begin_heap(
-                desc,
-                2,
-                [1, 2].as_mut_ptr(),
-                [(*float).lt_opr, pg_sys::Oid::from(pg_sys::Int8LessOperator)].as_mut_ptr(),
-                [pg_sys::InvalidOid; 2].as_mut_ptr(),
-                [false; 2].as_mut_ptr(),
-                pg_sys::work_mem,
-                null_mut(),
-                pg_sys::TUPLESORT_ALLOWBOUNDED as _,
-            );
-            if let Some(bound) = bound {
-                pg_sys::tuplesort_set_bound(sort, bound.into());
-            }
-            Self { sort, slot, desc }
-        }
-    }
-
-    fn push(&mut self, distance: Distance, payload: NonZero<u64>) {
-        use pgrx::pg_sys;
-        unsafe {
-            pg_sys::ExecClearTuple(self.slot);
-            (*self.slot)
-                .tts_values
-                .write(pg_sys::Datum::from(distance.to_f32().to_bits()));
-            (*self.slot)
-                .tts_values
-                .add(1)
-                .write(pg_sys::Datum::from(payload.get()));
-            (*self.slot).tts_isnull.write(false);
-            (*self.slot).tts_isnull.add(1).write(false);
-            pg_sys::ExecStoreVirtualTuple(self.slot);
-            pg_sys::tuplesort_puttupleslot(self.sort, self.slot);
-        }
-    }
-}
-
-impl Iterator for SortedRows {
-    type Item = (Distance, NonZero<u64>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        use pgrx::pg_sys;
-        unsafe {
-            if !pg_sys::tuplesort_gettupleslot(
-                self.sort,
-                true,
-                false,
-                self.slot,
-                std::ptr::null_mut(),
-            ) {
-                return None;
-            }
-            pg_sys::slot_getallattrs(self.slot);
-            let values = (*self.slot).tts_values;
-            let distance = f32::from_bits((*values).value() as u32);
-            let payload = NonZero::new((*values.add(1)).value() as u64).unwrap();
-            Some((Distance::from_f32(distance), payload))
-        }
-    }
-}
-
-impl Drop for SortedRows {
-    fn drop(&mut self) {
-        if crate::index::cleanup::pg_cleanup_allowed() {
-            unsafe {
-                pgrx::pg_sys::ExecDropSingleTupleTableSlot(self.slot);
-                pgrx::pg_sys::tuplesort_end(self.sort);
-                pgrx::pg_sys::FreeTupleDesc(self.desc);
-            }
-        }
-    }
 }
 
 /// The table rerank of `rerank`, with `d` the distance from the query to a row's vector.
@@ -534,9 +336,10 @@ where
     O: Operator,
     O::Vector: FromOwned,
 {
-    if let RerankMethod::Heap = options.method {
+    let can_refill = candidates.can_refill();
+    let rows: Ranked = if let RerankMethod::Heap = options.method {
         let reranking = (options.io, options.prefilter, options.table);
-        return if opfamily.is_cosine() {
+        if opfamily.is_cosine() {
             rerank_table::<_, O, _>(
                 index,
                 candidates,
@@ -554,49 +357,62 @@ where
                 fetcher,
                 exact_distance::<O>,
             )
-        };
-    }
-    let predicate = id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
-        let (key, _) = pointer_to_kv(*pointer);
-        let Some(mut tuple) = fetcher.fetch(key) else {
-            return false;
-        };
-        tuple.filter()
-    });
-    let hints = Hints::default().full(false);
-    match (options.io, options.prefilter) {
-        (Io::Plain, false) => {
-            let prefetcher = PlainPrefetcher::new(index, candidates);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
         }
-        (Io::Plain, true) => {
-            let prefetcher = PlainPrefetcher::new(index, filter(candidates, predicate));
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
+    } else {
+        let predicate = id_0(move |(_, AlwaysEqual(PackedRefMut4((pointer, _, _))))| {
+            let (key, _) = pointer_to_kv(*pointer);
+            let Some(mut tuple) = fetcher.fetch(key) else {
+                return false;
+            };
+            tuple.filter()
+        });
+        let hints = Hints::default().full(false);
+        match (options.io, options.prefilter) {
+            (Io::Plain, false) => {
+                let prefetcher = PlainPrefetcher::new(index, candidates);
+                Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
+            }
+            (Io::Plain, true) => {
+                let prefetcher = PlainPrefetcher::new(index, filter(candidates, predicate));
+                Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
+            }
+            (Io::Simple, false) => {
+                let prefetcher = SimplePrefetcher::new(index, candidates);
+                Box::new(rerank_index::<O, _, _, _>(
+                    vector,
+                    prefetcher,
+                    options.table,
+                ))
+            }
+            (Io::Simple, true) => {
+                let prefetcher = SimplePrefetcher::new(index, filter(candidates, predicate));
+                Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
+            }
+            (Io::Stream, false) => {
+                let prefetcher = StreamPrefetcher::new(index, candidates, hints);
+                Box::new(rerank_index::<O, _, _, _>(
+                    vector,
+                    prefetcher,
+                    options.table,
+                ))
+            }
+            (Io::Stream, true) => {
+                let prefetcher = StreamPrefetcher::new(index, filter(candidates, predicate), hints);
+                Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
+            }
         }
-        (Io::Simple, false) => {
-            let prefetcher = SimplePrefetcher::new(index, candidates);
-            Box::new(rerank_index::<O, _, _, _>(
-                vector,
-                prefetcher,
-                options.table,
-            ))
-        }
-        (Io::Simple, true) => {
-            let prefetcher = SimplePrefetcher::new(index, filter(candidates, predicate));
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
-        }
-        (Io::Stream, false) => {
-            let prefetcher = StreamPrefetcher::new(index, candidates, hints);
-            Box::new(rerank_index::<O, _, _, _>(
-                vector,
-                prefetcher,
-                options.table,
-            ))
-        }
-        (Io::Stream, true) => {
-            let prefetcher = StreamPrefetcher::new(index, filter(candidates, predicate), hints);
-            Box::new(rerank_index::<O, _, _, _>(vector, prefetcher, ()))
-        }
+    };
+    let Some(threshold) = options.threshold else {
+        return rows;
+    };
+    // `<=`: the index's distance may round up to the radius where the operator's is under it.
+    let within =
+        move |&(distance, _): &(Distance, NonZero<u64>)| opfamily.output(distance) <= threshold;
+    if can_refill {
+        // Out-of-radius rows in one round must not end the scan before further lists are read.
+        Box::new(rows.filter(within))
+    } else {
+        Box::new(rows.take_while(within))
     }
 }
 

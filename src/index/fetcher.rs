@@ -28,17 +28,6 @@ pub trait Fetcher {
     fn fetch(&mut self, key: [u16; 3]) -> Option<Self::Tuple<'_>>;
 }
 
-impl<F: Fetcher> Fetcher for &mut F {
-    type Tuple<'a>
-        = F::Tuple<'a>
-    where
-        Self: 'a;
-
-    fn fetch(&mut self, key: [u16; 3]) -> Option<Self::Tuple<'_>> {
-        (**self).fetch(key)
-    }
-}
-
 impl<T: Fetcher, F: FnOnce() -> T> Fetcher for LazyCell<T, F> {
     type Tuple<'a>
         = T::Tuple<'a>
@@ -248,10 +237,6 @@ pub struct TablePrefetch {
 }
 
 impl TablePrefetch {
-    pub fn disable(&mut self) {
-        self.window = 0;
-    }
-
     /// Reads ahead by the tablespace's `effective_io_concurrency`, for a heap table only.
     pub unsafe fn new(scan: pgrx::pg_sys::IndexScanDesc) -> Self {
         unsafe {

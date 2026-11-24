@@ -445,25 +445,41 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 .zip(cost.cells.iter().rev().skip(1))
                 .map(|(&probe, &cells)| f64::from(probe) / f64::from(cells.max(1)))
                 .fold(1.0, f64::min);
-            let probe_limit = gucs::vchordrq_max_probes()
-                .unwrap_or(cost.cells[0])
-                .min(cost.cells[0]);
-            let ordered_refill = key_selectivity.is_some()
-                && !(*path).indexorderbys.is_null()
-                && f64::from(probe_limit) > (initial_share * f64::from(cost.cells[0])).round();
+            let initial_lists = (initial_share * f64::from(cost.cells[0])).max(1.0);
+            let probe_limit = f64::from(
+                gucs::vchordrq_max_probes()
+                    .unwrap_or(cost.cells[0])
+                    .min(cost.cells[0]),
+            );
+            let can_refill = key_selectivity.is_some() && probe_limit > initial_lists.round();
             let key_selectivity = key_selectivity.unwrap_or(1.0).clamp(1e-9, 1.0);
-            let candidates = if ordered_refill {
-                (*index_opt_info).tuples * f64::from(probe_limit) / f64::from(cost.cells[0].max(1))
-                    * key_selectivity
+            let initial_candidates = node_count * key_selectivity;
+            let max_candidates = if can_refill {
+                ((*index_opt_info).tuples * probe_limit / f64::from(cost.cells[0].max(1))
+                    * key_selectivity)
+                    .max(initial_candidates)
             } else {
-                node_count * key_selectivity
+                initial_candidates
             };
             let filter_selectivity = (filter_selectivity / key_selectivity).clamp(1e-9, 1.0);
             // The scan cannot process more candidates than the configured IVF
             // budget, even for very selective filters or an unbounded query.
             let next_count = limit_tuples
-                .map(|limit| (limit * f64::min(1000.0, 1.0 / filter_selectivity)).min(candidates))
-                .unwrap_or(candidates);
+                .map(|limit| {
+                    (limit * f64::min(1000.0, 1.0 / filter_selectivity)).min(max_candidates)
+                })
+                .unwrap_or(max_candidates);
+            // Lazy refill expands past the initial probes only when they do not suffice.
+            let extra_lists = if can_refill && next_count > initial_candidates {
+                let scale = if initial_candidates > 0.0 {
+                    next_count / initial_candidates
+                } else {
+                    probe_limit / initial_lists
+                };
+                ((scale - 1.0) * initial_lists).clamp(0.0, (probe_limit - initial_lists).max(0.0))
+            } else {
+                0.0
+            };
             let full_path_count = next_count / limit_fraction;
             let scan_selectivity = if total_rows > 0.0 {
                 (full_path_count / total_rows).clamp(1e-9, 1.0)
@@ -471,13 +487,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 1.0
             };
             *index_startup_cost = 0.001 * node_count;
-            if ordered_refill {
-                let retained = gucs::vchordrq_max_scan_tuples()
-                    .map_or(candidates, |n| candidates.min(n.into()));
-                *index_startup_cost += candidates
-                    * (1.0 + 2.0 * pgrx::pg_sys::cpu_operator_cost * retained.max(2.0).log2());
-            }
-            *index_total_cost = *index_startup_cost + full_path_count;
+            *index_total_cost = *index_startup_cost + (next_count + extra_lists) / limit_fraction;
             *index_selectivity = scan_selectivity;
             *index_correlation = 0.0;
             *index_pages = page_count;
@@ -752,7 +762,6 @@ pub unsafe extern "C-unwind" fn amrescan(
             }
         }
         let options = SearchOptions {
-            scan_context: pgrx::pg_sys::GetMemoryChunkContext(scan.cast()),
             search: SearchParams {
                 probes,
                 epsilon: gucs::vchordrq_epsilon((*scan).indexRelation),

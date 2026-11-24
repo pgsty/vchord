@@ -48,7 +48,6 @@ pub use maxsim::MaxsimBuilder;
 #[derive(Debug)]
 pub struct SearchOptions {
     pub search: vchordrq::SearchParams,
-    pub scan_context: pgrx::pg_sys::MemoryContext,
     pub max_scan_tuples: Option<u32>,
     pub maxsim_refine: u32,
     pub maxsim_threshold: u32,

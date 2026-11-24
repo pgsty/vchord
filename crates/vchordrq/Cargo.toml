@@ -13,7 +13,6 @@ rabitq = { path = "../rabitq" }
 simd = { path = "../simd" }
 vector = { path = "../vector" }
 
-bumpalo.workspace = true
 dary_heap.workspace = true
 serde.workspace = true
 validator.workspace = true
