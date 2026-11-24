@@ -1,6 +1,6 @@
 # AGENTS.md
 
-vchord is a PostgreSQL extension for vector search, written in Rust on pgrx. It provides two index access methods on pgvector's types: `vchordrq` (IVF lists with RaBitQ codes and a rerank) and `vchordg` (graph). Supported PostgreSQL majors, architectures and toolchain versions are in `README.md` and `Cargo.toml`; read them there instead of assuming.
+vchord is a PostgreSQL extension for fast, disk-friendly approximate nearest-neighbor (ANN) vector search, written in Rust on pgrx. Its core value is serving as a much faster, lower-I/O drop-in upgrade over pgvector's built-in indexes on pgvector's types, providing two index access methods: `vchordrq` (IVF lists with RaBitQ codes and a rerank) and `vchordg` (graph). Supported PostgreSQL majors, architectures and toolchain versions are in `README.md` and `Cargo.toml`; read them there instead of assuming.
 
 ## Layout
 
@@ -42,7 +42,7 @@ When you report a change as checked, say which of these ran, on which PostgreSQL
 ## Design rules
 
 1. **The index exists to skip work.** The work of a scan should follow the rows it returns, not the rows that exist. `LIMIT`, a sphere radius and a filter key are there to bound lists read, rows reranked and table rows fetched. A change that makes a scan's cost grow with the table or with a filter's row count, by default, needs a maintainer's explicit decision.
-2. **Approximate by design.** Recall, the order of near-equal rows and short pages under a selective filter are properties to measure and document. Do not remove one by reading everything unless that is the decision in rule 1.
+2. **Approximate by design; keep correctness proportional.** ANN retrieval is inherently approximate, and high-throughput, low-latency search is this project's foundation. Never compromise PostgreSQL's hard safety invariants (crash/WAL recovery, MVCC/HOT visibility, memory/ResourceOwner safety, index integrity). By contrast, recall, near-tie distance order, relaxed cross-round order during filtered expansion, short pages under selective filters and approximate sphere bounds are properties to measure and document—not SQL invariants to "fix" by reading every list, reranking every matching row, spilling to sort or breaking streaming. Callers who need strict SQL order or exhaustive matching can overfetch and re-sort in SQL or use a sequential/B-tree scan.
 3. **Changes to defaults and to the scan, rerank, build or cost paths come with numbers.** Old against new, on real embeddings, across filter selectivities, limits and both rerank layouts: lists read, rows reranked, blocks per relation, instructions, recall. Synthetic data is for correctness tests only.
 4. **Counts first, then timings, then the cause.** Counts are what the design determines. A timing difference is reported with its cause from a profile, not from arithmetic on medians. Say what was measured and what was read from source.
 5. **One implementation.** Judge a change by the final state of the code, not the size of the diff. When a feature needs a variant of an existing path, restructure so both share it; refactoring is welcome. No parallel copies, no parameters appended to long signatures: group them in a type. `#[inline]` and `#[inline(always)]` on hot paths are fine.
