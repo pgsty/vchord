@@ -28,7 +28,7 @@ dependencies = [
 
 [[package]]
 name = "always_equal"
-version = "1.4.0"
+version = "1.5.0"
 
 [[package]]
 name = "anes"
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "distance"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "zerocopy",
 ]
@@ -541,7 +541,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "feistel"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "rand",
  "wyhash",
@@ -809,7 +809,7 @@ checksum = "964de6e86d545b246d84badc0fef527924ace5134f30641c203ef52ba83f58d5"
 
 [[package]]
 name = "index"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "always_equal",
  "bumpalo",
@@ -820,7 +820,7 @@ dependencies = [
 
 [[package]]
 name = "index_accessor"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "distance",
  "rabitq",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "k_means"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "always_equal",
  "distance",
@@ -1277,7 +1277,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rabitq"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "rand",
  "rand_chacha",
@@ -1547,7 +1547,7 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "simd"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "cc",
  "criterion",
@@ -1566,7 +1566,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "simd_macros"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1587,7 +1587,7 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "small_iter"
-version = "1.4.0"
+version = "1.5.0"
 
 [[package]]
 name = "smallvec"
@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "vchord"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "always_equal",
  "arrayvec",
@@ -1869,7 +1869,7 @@ dependencies = [
 
 [[package]]
 name = "vchordg"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "always_equal",
  "bumpalo",
@@ -1888,7 +1888,7 @@ dependencies = [
 
 [[package]]
 name = "vchordrq"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "always_equal",
  "dary_heap",
@@ -1912,7 +1912,7 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 
 [[package]]
 name = "vector"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "distance",
  "rabitq",
@@ -2140,7 +2140,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "clap",
  "object",
