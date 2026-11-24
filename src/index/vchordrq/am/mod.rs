@@ -439,7 +439,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
                 .unwrap_or(1.0);
             // Only rows the keys select become candidates.
             let keys = FilterKeys::of_index(relation.raw()).keys;
-            let key_selectivity = filter_key_selectivity(root, path, keys);
+            let key_selectivity = filter_key_selectivity(root, path, &keys);
             let initial_share = probes
                 .iter()
                 .zip(cost.cells.iter().rev().skip(1))
@@ -575,8 +575,11 @@ pub unsafe extern "C-unwind" fn aminsert(
     let datum = unsafe { (!is_null.add(0).read()).then_some(values.add(0).read()) };
     let ctid = unsafe { heap_tid.read() };
     if let Some(store) = unsafe { datum.and_then(|x| opfamily.store(x)) } {
-        let keys = unsafe { FilterKeys::of_index(index_relation) };
-        let columns = unsafe { keys.row(values, is_null) };
+        let columns = if unsafe { (*(*index_relation).rd_index).indnkeyatts } > 1 {
+            unsafe { FilterKeys::of_index(index_relation).row(values, is_null) }
+        } else {
+            Vec::new()
+        };
         for (vector, extra) in store {
             let key = ctid_to_key(ctid);
             let payload = kv_to_pointer((key, extra));
@@ -855,7 +858,7 @@ pub unsafe extern "C-unwind" fn amrescan(
                     Some(set) => set.intersect(&accepted),
                 });
             }
-            vchordrq::keys::KeyFilter::new(filter_keys.keys, sets)
+            vchordrq::keys::KeyFilter::new(&filter_keys.keys, sets)
         });
         if null_vector || matches!(filter, Some(None)) {
             return;

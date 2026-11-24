@@ -243,20 +243,20 @@ pub unsafe fn of_options(index_relation: pg_sys::Relation, zone_maps: usize) -> 
     }))
 }
 
-pub struct FilterKeys<'a> {
-    pub keys: &'a Keys,
+pub struct FilterKeys {
+    pub keys: Keys,
     index_relation: pg_sys::Relation,
 }
 
-impl<'a> FilterKeys<'a> {
-    pub fn new(index_relation: pg_sys::Relation, keys: &'a Keys) -> Self {
+impl FilterKeys {
+    pub fn new(index_relation: pg_sys::Relation, keys: Keys) -> Self {
         Self {
             keys,
             index_relation,
         }
     }
 
-    /// The keys are decoded once per relation cache entry, into `rd_amcache`.
+    /// Relcache invalidation can free `rd_amcache` on the next catalog access.
     pub unsafe fn of_index(index_relation: pg_sys::Relation) -> Self {
         unsafe {
             if (*index_relation).rd_amcache.is_null() {
@@ -276,7 +276,7 @@ impl<'a> FilterKeys<'a> {
                 (*index_relation).rd_amcache = memory;
             }
             Self {
-                keys: &*(*index_relation).rd_amcache.cast::<Keys>(),
+                keys: (*index_relation).rd_amcache.cast::<Keys>().read(),
                 index_relation,
             }
         }

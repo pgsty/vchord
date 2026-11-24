@@ -1148,7 +1148,7 @@ unsafe fn sequential_build(
     let cached = VchordrqCachedReader::deserialize_ref(vchordrqcached);
 
     let opfamily = unsafe { opfamily(index_relation) };
-    let keys = FilterKeys::new(index_relation, keys);
+    let keys = FilterKeys::new(index_relation, *keys);
     let traverser = unsafe {
         HeapTraverser::new(
             heap_relation,
