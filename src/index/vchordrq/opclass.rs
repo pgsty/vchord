@@ -293,6 +293,25 @@ impl Opfamily {
             | Self::Rabitq4Maxsim => x.to_f32(),
         }
     }
+    /// What a sphere of `radius` reaches between the lists of a vector or halfvec index.
+    pub fn reach(self, radius: f32) -> Option<f32> {
+        match self {
+            Self::VectorL2 | Self::HalfvecL2 => vchordrq::Ball::reach_l2(radius),
+            Self::VectorCosine | Self::HalfvecCosine => vchordrq::Ball::reach_cosine(radius),
+            Self::VectorIp
+            | Self::HalfvecIp
+            | Self::VectorMaxsim
+            | Self::HalfvecMaxsim
+            | Self::Rabitq8L2
+            | Self::Rabitq8Ip
+            | Self::Rabitq8Cosine
+            | Self::Rabitq8Maxsim
+            | Self::Rabitq4L2
+            | Self::Rabitq4Ip
+            | Self::Rabitq4Cosine
+            | Self::Rabitq4Maxsim => None,
+        }
+    }
     /// The inverse of [`Self::output`] at a sphere's radius, rounded up.
     pub fn bound(self, radius: f32) -> Distance {
         match self {

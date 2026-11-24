@@ -95,6 +95,13 @@ pub trait Vector: VectorOwned {
 
     fn pack(dim: u32, elements: Vec<Self::Element>, metadata: Self::Metadata) -> Self;
 
+    /// The inverse of [`Self::unpack`].
+    fn borrowed(
+        dim: u32,
+        elements: &[Self::Element],
+        metadata: Self::Metadata,
+    ) -> Self::Borrowed<'_>;
+
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut;
 
     fn preprocess(vector: Self::Borrowed<'_>) -> (BlockLut, BinaryLut);
@@ -137,6 +144,10 @@ impl Vector for VectOwned<f32> {
 
     fn pack(_: u32, elements: Vec<Self::Element>, (): Self::Metadata) -> Self {
         VectOwned::new(elements)
+    }
+
+    fn borrowed(_: u32, elements: &[Self::Element], (): Self::Metadata) -> Self::Borrowed<'_> {
+        VectBorrowed::new(elements)
     }
 
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut {
@@ -189,6 +200,10 @@ impl Vector for VectOwned<f16> {
 
     fn pack(_: u32, elements: Vec<Self::Element>, (): Self::Metadata) -> Self {
         VectOwned::new(elements)
+    }
+
+    fn borrowed(_: u32, elements: &[Self::Element], (): Self::Metadata) -> Self::Borrowed<'_> {
+        VectBorrowed::new(elements)
     }
 
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut {
@@ -253,6 +268,14 @@ impl Vector for Rabitq8Owned {
 
     fn pack(dim: u32, elements: Vec<Self::Element>, [_0, _1, _2, _3]: Self::Metadata) -> Self {
         Rabitq8Owned::new(dim, _0, _1, _2, _3, elements)
+    }
+
+    fn borrowed(
+        dim: u32,
+        elements: &[Self::Element],
+        [_0, _1, _2, _3]: Self::Metadata,
+    ) -> Self::Borrowed<'_> {
+        Rabitq8Borrowed::new(dim, _0, _1, _2, _3, elements)
     }
 
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut {
@@ -350,6 +373,14 @@ impl Vector for Rabitq4Owned {
 
     fn pack(dim: u32, elements: Vec<Self::Element>, [_0, _1, _2, _3]: Self::Metadata) -> Self {
         Rabitq4Owned::new(dim, _0, _1, _2, _3, elements)
+    }
+
+    fn borrowed(
+        dim: u32,
+        elements: &[Self::Element],
+        [_0, _1, _2, _3]: Self::Metadata,
+    ) -> Self::Borrowed<'_> {
+        Rabitq4Borrowed::new(dim, _0, _1, _2, _3, elements)
     }
 
     fn block_preprocess(vector: Self::Borrowed<'_>) -> BlockLut {

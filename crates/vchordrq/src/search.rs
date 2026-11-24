@@ -55,6 +55,9 @@ pub type MaxsimCandidate<'b> = (
 
 type Refill<'b> = Box<dyn FnMut() -> Option<Heap<Candidate<'b>>> + 'b>;
 
+/// The nearest centroids whose planes bound the lists beyond them.
+const NEAREST: usize = 4;
+
 #[derive(Debug)]
 pub struct SearchParams {
     pub probes: Vec<u32>,
@@ -625,10 +628,32 @@ impl Bound for Distance {
     }
 }
 
+/// A sphere around the search vector.
+#[derive(Debug, Clone, Copy)]
+pub struct Ball {
+    /// Rows at or past it are dropped.
+    pub bound: Distance,
+    /// Its reach past the plane between two centroids, per unit of the distance between them.
+    pub reach: Option<f32>,
+}
+
+impl Ball {
+    /// For rows nearest their own centroid: the planes midway to nearer centroids.
+    pub fn reach_l2(radius: f32) -> Option<f32> {
+        Some(2.0 * radius)
+    }
+
+    /// For unit rows nearest their own centroid by inner product: the planes through the origin.
+    pub fn reach_cosine(radius: f32) -> Option<f32> {
+        // A unit query is within 1 of every plane through the origin: such a reach skips no list.
+        Some((2.0 * radius).sqrt()).filter(|reach| *reach < 1.0)
+    }
+}
+
 type Element<O> = <<O as Operator>::Vector as Vector>::Element;
 type Metadata<O> = <<O as Operator>::Vector as Vector>::Metadata;
 
-/// What a search reads of the lists routing offers and of their rows.
+/// What a search reads of the lists routing offers and of their rows: all of them, or a sphere's.
 trait Scope<'b, O: Operator>: Clone {
     type Rows: Bound;
     /// What routing keeps of a centroid it reads until it offers the list.
@@ -684,13 +709,72 @@ impl<'b, O: Operator, B: Bound> Scope<'b, O> for B {
     }
 }
 
-/// Candidates past `bound` are dropped; with a filter, refills double the probes to `max_probes`.
+/// Below a root alone: skips a list whose rows, each nearest its own centroid, lie past the sphere.
+#[derive(Clone)]
+struct Planes<'b, O: Operator> {
+    bound: Distance,
+    reach: f32,
+    /// A centroid's elements while routing reads it.
+    scratch: Vec<Element<O>>,
+    /// The nearest centroids and their distances: the first lists offered.
+    nearest: Vec<(<O::Vector as VectorOwned>::Borrowed<'b>, f32)>,
+}
+
+impl<'b, O: Operator> Scope<'b, O> for Planes<'b, O> {
+    type Rows = Distance;
+    type Centroid = <O::Vector as VectorOwned>::Borrowed<'b>;
+    type Skipped = bool;
+
+    fn rows(&self) -> Distance {
+        self.bound
+    }
+
+    fn ranks(&self) -> bool {
+        true
+    }
+
+    fn keep(
+        &mut self,
+        bump: &'b impl Bump,
+        dim: u32,
+    ) -> impl Accessor1<Element<O>, Metadata<O>, Output = Self::Centroid> {
+        self.scratch.clear();
+        FunctionalAccessor::new(
+            &mut self.scratch,
+            id_0(|elements: &mut &mut Vec<_>, slice| elements.extend_from_slice(slice)),
+            move |elements: &mut Vec<_>, metadata| {
+                O::Vector::borrowed(dim, bump.alloc_slice(elements), metadata)
+            },
+        )
+    }
+
+    // Insertion routes approximately: a row past its plane by more than the reach is missed.
+    fn offer(&mut self, distance: Distance, centroid: Self::Centroid) -> bool {
+        let distance = distance.to_f32();
+        let skipped = self.nearest.iter().any(|&(other, nearer)| {
+            distance - nearer > self.reach * centroid.operator_l2s(other).to_f32().sqrt()
+        });
+        if self.nearest.len() < NEAREST {
+            self.nearest.push((centroid, distance));
+        }
+        skipped
+    }
+
+    fn unskipped(lists: Vec<List<bool>>) -> Vec<List> {
+        let lists = lists.into_iter().filter(|list| !list.3.0);
+        lists
+            .map(|(distance, norm, first, _)| (distance, norm, first, AlwaysEqual(())))
+            .collect()
+    }
+}
+
+/// Candidates past `ball` are dropped; with a filter, refills double the probes to `max_probes`.
 // Inlined into each scanner arm, which compiles the halfvec search to fewer instructions.
 #[inline(always)]
 pub fn default_search<'b, R: RelationRead, O: Operator>(
     index: &'b R,
     vector: Rc<O::Vector>,
-    bound: Option<Distance>,
+    ball: Option<Ball>,
     params: SearchParams,
     bump: &'b impl Bump,
     prefetch_h1_vectors: impl PrefetcherHeapFamily<'b, R> + 'b,
@@ -707,9 +791,23 @@ where
         prefetch_h1_vectors,
         prefetch_h0_tuples,
     );
-    match bound {
-        Some(radius) => searcher.search(params, radius),
-        None => searcher.search(params, ()),
+    let Some(Ball { bound, reach }) = ball else {
+        return searcher.search(params, ());
+    };
+    match reach.filter(|_| searcher.cells.len() == 2) {
+        Some(reach) => {
+            let (scratch, nearest) = (Vec::new(), Vec::new());
+            searcher.search(
+                params,
+                Planes {
+                    bound,
+                    reach,
+                    scratch,
+                    nearest,
+                },
+            )
+        }
+        None => searcher.search(params, bound),
     }
 }
 
@@ -776,7 +874,9 @@ mod tests {
     use super::*;
     use index::prefetcher::PlainPrefetcher;
     use index::test_support::MemoryRelation;
+    use index_accessor::{Dot, L2S};
     use std::cell::Cell;
+    use vector::vect::{VectBorrowed, VectOwned};
 
     #[test]
     fn rerank_refills_only_after_the_initial_rows_are_consumed() {
@@ -813,5 +913,47 @@ mod tests {
         assert_eq!(reads.get(), 0);
         assert_eq!(rows.next().unwrap().1.get(), 2);
         assert_eq!(reads.get(), 1);
+    }
+
+    /// Whether a sphere of `reach` skips the last of the lists around `centroids`, offered in turn.
+    fn skips<O: Operator<Vector = VectOwned<f32>>>(
+        reach: Option<f32>,
+        query: [f32; 2],
+        centroids: &[[f32; 2]],
+    ) -> bool {
+        let (bound, scratch, nearest) = (Distance::ZERO, Vec::new(), Vec::new());
+        let mut planes = Planes::<O> {
+            bound,
+            reach: reach.unwrap(),
+            scratch,
+            nearest,
+        };
+        let offer = |centroid| {
+            let centroid = VectBorrowed::new(centroid);
+            let distance = crate::exact_distance::<O>(VectBorrowed::new(&query), centroid);
+            planes.offer(distance, centroid)
+        };
+        centroids.iter().map(|x| x.as_slice()).map(offer).last() == Some(true)
+    }
+
+    #[test]
+    fn a_sphere_skips_the_lists_past_its_reach() {
+        type L2 = Op<VectOwned<f32>, L2S>;
+        let centroids = [[0.0, 0.0], [10.0, 0.0]];
+        assert!(skips::<L2>(Ball::reach_l2(3.9), [1.0, 0.0], &centroids));
+        assert!(!skips::<L2>(Ball::reach_l2(4.1), [1.0, 0.0], &centroids));
+        type Ip = Op<VectOwned<f32>, Dot>;
+        let centroids = [[1.0, 0.0], [0.0, 1.0]];
+        assert!(skips::<Ip>(
+            Ball::reach_cosine(0.008),
+            [0.8, 0.6],
+            &centroids
+        ));
+        assert!(!skips::<Ip>(
+            Ball::reach_cosine(0.012),
+            [0.8, 0.6],
+            &centroids
+        ));
+        assert_eq!(Ball::reach_cosine(0.5), None);
     }
 }

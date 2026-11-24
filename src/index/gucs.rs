@@ -167,7 +167,7 @@ pub fn init() {
     GucRegistry::define_int_guc(
         c"vchordrq.max_probes",
         c"`max_probes` argument of vchordrq.",
-        c"The most lists a scan with filter keys reads once its probed lists run out of candidates; -1 reads every list. Rows from further lists can be nearer than rows already returned.",
+        c"The most lists a scan with filter keys goes through once its probed lists run out of candidates; -1 is every list. A sphere scan reads only those of them it can reach. Rows from further lists can be nearer than rows already returned.",
         &VCHORDRQ_MAX_PROBES,
         -1,
         i32::MAX,
