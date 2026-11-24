@@ -31,6 +31,7 @@ pub struct DefaultBuilder {
     opfamily: Opfamily,
     orderbys: Vec<Option<OwnedVector>>,
     spheres: Vec<Option<Sphere<OwnedVector>>>,
+    empty: bool,
 }
 
 impl SearchBuilder for DefaultBuilder {
@@ -60,6 +61,7 @@ impl SearchBuilder for DefaultBuilder {
             opfamily,
             orderbys: Vec::new(),
             spheres: Vec::new(),
+            empty: false,
         }
     }
 
@@ -67,10 +69,16 @@ impl SearchBuilder for DefaultBuilder {
         match strategy {
             1 => {
                 let x = unsafe { datum.and_then(|x| self.opfamily.input_vector(x)) };
+                if datum.is_some() && x.is_none() {
+                    self.empty = true;
+                }
                 self.orderbys.push(x);
             }
             2 => {
                 let x = unsafe { datum.and_then(|x| self.opfamily.input_sphere(x)) };
+                if datum.is_some() && x.is_none() {
+                    self.empty = true;
+                }
                 self.spheres.push(x);
             }
             _ => unreachable!(),
@@ -90,13 +98,9 @@ impl SearchBuilder for DefaultBuilder {
         R::Page: Page<Opaque = vchordg::Opaque>,
     {
         let mut vector = None;
-        let mut threshold = None;
-        // Let PostgreSQL recheck every sphere qual against the heap tuple. Only
-        // the first non-null sphere (when there is no ORDER BY vector) bounds
-        // the search, and index distances may differ from the operator's by
-        // rounding (e.g. vectors are normalized for cosine). Other spheres,
-        // including null ones, are filtered entirely by the recheck.
-        let recheck = !self.spheres.is_empty();
+        let mut raw_radius = None;
+        let has_spheres = !self.spheres.is_empty();
+        let single_sphere = self.spheres.len() == 1 && self.spheres[0].is_some();
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
                 vector = Some(orderby_vector);
@@ -106,18 +110,45 @@ impl SearchBuilder for DefaultBuilder {
         }
         for Sphere { center, radius } in self.spheres.into_iter().flatten() {
             if vector.is_none() {
-                (vector, threshold) = (Some(center), Some(radius));
+                (vector, raw_radius) = (Some(center), Some(radius));
+            } else if raw_radius.is_none() && vector.as_ref() == Some(&center) {
+                raw_radius = Some(radius);
             }
         }
         let opfamily = self.opfamily;
+        let (rel, abs) = match opfamily {
+            Opfamily::HalfvecL2 | Opfamily::HalfvecIp | Opfamily::HalfvecCosine => {
+                (5e-3_f32, 1e-3_f32)
+            }
+            _ => (1e-4_f32, 1e-4_f32),
+        };
+        let threshold = raw_radius.map(|r| {
+            if r.is_finite() {
+                r + rel * r.abs() + abs
+            } else {
+                r
+            }
+        });
+        // Only recheck near the boundary (and zero-vector distance 0.5 under cosine)
+        // for a single bounding sphere so interior hits skip TOAST detoasting.
+        let safe_interior = single_sphere
+            .then_some(raw_radius)
+            .flatten()
+            .filter(|r| r.is_finite())
+            .map(|r| r - rel * r.abs() - abs);
+        let is_cosine = matches!(
+            opfamily,
+            Opfamily::VectorCosine
+                | Opfamily::HalfvecCosine
+                | Opfamily::Rabitq8Cosine
+                | Opfamily::Rabitq4Cosine
+        );
+        if self.empty {
+            return Box::new(std::iter::empty());
+        }
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
-        // A zero/non-finite cosine query has no direction. Cosine indexes
-        // contain only defined vectors and return no neighbours for it.
-        if !opfamily.valid_cosine_query(&vector) {
-            return Box::new(std::iter::empty());
-        }
         let vertex_hints = Hints::default().full(true);
         let vector_hints = Hints::default().full(true);
         let make_vertex_plain_prefetcher = MakePlainPrefetcher { index };
@@ -915,7 +946,7 @@ impl SearchBuilder for DefaultBuilder {
         // cos` for `cosine_ops`), while the sphere radius is in the output
         // space of the SQL operator.
         let iter = if let Some(threshold) = threshold {
-            Box::new(iter.take_while(move |(distance, _)| opfamily.output(*distance) < threshold))
+            Box::new(iter.take_while(move |(distance, _)| opfamily.output(*distance) <= threshold))
         } else {
             iter
         };
@@ -942,7 +973,13 @@ impl SearchBuilder for DefaultBuilder {
         }
         Box::new(iter.map(move |(distance, pointer)| {
             let (key, _) = pointer_to_kv(pointer);
-            (opfamily.output(distance), key, recheck)
+            let out = opfamily.output(distance);
+            let recheck = if let Some(limit) = safe_interior {
+                !(out < limit && (!is_cosine || (out - 0.5).abs() > 1e-2))
+            } else {
+                has_spheres
+            };
+            (out, key, recheck)
         }))
     }
 }

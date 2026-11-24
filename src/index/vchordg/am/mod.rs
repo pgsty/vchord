@@ -193,7 +193,7 @@ pub unsafe extern "C-unwind" fn amoptions(
 
 #[pgrx::pg_guard]
 pub unsafe extern "C-unwind" fn amcostestimate(
-    _root: *mut pgrx::pg_sys::PlannerInfo,
+    root: *mut pgrx::pg_sys::PlannerInfo,
     path: *mut pgrx::pg_sys::IndexPath,
     _loop_count: f64,
     index_startup_cost: *mut pgrx::pg_sys::Cost,
@@ -208,7 +208,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         // a partial index whose predicate the query implies, and index-only
         // paths when the query needs no columns. `amrescan` rejects the former,
         // and this index cannot return tuple data for the latter.
-        if !crate::index::hook::usable_path(path) {
+        if !crate::index::hook::usable_path(root, path) {
             // Since PostgreSQL 18, `disable_cost` alone does not lose against
             // paths disabled by `enable_*` settings, so count the path as
             // disabled as well. Before PostgreSQL 18, `disable_cost` is
@@ -365,12 +365,18 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     if unsafe { (*info).analyze_only } {
         return stats;
     }
+    let check = || unsafe {
+        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
+        pgrx::pg_sys::vacuum_delay_point();
+        #[cfg(any(feature = "pg18", feature = "pg19"))]
+        pgrx::pg_sys::vacuum_delay_point(false);
+    };
     // Without a bulk delete in this VACUUM, rewrite nothing unless an earlier
     // VACUUM left deleted vertices or unreferenced vectors behind. Returning
     // NULL tells PostgreSQL the index did not change (#24).
     if stats.is_null() {
         let index = unsafe { PostgresRelation::new((*info).index) };
-        if !vchordg::pending(&index) {
+        if !vchordg::pending(&index, check) {
             return stats;
         }
     }
@@ -382,54 +388,12 @@ pub unsafe extern "C-unwind" fn amvacuumcleanup(
     }
     let opfamily = unsafe { opfamily((*info).index) };
     let index = unsafe { PostgresRelation::new((*info).index) };
-    let check = || unsafe {
-        #[cfg(any(feature = "pg15", feature = "pg16", feature = "pg17"))]
-        pgrx::pg_sys::vacuum_delay_point();
-        #[cfg(any(feature = "pg18", feature = "pg19"))]
-        pgrx::pg_sys::vacuum_delay_point(false);
-    };
-    // maintenance_work_mem is in kilobytes
-    let memory_limit =
-        usize::try_from(unsafe { pgrx::pg_sys::maintenance_work_mem }).unwrap_or(0) * 1024;
-    let maintained =
-        crate::index::vchordg::dispatch::maintain(opfamily, &index, check, memory_limit);
+    let maintained = crate::index::vchordg::dispatch::maintain(opfamily, &index, check);
     let name = unsafe {
         CStr::from_ptr((*(*(*info).index).rd_rel).relname.data.as_ptr())
             .to_string_lossy()
             .into_owned()
     };
-    match maintained.reachability {
-        vchordg::Reachability::Checked {
-            disconnected,
-            unreachable_before,
-            live,
-        } => {
-            if disconnected > 0 {
-                let message = format!(
-                    "vchordg index \"{name}\": {disconnected} of {live} live vertices may have become unreachable from the entry point during VACUUM (concurrent inserts are not accounted for); REINDEX to restore recall"
-                );
-                // Edge repair can cut off a few vertices after ordinary
-                // deletes; warn the session only when it is a noticeable
-                // share of the index, and keep smaller counts in the log.
-                if disconnected.saturating_mul(100) >= live {
-                    pgrx::warning!("{message}");
-                } else {
-                    pgrx::log!("{message}");
-                }
-            }
-            pgrx::debug1!(
-                "vchordg index \"{name}\": reachability check: {disconnected} live vertices disconnected by VACUUM, {unreachable_before} unreachable before it, {live} live"
-            );
-        }
-        vchordg::Reachability::Skipped(reason) => {
-            pgrx::debug1!("vchordg index \"{name}\": reachability check skipped: {reason}");
-        }
-    }
-    if let Some(reason) = maintained.retained {
-        pgrx::warning!(
-            "vchordg index \"{name}\": VACUUM kept deleted vertices because {reason}; run VACUUM again with a larger maintenance_work_mem"
-        );
-    }
     if maintained.broken > 0 {
         // A warning, not an error: an error would fail the whole VACUUM and
         // keep the table from being cleaned up and frozen.
@@ -511,13 +475,36 @@ pub unsafe extern "C-unwind" fn amrescan(
                 "vector search with no WHERE clause and no ORDER BY clause is not supported"
             );
         }
+        let keys = if (*scan).numberOfKeys > 0 {
+            std::slice::from_raw_parts((*scan).keyData, (*scan).numberOfKeys as _)
+        } else {
+            &[]
+        };
+        use pgrx::pg_sys::{SK_ISNULL, SK_SEARCHARRAY, SK_SEARCHNOTNULL, SK_SEARCHNULL};
+        let null_test = |key: &pgrx::pg_sys::ScanKeyData| {
+            key.sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL) as i32 != 0
+        };
+        let null_sphere = keys.iter().any(|key| {
+            key.sk_attno == 1 && (key.sk_flags & SK_ISNULL as i32) != 0 && !null_test(key)
+        });
+        let is_vector_key = |key: &pgrx::pg_sys::ScanKeyData| {
+            key.sk_attno == 1 && key.sk_flags & SK_SEARCHARRAY as i32 == 0 && !null_test(key)
+        };
+        let has_vector_key = keys.iter().any(is_vector_key);
         let scanner = &mut *(*scan).opaque.cast::<Scanner>();
         scanner.searched = false;
         drop(scanner.scanning.take());
         scanner.bump.reset();
-        if crate::index::scanners::null_order(scan) {
+        if null_sphere {
+            return;
+        }
+        if crate::index::scanners::null_order(scan) && !has_vector_key {
+            let max_scan_tuples = gucs::vchordg_max_scan_tuples();
             scanner.scanning = Some(LazyCell::new(Box::new(move || {
-                Box::new(crate::index::scanners::NullOrderRows::new(scan))
+                Box::new(crate::index::scanners::NullOrderRows::new(
+                    scan,
+                    max_scan_tuples,
+                ))
             })));
             return;
         }
@@ -572,14 +559,16 @@ pub unsafe extern "C-unwind" fn amrescan(
                 for i in 0..(*scan).numberOfOrderBys {
                     let data = (*scan).orderByData.add(i as usize);
                     let value = (*data).sk_argument;
-                    let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    let is_null = ((*data).sk_flags & SK_ISNULL as i32) != 0;
                     builder.add((*data).sk_strategy, (!is_null).then_some(value));
                 }
-                for i in 0..(*scan).numberOfKeys {
-                    let data = (*scan).keyData.add(i as usize);
-                    let value = (*data).sk_argument;
-                    let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
-                    builder.add((*data).sk_strategy, (!is_null).then_some(value));
+                for key in keys
+                    .iter()
+                    .filter(|key| key.sk_attno == 1 && !null_test(key))
+                {
+                    let is_null = (key.sk_flags & SK_ISNULL as i32) != 0;
+                    let value = (is_vector_key(key) && !is_null).then_some(key.sk_argument);
+                    builder.add(key.sk_strategy, value);
                 }
                 LazyCell::new(Box::new(move || {
                     // only do this since `PostgresRelation` has no destructor

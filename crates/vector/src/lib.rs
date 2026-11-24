@@ -32,4 +32,7 @@ pub trait VectorBorrowed: Copy {
     fn operator_cos(self, rhs: Self) -> distance::Distance;
 
     fn function_normalize(&self) -> Self::Owned;
+
+    /// Scales to unit length, or returns `None` when the vector has no direction.
+    fn try_normalize(&self) -> Option<Self::Owned>;
 }

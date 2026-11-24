@@ -75,7 +75,7 @@ impl Default for VchordgIndexOptions {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OwnedVector {
     Vecf32(VectOwned<f32>),
     Vecf16(VectOwned<f16>),

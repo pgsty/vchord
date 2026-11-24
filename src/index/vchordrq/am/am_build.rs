@@ -253,7 +253,7 @@ pub unsafe extern "C-unwind" fn ambuild(
             // Sampling only needs visible rows. SnapshotAny can expose dead heap
             // tuples whose external TOAST values have already been vacuumed.
             let snapshot =
-                unsafe { pgrx::pg_sys::RegisterSnapshot(pgrx::pg_sys::GetTransactionSnapshot()) };
+                unsafe { pgrx::pg_sys::RegisterSnapshot(pgrx::pg_sys::GetLatestSnapshot()) };
             let sampler = unsafe { HeapSampler::new(index_relation, heap_relation, snapshot) };
             // the planner's estimate, which also covers tables never analyzed
             let estimated_rows = unsafe {
@@ -667,22 +667,8 @@ impl VchordrqLeader {
         isconcurrent: bool,
         vchordrq_cached: &[u8],
     ) -> Option<Self> {
-        unsafe fn compute_parallel_workers(
-            heap_relation: pgrx::pg_sys::Relation,
-            index_relation: pgrx::pg_sys::Relation,
-        ) -> i32 {
-            // The planner already honours the `parallel_workers` reloption (an
-            // unset one is -1), max_parallel_maintenance_workers, the heap size
-            // and maintenance_work_mem; use its answer as is.
-            unsafe {
-                pgrx::pg_sys::plan_create_index_workers(
-                    (*heap_relation).rd_id,
-                    (*index_relation).rd_id,
-                )
-            }
-        }
-
-        let request = unsafe { compute_parallel_workers(heap_relation, index_relation) };
+        let request =
+            unsafe { crate::index::compute_parallel_workers(heap_relation, index_relation) };
         if request <= 0 {
             return None;
         }
@@ -1016,6 +1002,9 @@ unsafe fn parallel_build(
         fn choose(&mut self, i: usize) -> bool {
             i % self.n == self.k
         }
+        fn is_exclusive(&self) -> bool {
+            true
+        }
     }
 
     let check = || {
@@ -1176,6 +1165,9 @@ unsafe fn sequential_build(
     struct ChooseAll;
     impl MaintainChooser for ChooseAll {
         fn choose(&mut self, _: usize) -> bool {
+            true
+        }
+        fn is_exclusive(&self) -> bool {
             true
         }
     }

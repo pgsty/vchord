@@ -655,9 +655,12 @@ where
 #[cfg(any(feature = "pg17", feature = "pg18", feature = "pg19"))]
 impl<O, I, L: Iterator<Item = u32>> Drop for PostgresReadStreamGuards<O, I, L> {
     fn drop(&mut self) {
+        let Some(first) = self.list.next() else {
+            return;
+        };
         // After an error, PostgreSQL releases the pins and the stream.
         if crate::index::cleanup::pg_cleanup_allowed() {
-            for id in self.list.by_ref() {
+            for id in std::iter::once(first).chain(self.list.by_ref()) {
                 unsafe {
                     let buf = read_stream_next_expected(self.raw, id);
                     pgrx::pg_sys::ReleaseBuffer(buf);

@@ -349,17 +349,22 @@ impl VectorBorrowed for Rabitq4Borrowed<'_> {
     fn function_normalize(&self) -> Rabitq4Owned {
         // See `VectBorrowed::function_normalize`: a zero vector stays zero
         // instead of pretending to be the unit vector its middle code encodes.
+        self.try_normalize().unwrap_or_else(|| self.own())
+    }
+
+    #[inline(always)]
+    fn try_normalize(&self) -> Option<Rabitq4Owned> {
         if !self.has_direction() {
-            return self.own();
+            return None;
         }
-        Rabitq4Owned {
+        Some(Rabitq4Owned {
             dim: self.dim,
             sum_of_x2: 1.0,
             norm_of_lattice: self.norm_of_lattice,
             sum_of_code: self.sum_of_code,
             sum_of_abs_x: self.sum_of_abs_x / self.sum_of_x2.sqrt(),
             packed_code: self.packed_code.to_owned(),
-        }
+        })
     }
 }
 

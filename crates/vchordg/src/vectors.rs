@@ -140,22 +140,7 @@ pub fn update<R: RelationRead + RelationWrite, O: Operator>(
     outs: impl Iterator<Item = ((u32, u16), Distance)> + Clone,
 ) -> Result<bool, ()> {
     if outs.clone().eq(neighbours_u) {
-        // Nothing to write, but only if the list is still the one that was
-        // read: an unchanged result computed from a stale list must be
-        // recomputed too (#26). A share lock suffices for the check.
-        let (id, i) = pointers_u.last().unwrap().into_inner();
-        let vector_guard = index.read(id);
-        let Some(vector_bytes) = vector_guard.get(i) else {
-            // the link is broken
-            return Err(());
-        };
-        let VectorTupleReader::_0(vector_tuple) =
-            VectorTuple::<O::Vector>::deserialize_ref(vector_bytes)
-        else {
-            // the link is broken
-            return Err(());
-        };
-        return Ok(vector_tuple.version() == version);
+        return Ok(true);
     }
     let mut vector_guard = index.write(pointers_u.last().unwrap().into_inner().0, false);
     let Some(vector_bytes) = vector_guard.get_mut(pointers_u.last().unwrap().into_inner().1) else {

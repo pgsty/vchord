@@ -87,13 +87,7 @@ where
         let link = vertex_guard.get_opaque().link;
         let pointers_t = list_of_vector_bytes
             .iter()
-            .map(|vector_bytes| {
-                let mut vector_guard = append_vector_tuple(index, link, vector_bytes.len());
-                let i = vector_guard
-                    .alloc(vector_bytes)
-                    .expect("implementation: a free page cannot accommodate a single tuple");
-                Pointer::new((vector_guard.id(), i))
-            })
+            .map(|vector_bytes| append_vector_tuple(index, link, vector_bytes))
             .collect::<Vec<_>>();
         let t = {
             let i = vertex_guard
@@ -213,7 +207,12 @@ where
     for element @ (Reverse(dis_c), AlwaysEqual((_, (u, payload_u)))) in iter.by_ref() {
         if payload_u.is_none() && u != s {
             passed += 1;
-            if passed > DELETED_TRAVERSAL_FACTOR * ef as usize {
+            if passed > DELETED_TRAVERSAL_FACTOR * ef as usize
+                || results
+                    .peek_ef_th()
+                    .map(|dis_e| dis_e < dis_c)
+                    .unwrap_or_default()
+            {
                 break;
             }
             continue;
@@ -273,6 +272,7 @@ where
         Err(()) => return Err(InsertError::Corrupted("the inserted vertex is missing")),
     }
     let mut stale = Vec::new();
+    let mut linked = 0_usize;
     for &(Reverse(dis_t), AlwaysEqual((pointers_u, u, payload_u))) in outs.iter() {
         match backlink::<R, O>(
             index,
@@ -280,48 +280,51 @@ where
             (pointers_u, u, payload_u),
             (t, dis_t),
         ) {
-            Backlink::Done => {}
+            Backlink::Done => linked += 1,
             Backlink::Stale => stale.push(u),
-            Backlink::RetryLimit => return Err(InsertError::RetryLimit),
+            // Skip a single contended hub rather than aborting the whole INSERT/CREATE INDEX.
+            Backlink::RetryLimit => {}
         }
     }
-    // A neighbour validated by its backlink was live after this list was
-    // written. Freeing it later needs a VACUUM that marks it and then runs a
-    // complete edge-repair pass before freeing anything; that pass visits
-    // this vertex and repairs the edge. So only the stale ones need care.
-    if stale.is_empty() {
+    if stale.is_empty() && (linked > 0 || outs.is_empty()) {
         return Ok(());
     }
-    // Some selected neighbours were marked deleted, freed or replaced by a
-    // concurrent VACUUM before their backlinks were placed: take them out of
-    // the new vertex's list again, so it keeps no edge to a freed vertex. If
-    // none is left, link through the start vertex, which is never freed.
-    // (Matching by slot can also drop an edge to a vertex that reused a
-    // freed slot meanwhile; that edge was never chosen, so nothing is lost.)
+    // Some selected neighbours were marked deleted/freed, or every backlink hit
+    // contention. Drop stale edges; if no backlink succeeded, link through `s`.
     let mut fallback = None;
-    if stale.len() == outs.len() {
-        let Some((pointers_s, payload_s)) = read_vertex(index, s) else {
-            return Err(InsertError::Corrupted("the start vertex is missing"));
-        };
-        // The start vertex is popped first; it has no distance only if its
-        // vectors could not be read.
+    if linked == 0 && !outs.is_empty() {
         let Some(dis_s) = start_distance else {
             return Err(InsertError::Corrupted(
                 "the start vertex's vectors could not be read",
             ));
         };
-        match backlink::<R, O>(
-            index,
-            (dim, m, &alpha),
-            (&pointers_s, s, payload_s),
-            (t, dis_s),
-        ) {
-            Backlink::Done => fallback = Some((s, dis_s)),
-            // A concurrent DELETE marked the start vertex between reading it
-            // and linking it; it is never freed, so a retry can link it.
-            Backlink::Stale => return Err(InsertError::Conflict),
-            Backlink::RetryLimit => return Err(InsertError::RetryLimit),
+        let mut linked_s = false;
+        for _ in 0..4 {
+            let Some((pointers_s, payload_s)) = read_vertex(index, s) else {
+                return Err(InsertError::Corrupted("the start vertex is missing"));
+            };
+            match backlink::<R, O>(
+                index,
+                (dim, m, &alpha),
+                (&pointers_s, s, payload_s),
+                (t, dis_s),
+            ) {
+                Backlink::Done => {
+                    fallback = Some((s, dis_s));
+                    linked_s = true;
+                    break;
+                }
+                // Start vertex payload flipped concurrently; re-read and retry.
+                Backlink::Stale => continue,
+                Backlink::RetryLimit => return Err(InsertError::RetryLimit),
+            }
         }
+        if !linked_s {
+            return Err(InsertError::Conflict);
+        }
+    }
+    if stale.is_empty() && fallback.is_none() {
+        return Ok(());
     }
     // Retried while the list changes under us, a bounded number of times;
     // stops if its tuple is gone.
@@ -356,12 +359,11 @@ where
 
 /// An insertion may pass through `DELETED_TRAVERSAL_FACTOR * ef` deleted
 /// vertices (#26). This is not a bound on live candidates or working memory.
-const DELETED_TRAVERSAL_FACTOR: usize = 4;
+const DELETED_TRAVERSAL_FACTOR: usize = 1;
 
-/// Recomputations of one neighbour list after concurrent changes before an
-/// insertion returns an error. PostgreSQL must abort the inserting transaction;
-/// a later VACUUM can reclaim its now-invisible physical tuples.
-const MAX_RETRIES: usize = 64;
+/// Recomputations of one neighbour list after concurrent changes before a
+/// single backlink gives up.
+const MAX_RETRIES: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backlink {
@@ -463,28 +465,26 @@ where
             |(_, u)| *u,
             O::DISTANCE == DistanceKind::L2S,
         );
-        // Publish the backlink only while `u` is still the vertex that was
-        // selected, in the same state (#26): a VACUUM may have marked it
-        // deleted since, or freed it and reused its slot. Its vertex page
-        // stays share-locked through the update, so it cannot be marked or
-        // freed in between (vertex before vector, as in insert and maintain);
-        // the version check in `update`, also for an unchanged result, covers
-        // changes to the list since it was read.
-        let vertex_guard = index.read(u.0);
-        let Some(vertex_bytes) = vertex_guard.get(u.1) else {
-            return Backlink::Stale;
-        };
-        let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
-        if vertex_tuple.payload() != payload_u || vertex_tuple.pointers() != pointers_u {
-            return Backlink::Stale;
+        let outs_iter = outs
+            .iter()
+            .map(|&(Reverse(dis_u), AlwaysEqual((_, u)))| (u, dis_u));
+        // Skip vertex-page and vector-page locks altogether when pruning keeps `u` unchanged.
+        if outs_iter.clone().eq(neighbours_u.iter().copied()) {
+            return Backlink::Done;
         }
-        let updated = update::<R, O>(
-            (index, pointers_u),
-            (version, neighbours_u),
-            outs.iter()
-                .map(|&(Reverse(dis_u), AlwaysEqual((_, u)))| (u, dis_u)),
-        );
-        drop(vertex_guard);
+        // Check `u` is still the selected vertex before taking the vector write lock,
+        // without holding the vertex-page share lock across WAL insertion.
+        {
+            let vertex_guard = index.read(u.0);
+            let Some(vertex_bytes) = vertex_guard.get(u.1) else {
+                return Backlink::Stale;
+            };
+            let vertex_tuple = VertexTuple::deserialize_ref(vertex_bytes);
+            if vertex_tuple.payload() != payload_u || vertex_tuple.pointers() != pointers_u {
+                return Backlink::Stale;
+            }
+        }
+        let updated = update::<R, O>((index, pointers_u), (version, neighbours_u), outs_iter);
         match updated {
             Ok(true) => return Backlink::Done,
             Ok(false) => continue,
@@ -553,15 +553,16 @@ where
     }
 }
 
-fn append_vector_tuple<'b, R: RelationRead + RelationWrite>(
-    index: &'b R,
+fn append_vector_tuple<R: RelationRead + RelationWrite>(
+    index: &R,
     first: u32,
-    size: usize,
-) -> R::WriteGuard<'b>
+    bytes: &[u8],
+) -> Pointer
 where
     R::Page: Page<Opaque = Opaque>,
 {
     assert!(first != u32::MAX);
+    let size = bytes.len();
     let mut current = first;
     loop {
         let read = index.read(current);
@@ -569,27 +570,27 @@ where
             drop(read);
             let mut write = index.write(current, false);
             if write.freespace() as usize >= size {
-                return write;
+                let i = write
+                    .alloc(bytes)
+                    .expect("implementation: a free page cannot accommodate a single tuple");
+                return Pointer::new((write.id(), i));
             }
             if write.get_opaque().next == u32::MAX {
-                // Initialize and WAL-log the new page before the predecessor
-                // links to it (see `append_vertex_tuple`).
-                let extend = index.extend(
+                // Populate and WAL-log the new page in one record before linking it.
+                let mut extend = index.extend(
                     Opaque {
                         next: u32::MAX,
                         link: u32::MAX,
                     },
                     false,
                 );
-                if (extend.freespace() as usize) < size {
-                    panic!("implementation: a clear page cannot accommodate a single tuple");
-                }
+                let i = extend
+                    .alloc(bytes)
+                    .expect("implementation: a clear page cannot accommodate a single tuple");
                 let id = extend.id();
                 drop(extend);
                 write.get_opaque_mut().next = id;
-                drop(write);
-                current = id;
-                continue;
+                return Pointer::new((id, i));
             }
             current = write.get_opaque().next
         } else {
@@ -630,7 +631,7 @@ mod tests {
         // heap-TID callback, then exercise real maintenance recovery.
         r.inject.set(false);
         crate::bulkdelete::<_, TestOp>(&r, || {}, |p| p.get() == 2);
-        let maintained = crate::maintain::<_, TestOp>(&r, || {}, 1024 * 1024);
+        let maintained = crate::maintain::<_, TestOp>(&r, || {});
         assert_eq!(maintained.live, 1);
         assert!(r.read(1).get(2).is_none());
         let (outs, _, _) = crate::vectors::read_without_accessor::<_, TestOp, _>(
@@ -661,8 +662,8 @@ mod tests {
         assert!(r.conflicts.get() >= MAX_RETRIES);
         r.inject.set(false);
         crate::bulkdelete::<_, TestOp>(&r, || {}, |p| p.get() == 2);
-        assert_eq!(crate::maintain::<_, TestOp>(&r, || {}, 1024 * 1024).live, 1);
-        assert!(!crate::pending(&r));
+        assert_eq!(crate::maintain::<_, TestOp>(&r, || {}).live, 1);
+        assert!(!crate::pending(&r, || {}));
     }
     #[test]
     fn missing_start_vertex_is_corruption_not_a_conflict() {

@@ -8,6 +8,58 @@
 
 use pgrx::pg_sys::Expr;
 
+unsafe fn key_is_not_null(root: *mut pgrx::pg_sys::PlannerInfo, mut key: *mut Expr) -> bool {
+    use pgrx::pg_sys::{self, FormData_pg_attribute, NodeTag, SysCacheIdentifier};
+    unsafe {
+        if root.is_null() || (*root).simple_rte_array.is_null() {
+            return false;
+        }
+        while !key.is_null() && (*key).type_ == NodeTag::T_RelabelType {
+            key = (*key.cast::<pg_sys::RelabelType>()).arg;
+        }
+        if key.is_null() || (*key).type_ != NodeTag::T_Var {
+            return false;
+        }
+        let var = &*key.cast::<pg_sys::Var>();
+        let varno = i64::from(var.varno);
+        if var.varattno <= 0 || varno <= 0 || varno >= i64::from((*root).simple_rel_array_size) {
+            return false;
+        }
+        let rte = *(*root).simple_rte_array.add(varno as usize);
+        if rte.is_null() || (*rte).relid == pg_sys::InvalidOid {
+            return false;
+        }
+        let tp = pg_sys::SearchSysCache2(
+            SysCacheIdentifier::ATTNUM as _,
+            (*rte).relid.into(),
+            var.varattno.into(),
+        );
+        if tp.is_null() {
+            return false;
+        }
+        let not_null = (*(pg_sys::GETSTRUCT(tp) as *const FormData_pg_attribute)).attnotnull;
+        pg_sys::ReleaseSysCache(tp);
+        not_null
+    }
+}
+
+unsafe fn orderby_is_const_null(path: *mut pgrx::pg_sys::IndexPath) -> bool {
+    use pgrx::pg_sys::{self, NodeTag};
+    unsafe {
+        let Some(clause) = pgrx::PgList::<Expr>::from_pg((*path).indexorderbys).get_ptr(0) else {
+            return false;
+        };
+        if (*clause).type_ != NodeTag::T_OpExpr {
+            return false;
+        }
+        pgrx::PgList::<Expr>::from_pg((*clause.cast::<pg_sys::OpExpr>()).args)
+            .iter_ptr()
+            .any(|arg| {
+                (*arg).type_ == NodeTag::T_Const && (*arg.cast::<pg_sys::Const>()).constisnull
+            })
+    }
+}
+
 unsafe fn null_propagates_to_key(key: *mut Expr, input: *mut Expr) -> bool {
     use pgrx::pg_sys::{self, NodeTag};
     unsafe {
@@ -70,7 +122,9 @@ unsafe fn tests_null_key(clause: *mut Expr, key: *mut Expr, negated: bool) -> bo
                     && (test.nulltesttype == pg_sys::NullTestType::IS_NULL) != negated
                     && null_propagates_to_key(key, test.arg)
             }
-            NodeTag::T_DistinctExpr => {
+            // Only `IS NOT DISTINCT FROM` (`negated == true`) matches NULL keys intentionally;
+            // `IS DISTINCT FROM` (`negated == false`) excludes a vector and should keep the index.
+            NodeTag::T_DistinctExpr if negated => {
                 let args = pgrx::PgList::<Expr>::from_pg((*clause.cast::<pg_sys::OpExpr>()).args);
                 let left = args.get_ptr(0).unwrap();
                 let right = args.get_ptr(1).unwrap();
@@ -78,7 +132,7 @@ unsafe fn tests_null_key(clause: *mut Expr, key: *mut Expr, negated: bool) -> bo
                     .into_iter()
                     .any(|(arg, other)| {
                         ((*other).type_ != NodeTag::T_Const
-                            || (*other.cast::<pg_sys::Const>()).constisnull == negated)
+                            || (*other.cast::<pg_sys::Const>()).constisnull)
                             && null_propagates_to_key(key, arg)
                     })
             }
@@ -87,7 +141,10 @@ unsafe fn tests_null_key(clause: *mut Expr, key: *mut Expr, negated: bool) -> bo
     }
 }
 
-pub(super) unsafe fn usable_path(path: *mut pgrx::pg_sys::IndexPath) -> bool {
+pub(super) unsafe fn usable_path(
+    root: *mut pgrx::pg_sys::PlannerInfo,
+    path: *mut pgrx::pg_sys::IndexPath,
+) -> bool {
     use pgrx::pg_sys::{self, IndexClause, NodeTag, NullTest, NullTestType, RestrictInfo};
     unsafe {
         let index = (*path).indexinfo;
@@ -102,6 +159,21 @@ pub(super) unsafe fn usable_path(path: *mut pgrx::pg_sys::IndexPath) -> bool {
             (*path).indexorderbys = pg_sys::list_copy_head((*path).indexorderbys, 1);
             (*path).indexorderbycols = pg_sys::list_copy_head((*path).indexorderbycols, 1);
             (*path).path.pathkeys = pg_sys::list_copy_head((*path).path.pathkeys, 1);
+        }
+        let has_vector_clause = pgrx::PgList::<IndexClause>::from_pg((*path).indexclauses)
+            .iter_ptr()
+            .any(|clause| {
+                (*clause).indexcol == 0
+                    && pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals)
+                        .iter_ptr()
+                        .any(|qual| (*(*qual).clause).type_ == NodeTag::T_OpExpr)
+            });
+        if (*path).indexorderbys.is_null() && !has_vector_clause {
+            return false;
+        }
+        // Let PostgreSQL stream a SeqScan for a literal `ORDER BY v <-> NULL` without a sphere.
+        if !has_vector_clause && orderby_is_const_null(path) {
+            return false;
         }
         let base_quals = (*(*index).rel).baserestrictinfo;
         let join_quals = (*path)
@@ -121,11 +193,13 @@ pub(super) unsafe fn usable_path(path: *mut pgrx::pg_sys::IndexPath) -> bool {
                 .get_ptr(0)
                 .unwrap();
             let key = (*column).expr;
-            if restrictions.into_iter().any(|list| {
-                pgrx::PgList::<Expr>::from_pg(list)
-                    .iter_ptr()
-                    .any(|qual| tests_null_key(qual, key, false))
-            }) {
+            if !key_is_not_null(root, key)
+                && restrictions.into_iter().any(|list| {
+                    pgrx::PgList::<Expr>::from_pg(list)
+                        .iter_ptr()
+                        .any(|qual| tests_null_key(qual, key, false))
+                })
+            {
                 let mut test = NullTest::default();
                 test.xpr.type_ = NodeTag::T_NullTest;
                 test.arg = key;
@@ -139,15 +213,7 @@ pub(super) unsafe fn usable_path(path: *mut pgrx::pg_sys::IndexPath) -> bool {
                 }
             }
         }
-        !(*path).indexorderbys.is_null()
-            || pgrx::PgList::<IndexClause>::from_pg((*path).indexclauses)
-                .iter_ptr()
-                .any(|clause| {
-                    (*clause).indexcol == 0
-                        && pgrx::PgList::<RestrictInfo>::from_pg((*clause).indexquals)
-                            .iter_ptr()
-                            .any(|qual| (*(*qual).clause).type_ == NodeTag::T_OpExpr)
-                })
+        true
     }
 }
 

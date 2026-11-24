@@ -17,7 +17,7 @@ use pgrx::heap_tuple::PgHeapTuple;
 use pgrx::pg_sys::Datum;
 use std::num::NonZero;
 use vchordg::types::*;
-use vector::{VectorBorrowed, VectorOwned};
+use vector::VectorBorrowed;
 
 #[derive(Debug, Clone, Copy)]
 pub enum Opfamily {
@@ -36,66 +36,20 @@ pub enum Opfamily {
 }
 
 impl Opfamily {
-    pub fn is_cosine(self) -> bool {
-        matches!(
-            self,
-            Self::VectorCosine | Self::HalfvecCosine | Self::Rabitq8Cosine | Self::Rabitq4Cosine
-        )
-    }
-    /// Uses the same test as `function_normalize`, so every vector a cosine
-    /// index stores is normalized.
-    fn has_direction(vector: BorrowedVector<'_>) -> bool {
-        match vector {
-            BorrowedVector::Vecf32(v) => v.has_direction(),
-            BorrowedVector::Vecf16(v) => v.has_direction(),
-            BorrowedVector::Rabitq8(v) => v.has_direction(),
-            BorrowedVector::Rabitq4(v) => v.has_direction(),
-        }
-    }
-    pub fn valid_cosine_query(self, vector: &OwnedVector) -> bool {
-        if !self.is_cosine() {
-            return true;
-        }
-        match vector {
-            OwnedVector::Vecf32(v) => Self::has_direction(BorrowedVector::Vecf32(v.as_borrowed())),
-            OwnedVector::Vecf16(v) => Self::has_direction(BorrowedVector::Vecf16(v.as_borrowed())),
-            OwnedVector::Rabitq8(v) => {
-                Self::has_direction(BorrowedVector::Rabitq8(v.as_borrowed()))
-            }
-            OwnedVector::Rabitq4(v) => {
-                Self::has_direction(BorrowedVector::Rabitq4(v.as_borrowed()))
-            }
-        }
-    }
-    fn input(self, vector: BorrowedVector<'_>) -> OwnedVector {
+    fn try_input(self, vector: BorrowedVector<'_>) -> Option<OwnedVector> {
         use BorrowedVector as B;
         use OwnedVector as O;
-        match (self, vector) {
-            (Self::VectorL2, B::Vecf32(x)) => O::Vecf32(x.own()),
-            (Self::VectorL2, _) => unreachable!(),
-            (Self::VectorCosine, B::Vecf32(x)) => O::Vecf32(x.function_normalize()),
-            (Self::VectorCosine, _) => unreachable!(),
-            (Self::VectorIp, B::Vecf32(x)) => O::Vecf32(x.own()),
-            (Self::VectorIp, _) => unreachable!(),
-            (Self::HalfvecL2, B::Vecf16(x)) => O::Vecf16(x.own()),
-            (Self::HalfvecL2, _) => unreachable!(),
-            (Self::HalfvecCosine, B::Vecf16(x)) => O::Vecf16(x.function_normalize()),
-            (Self::HalfvecCosine, _) => unreachable!(),
-            (Self::HalfvecIp, B::Vecf16(x)) => O::Vecf16(x.own()),
-            (Self::HalfvecIp, _) => unreachable!(),
-            (Self::Rabitq8L2, B::Rabitq8(x)) => O::Rabitq8(x.own()),
-            (Self::Rabitq8L2, _) => unreachable!(),
-            (Self::Rabitq8Cosine, B::Rabitq8(x)) => O::Rabitq8(x.function_normalize()),
-            (Self::Rabitq8Cosine, _) => unreachable!(),
-            (Self::Rabitq8Ip, B::Rabitq8(x)) => O::Rabitq8(x.own()),
-            (Self::Rabitq8Ip, _) => unreachable!(),
-            (Self::Rabitq4L2, B::Rabitq4(x)) => O::Rabitq4(x.own()),
-            (Self::Rabitq4L2, _) => unreachable!(),
-            (Self::Rabitq4Cosine, B::Rabitq4(x)) => O::Rabitq4(x.function_normalize()),
-            (Self::Rabitq4Cosine, _) => unreachable!(),
-            (Self::Rabitq4Ip, B::Rabitq4(x)) => O::Rabitq4(x.own()),
-            (Self::Rabitq4Ip, _) => unreachable!(),
-        }
+        Some(match (self, vector) {
+            (Self::VectorL2 | Self::VectorIp, B::Vecf32(x)) => O::Vecf32(x.own()),
+            (Self::VectorCosine, B::Vecf32(x)) => O::Vecf32(x.try_normalize()?),
+            (Self::HalfvecL2 | Self::HalfvecIp, B::Vecf16(x)) => O::Vecf16(x.own()),
+            (Self::HalfvecCosine, B::Vecf16(x)) => O::Vecf16(x.try_normalize()?),
+            (Self::Rabitq8L2 | Self::Rabitq8Ip, B::Rabitq8(x)) => O::Rabitq8(x.own()),
+            (Self::Rabitq8Cosine, B::Rabitq8(x)) => O::Rabitq8(x.try_normalize()?),
+            (Self::Rabitq4L2 | Self::Rabitq4Ip, B::Rabitq4(x)) => O::Rabitq4(x.own()),
+            (Self::Rabitq4Cosine, B::Rabitq4(x)) => O::Rabitq4(x.try_normalize()?),
+            _ => unreachable!(),
+        })
     }
     pub unsafe fn store(self, datum: Datum) -> Option<Vec<(OwnedVector, u16)>> {
         if datum.is_null() {
@@ -104,39 +58,31 @@ impl Opfamily {
         let store = match self {
             Self::VectorL2 | Self::VectorCosine | Self::VectorIp => {
                 let vector = unsafe { VectorInput::from_datum(datum, false).unwrap() };
-                if matches!(self, Self::VectorCosine)
-                    && !Self::has_direction(BorrowedVector::Vecf32(vector.as_borrowed()))
-                {
-                    return None;
-                }
-                vec![(self.input(BorrowedVector::Vecf32(vector.as_borrowed())), 0)]
+                vec![(
+                    self.try_input(BorrowedVector::Vecf32(vector.as_borrowed()))?,
+                    0,
+                )]
             }
             Self::HalfvecL2 | Self::HalfvecCosine | Self::HalfvecIp => {
                 let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
-                if matches!(self, Self::HalfvecCosine)
-                    && !Self::has_direction(BorrowedVector::Vecf16(vector.as_borrowed()))
-                {
-                    return None;
-                }
-                vec![(self.input(BorrowedVector::Vecf16(vector.as_borrowed())), 0)]
+                vec![(
+                    self.try_input(BorrowedVector::Vecf16(vector.as_borrowed()))?,
+                    0,
+                )]
             }
             Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
                 let vector = unsafe { Rabitq8Input::from_datum(datum, false).unwrap() };
-                if matches!(self, Self::Rabitq8Cosine)
-                    && !Self::has_direction(BorrowedVector::Rabitq8(vector.as_borrowed()))
-                {
-                    return None;
-                }
-                vec![(self.input(BorrowedVector::Rabitq8(vector.as_borrowed())), 0)]
+                vec![(
+                    self.try_input(BorrowedVector::Rabitq8(vector.as_borrowed()))?,
+                    0,
+                )]
             }
             Self::Rabitq4L2 | Self::Rabitq4Cosine | Self::Rabitq4Ip => {
                 let vector = unsafe { Rabitq4Input::from_datum(datum, false).unwrap() };
-                if matches!(self, Self::Rabitq4Cosine)
-                    && !Self::has_direction(BorrowedVector::Rabitq4(vector.as_borrowed()))
-                {
-                    return None;
-                }
-                vec![(self.input(BorrowedVector::Rabitq4(vector.as_borrowed())), 0)]
+                vec![(
+                    self.try_input(BorrowedVector::Rabitq4(vector.as_borrowed()))?,
+                    0,
+                )]
             }
         };
         Some(store)
@@ -150,65 +96,64 @@ impl Opfamily {
         let attno_1 = NonZero::new(1_usize).unwrap();
         let attno_2 = NonZero::new(2_usize).unwrap();
         let tuple = unsafe { PgHeapTuple::from_composite_datum(datum) };
+        let radius = tuple
+            .get_by_index::<f32>(attno_2)
+            .unwrap()
+            .unwrap_or_else(|| pgrx::error!("Bad input: empty radius at sphere"));
         let center = match self {
             Self::VectorL2 | Self::VectorCosine | Self::VectorIp => {
                 let vector = tuple
                     .get_by_index::<VectorOutput>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
-                self.input(BorrowedVector::Vecf32(vector.as_borrowed()))
+                self.try_input(BorrowedVector::Vecf32(vector.as_borrowed()))?
             }
             Self::HalfvecL2 | Self::HalfvecCosine | Self::HalfvecIp => {
                 let vector = tuple
                     .get_by_index::<HalfvecOutput>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
-                self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
+                self.try_input(BorrowedVector::Vecf16(vector.as_borrowed()))?
             }
             Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
                 let vector = tuple
                     .get_by_index::<Rabitq8Output>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
-                self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
+                self.try_input(BorrowedVector::Rabitq8(vector.as_borrowed()))?
             }
             Self::Rabitq4L2 | Self::Rabitq4Cosine | Self::Rabitq4Ip => {
                 let vector = tuple
                     .get_by_index::<Rabitq4Output>(attno_1)
                     .unwrap()
                     .unwrap_or_else(|| pgrx::error!("Bad input: empty center at sphere"));
-                self.input(BorrowedVector::Rabitq4(vector.as_borrowed()))
+                self.try_input(BorrowedVector::Rabitq4(vector.as_borrowed()))?
             }
         };
-        let radius = tuple
-            .get_by_index::<f32>(attno_2)
-            .unwrap()
-            .unwrap_or_else(|| pgrx::error!("Bad input: empty radius at sphere"));
         Some(Sphere { center, radius })
     }
     pub unsafe fn input_vector(self, datum: Datum) -> Option<OwnedVector> {
         if datum.is_null() {
             return None;
         }
-        let vector = match self {
+        match self {
             Self::VectorL2 | Self::VectorCosine | Self::VectorIp => {
                 let vector = unsafe { VectorInput::from_datum(datum, false).unwrap() };
-                self.input(BorrowedVector::Vecf32(vector.as_borrowed()))
+                self.try_input(BorrowedVector::Vecf32(vector.as_borrowed()))
             }
             Self::HalfvecL2 | Self::HalfvecCosine | Self::HalfvecIp => {
                 let vector = unsafe { HalfvecInput::from_datum(datum, false).unwrap() };
-                self.input(BorrowedVector::Vecf16(vector.as_borrowed()))
+                self.try_input(BorrowedVector::Vecf16(vector.as_borrowed()))
             }
             Self::Rabitq8L2 | Self::Rabitq8Cosine | Self::Rabitq8Ip => {
                 let vector = unsafe { Rabitq8Input::from_datum(datum, false).unwrap() };
-                self.input(BorrowedVector::Rabitq8(vector.as_borrowed()))
+                self.try_input(BorrowedVector::Rabitq8(vector.as_borrowed()))
             }
             Self::Rabitq4L2 | Self::Rabitq4Cosine | Self::Rabitq4Ip => {
                 let vector = unsafe { Rabitq4Input::from_datum(datum, false).unwrap() };
-                self.input(BorrowedVector::Rabitq4(vector.as_borrowed()))
+                self.try_input(BorrowedVector::Rabitq4(vector.as_borrowed()))
             }
-        };
-        Some(vector)
+        }
     }
     pub fn output(self, x: Distance) -> f32 {
         match self {

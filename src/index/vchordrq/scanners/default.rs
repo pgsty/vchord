@@ -40,6 +40,7 @@ pub struct DefaultBuilder {
     opfamily: Opfamily,
     orderbys: Vec<Option<OwnedVector>>,
     spheres: Vec<Option<Sphere<OwnedVector>>>,
+    empty: bool,
 }
 
 impl SearchBuilder for DefaultBuilder {
@@ -69,6 +70,7 @@ impl SearchBuilder for DefaultBuilder {
             opfamily,
             orderbys: Vec::new(),
             spheres: Vec::new(),
+            empty: false,
         }
     }
 
@@ -76,10 +78,16 @@ impl SearchBuilder for DefaultBuilder {
         match strategy {
             1 => {
                 let x = unsafe { datum.and_then(|x| self.opfamily.input_vector(x)) };
+                if datum.is_some() && x.is_none() {
+                    self.empty = true;
+                }
                 self.orderbys.push(x);
             }
             2 => {
                 let x = unsafe { datum.and_then(|x| self.opfamily.input_sphere(x)) };
+                if datum.is_some() && x.is_none() {
+                    self.empty = true;
+                }
                 self.spheres.push(x);
             }
             _ => unreachable!(),
@@ -99,11 +107,10 @@ impl SearchBuilder for DefaultBuilder {
         R::Page: Page<Opaque = vchordrq::Opaque>,
     {
         let mut vector = None;
-        let mut threshold = None;
-        // PostgreSQL rechecks spheres, as for vchordg; only the first one around the search vector
-        // bounds the search.
-        let recheck = !self.spheres.is_empty()
-            || (options.search.filter.as_ref()).is_some_and(|filter| !filter.exact());
+        let mut raw_radius = None;
+        let has_spheres = !self.spheres.is_empty();
+        let single_sphere = self.spheres.len() == 1 && self.spheres[0].is_some();
+        let filter_inexact = (options.search.filter.as_ref()).is_some_and(|filter| !filter.exact());
         for orderby_vector in self.orderbys.into_iter().flatten() {
             if vector.is_none() {
                 vector = Some(orderby_vector);
@@ -113,25 +120,48 @@ impl SearchBuilder for DefaultBuilder {
         }
         for Sphere { center, radius } in self.spheres.into_iter().flatten() {
             if vector.is_none() {
-                (vector, threshold) = (Some(center), Some(radius));
-            } else if threshold.is_none() && vector.as_ref() == Some(&center) {
-                threshold = Some(radius);
+                (vector, raw_radius) = (Some(center), Some(radius));
+            } else if raw_radius.is_none() && vector.as_ref() == Some(&center) {
+                raw_radius = Some(radius);
             }
         }
         let opfamily = self.opfamily;
-        let threshold = threshold.map(|radius| match opfamily {
-            Opfamily::VectorL2 | Opfamily::HalfvecL2 if radius > 0.0 => radius.next_up(),
+        let threshold = raw_radius.map(|radius| match opfamily {
+            Opfamily::VectorL2 if radius > 0.0 => radius.next_up(),
+            Opfamily::HalfvecL2 if radius > 0.0 => {
+                if <f16 as simd::Floating>::reduce_sum_of_d2_approx_is_exact() {
+                    radius.next_up()
+                } else {
+                    radius * (1.0 + 1.0 / 1024.0)
+                }
+            }
             _ => radius,
         });
         let bound = threshold.map(|radius| opfamily.bound(radius));
+        // Recheck all rows for multiple/unbounded spheres or inexact filter keys;
+        // for a single bounding sphere, only recheck near the boundary (and zero-vector
+        // distance 1.0 under cosine) so interior hits skip TOAST detoasting.
+        let needs_recheck = has_spheres || filter_inexact;
+        let safe_interior = if filter_inexact || !single_sphere {
+            None
+        } else {
+            raw_radius.filter(|r| r.is_finite()).map(|r| {
+                let (rel, abs) = match opfamily {
+                    Opfamily::HalfvecL2 | Opfamily::HalfvecIp | Opfamily::HalfvecCosine => {
+                        (5e-3_f32, 1e-3_f32)
+                    }
+                    _ => (1e-4_f32, 1e-4_f32),
+                };
+                r - rel * r.abs() - abs
+            })
+        };
+        let is_cosine = opfamily.is_cosine();
+        if self.empty {
+            return Box::new(std::iter::empty());
+        }
         let Some(vector) = vector else {
             return Box::new(std::iter::empty()) as Box<dyn Iterator<Item = (f32, [u16; 3], bool)>>;
         };
-        // A zero/non-finite cosine query has no direction. Cosine indexes
-        // contain only defined vectors and return no neighbours for it.
-        if !opfamily.valid_cosine_query(&vector) {
-            return Box::new(std::iter::empty());
-        }
         let reranking = RerankOptions {
             method: how(index),
             io: options.io_rerank,
@@ -260,7 +290,13 @@ impl SearchBuilder for DefaultBuilder {
         }
         Box::new(iter.map(move |(distance, pointer)| {
             let (key, _) = pointer_to_kv(pointer);
-            (opfamily.output(distance), key, recheck)
+            let out = opfamily.output(distance);
+            let recheck = if let Some(limit) = safe_interior {
+                !(out < limit && (!is_cosine || (out - 1.0).abs() > 1e-2))
+            } else {
+                needs_recheck
+            };
+            (out, key, recheck)
         }))
     }
 }

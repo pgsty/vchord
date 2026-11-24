@@ -245,22 +245,8 @@ impl VchordgLeader {
         isconcurrent: bool,
         cached: &[u8],
     ) -> Option<Self> {
-        unsafe fn compute_parallel_workers(
-            heap_relation: pgrx::pg_sys::Relation,
-            index_relation: pgrx::pg_sys::Relation,
-        ) -> i32 {
-            // The planner already honours the `parallel_workers` reloption (an
-            // unset one is -1), max_parallel_maintenance_workers, the heap size
-            // and maintenance_work_mem; use its answer as is.
-            unsafe {
-                pgrx::pg_sys::plan_create_index_workers(
-                    (*heap_relation).rd_id,
-                    (*index_relation).rd_id,
-                )
-            }
-        }
-
-        let request = unsafe { compute_parallel_workers(heap_relation, index_relation) };
+        let request =
+            unsafe { crate::index::compute_parallel_workers(heap_relation, index_relation) };
         if request <= 0 {
             return None;
         }

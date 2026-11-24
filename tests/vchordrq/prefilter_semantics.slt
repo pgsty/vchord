@@ -40,7 +40,23 @@ SELECT currval('pf_seq');
 ----
 5
 
-# A correlated SubPlan with a volatile function.
+# A correlated SubPlan with a volatile function stays in the executor only.
+statement ok
+SELECT setval('pf_seq', 1, false);
+
+query I
+SELECT array_agg(id) FROM (
+  SELECT id FROM pf WHERE id IN (SELECT s.id FROM pf_side s WHERE s.id = pf.id AND nextval('pf_seq') > 0)
+  ORDER BY v <-> '[1,1,1]' LIMIT 3
+) s;
+----
+{1,2,3}
+
+query I
+SELECT currval('pf_seq');
+----
+3
+
 query I
 SELECT array_agg(id) FROM (
   SELECT id FROM pf WHERE id IN (SELECT s.id FROM pf_side s WHERE s.id = pf.id AND random() < 2)
@@ -48,6 +64,49 @@ SELECT array_agg(id) FROM (
 ) s;
 ----
 {1,2,3}
+
+# A non-volatile correlated SubPlan still prefilters inside the index scan
+# (no rejected rows reach the executor's Filter).
+statement ok
+CREATE FUNCTION pf_removed_by_filter(q text) RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+  r text;
+  result bigint := 0;
+BEGIN
+  FOR r IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+    EXIT WHEN r ~ '^\s+SubPlan ';
+    IF r LIKE '%Rows Removed by Filter%' THEN
+      result := result + substring(r FROM '\d+')::bigint;
+    END IF;
+  END LOOP;
+  RETURN result;
+END
+$$;
+
+query I
+SELECT pf_removed_by_filter($q$
+  SELECT id FROM pf WHERE EXISTS (SELECT 1 FROM pf_side s WHERE s.id = pf.id AND s.flag) OR id = -1
+  ORDER BY v <-> '[501,501,501]' LIMIT 3
+$q$);
+----
+0
+
+statement ok
+SET vchordrq.prefilter = off;
+
+query T
+SELECT pf_removed_by_filter($q$
+  SELECT id FROM pf WHERE EXISTS (SELECT 1 FROM pf_side s WHERE s.id = pf.id AND s.flag) OR id = -1
+  ORDER BY v <-> '[501,501,501]' LIMIT 3
+$q$) > 0;
+----
+t
+
+statement ok
+SET vchordrq.prefilter = on;
+
+statement ok
+DROP FUNCTION pf_removed_by_filter;
 
 # Non-volatile quals: the same rows with and without prefiltering, including
 # a correlated SubPlan and parameterized rescans through LATERAL.

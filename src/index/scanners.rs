@@ -61,15 +61,24 @@ pub(super) unsafe fn null_order(scan: pgrx::pg_sys::IndexScanDesc) -> bool {
 
 pub(super) struct NullOrderRows {
     context: pgrx::pg_sys::MemoryContext,
-    store: *mut pgrx::pg_sys::Tuplestorestate,
+    heap: pgrx::pg_sys::Relation,
+    table_scan: *mut pgrx::pg_sys::TableScanDescData,
     slot: *mut pgrx::pg_sys::TupleTableSlot,
+    estate: *mut pgrx::pg_sys::EState,
+    econtext: *mut pgrx::pg_sys::ExprContext,
+    predicate: *mut pgrx::pg_sys::ExprState,
+    remaining: Option<u32>,
+    root_block: Option<pgrx::pg_sys::BlockNumber>,
+    root_offsets: Vec<pgrx::pg_sys::OffsetNumber>,
 }
 
 impl NullOrderRows {
-    pub(super) unsafe fn new(scan: pgrx::pg_sys::IndexScanDesc) -> Self {
-        use crate::index::traverse::{HeapTraverser, Traverser};
+    pub(super) unsafe fn new(
+        scan: pgrx::pg_sys::IndexScanDesc,
+        max_scan_tuples: Option<u32>,
+    ) -> Self {
         use pgrx::pg_sys;
-        use std::ptr::{null, null_mut};
+        use std::ptr::null_mut;
         unsafe {
             let context = pg_sys::AllocSetContextCreateInternal(
                 pg_sys::GetMemoryChunkContext(scan.cast()),
@@ -79,35 +88,34 @@ impl NullOrderRows {
                 pg_sys::ALLOCSET_DEFAULT_MAXSIZE as _,
             );
             let _switch = crate::index::MemoryContextSwitch::new(context);
-            let desc = pg_sys::CreateTemplateTupleDesc(1);
-            pg_sys::TupleDescInitEntry(desc, 1, null(), pg_sys::TIDOID, -1, 0);
-            #[cfg(feature = "pg19")]
-            pg_sys::TupleDescFinalize(desc);
-            let store = pg_sys::tuplestore_begin_heap(false, false, pg_sys::work_mem);
-            let slot =
-                pg_sys::MakeSingleTupleTableSlot(desc, &raw const pg_sys::TTSOpsMinimalTuple);
             let index = (*scan).indexRelation;
             let heap = (*scan).heapRelation;
-            let info = pg_sys::BuildIndexInfo(index);
-            (*info).ii_Concurrent = true;
-            (*info).ii_NumIndexAttrs = 0;
-            (*info).ii_NumIndexKeyAttrs = 0;
-            (*info).ii_Expressions = null_mut();
             let table_scan =
                 pg_sys::table_beginscan_strat(heap, (*scan).xs_snapshot, 0, null_mut(), true, true);
-            HeapTraverser::new(heap, index, info, table_scan).traverse(
-                false,
-                |row: &mut dyn crate::index::traverse::Tuple| {
-                    let mut tid = row.id();
-                    let mut value = Datum::from(&raw mut tid);
-                    let mut is_null = false;
-                    pg_sys::tuplestore_putvalues(store, desc, &raw mut value, &raw mut is_null);
-                },
-            );
+            let slot = pg_sys::table_slot_create(heap, null_mut());
+            let pred = pg_sys::RelationGetIndexPredicate(index);
+            let (estate, econtext, predicate) = if pred.is_null() {
+                (null_mut(), null_mut(), null_mut())
+            } else {
+                let estate = pg_sys::CreateExecutorState();
+                let predicate = {
+                    let _switch = crate::index::MemoryContextSwitch::new((*estate).es_query_cxt);
+                    pg_sys::ExecPrepareQual(pred, estate)
+                };
+                let econtext = pg_sys::MakePerTupleExprContext(estate);
+                (estate, econtext, predicate)
+            };
             Self {
                 context,
-                store,
+                heap,
+                table_scan,
                 slot,
+                estate,
+                econtext,
+                predicate,
+                remaining: max_scan_tuples,
+                root_block: None,
+                root_offsets: Vec::new(),
             }
         }
     }
@@ -117,14 +125,93 @@ impl Iterator for NullOrderRows {
     type Item = (f32, [u16; 3], bool);
 
     fn next(&mut self) -> Option<Self::Item> {
+        use pgrx::datum::FromDatum;
         use pgrx::pg_sys;
+        use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
+        if self.remaining == Some(0) {
+            return None;
+        }
         unsafe {
-            if !pg_sys::tuplestore_gettupleslot(self.store, true, false, self.slot) {
-                return None;
+            let table_am = (*self.heap).rd_tableam;
+            if table_am.is_null() {
+                panic!("unknown heap access method");
             }
-            let value = pg_sys::slot_getattr(self.slot, 1, &mut false);
-            let tid = *value.cast_mut_ptr::<pg_sys::ItemPointerData>();
-            Some((0.0, crate::index::fetcher::ctid_to_key(tid), true))
+            let scan_getnextslot = (*table_am)
+                .scan_getnextslot
+                .expect("unsupported heap access method");
+            loop {
+                pgrx::check_for_interrupts();
+                #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+                let found = pg_guard_ffi_boundary(|| {
+                    scan_getnextslot(
+                        self.table_scan,
+                        pg_sys::ScanDirection::ForwardScanDirection,
+                        self.slot,
+                    )
+                });
+                if !found {
+                    return None;
+                }
+                if !self.predicate.is_null() {
+                    let evalfunc = (*self.predicate).evalfunc.expect("no evalfunc for qual");
+                    (*self.econtext).ecxt_scantuple = self.slot;
+                    pg_sys::MemoryContextReset((*self.econtext).ecxt_per_tuple_memory);
+                    let result = {
+                        let _switch = crate::index::MemoryContextSwitch::new(
+                            (*self.econtext).ecxt_per_tuple_memory,
+                        );
+                        let mut is_null = true;
+                        #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+                        let datum = pg_guard_ffi_boundary(|| {
+                            evalfunc(self.predicate, self.econtext, &mut is_null)
+                        });
+                        bool::from_datum(datum, is_null)
+                    };
+                    if result != Some(true) {
+                        continue;
+                    }
+                }
+                if let Some(remaining) = &mut self.remaining {
+                    *remaining -= 1;
+                }
+                let mut tid = (*self.slot).tts_tid;
+                // `index_getnext_slot` rejects heap-only TIDs; map them to their HOT root.
+                if std::ptr::eq(
+                    (*self.slot).tts_ops,
+                    &raw const pg_sys::TTSOpsBufferHeapTuple,
+                ) {
+                    let bslot = self.slot.cast::<pg_sys::BufferHeapTupleTableSlot>();
+                    let tuple = (*bslot).base.tuple;
+                    if !tuple.is_null()
+                        && !(*tuple).t_data.is_null()
+                        && ((*(*tuple).t_data).t_infomask2 & pg_sys::HEAP_ONLY_TUPLE as u16) != 0
+                    {
+                        let blkno = pg_sys::ItemPointerGetBlockNumber(&tid);
+                        let offnum = pg_sys::ItemPointerGetOffsetNumber(&tid);
+                        if self.root_block != Some(blkno) {
+                            if self.root_offsets.is_empty() {
+                                self.root_offsets.resize(
+                                    (pg_sys::BLCKSZ as usize) / size_of::<pg_sys::ItemIdData>(),
+                                    0,
+                                );
+                            }
+                            let buf = (*bslot).buffer;
+                            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_SHARE as _);
+                            pg_sys::heap_get_root_tuples(
+                                pgrx::BufferGetPage!(buf).get(),
+                                self.root_offsets.as_mut_ptr(),
+                            );
+                            pg_sys::LockBuffer(buf, pg_sys::BUFFER_LOCK_UNLOCK as _);
+                            self.root_block = Some(blkno);
+                        }
+                        let root_off = self.root_offsets[(offnum - 1) as usize];
+                        if root_off != 0 {
+                            pg_sys::ItemPointerSetOffsetNumber(&mut tid, root_off);
+                        }
+                    }
+                }
+                return Some((0.0, crate::index::fetcher::ctid_to_key(tid), true));
+            }
         }
     }
 }
@@ -133,8 +220,18 @@ impl Drop for NullOrderRows {
     fn drop(&mut self) {
         if crate::index::cleanup::pg_cleanup_allowed() {
             unsafe {
+                use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
                 pgrx::pg_sys::ExecDropSingleTupleTableSlot(self.slot);
-                pgrx::pg_sys::tuplestore_end(self.store);
+                let table_am = (*self.heap).rd_tableam;
+                if !table_am.is_null()
+                    && let Some(scan_end) = (*table_am).scan_end
+                {
+                    #[allow(ffi_unwind_calls, reason = "protected by pg_guard_ffi_boundary")]
+                    pg_guard_ffi_boundary(|| scan_end(self.table_scan));
+                }
+                if !self.estate.is_null() {
+                    pgrx::pg_sys::FreeExecutorState(self.estate);
+                }
                 pgrx::pg_sys::MemoryContextDelete(self.context);
             }
         }

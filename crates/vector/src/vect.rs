@@ -142,7 +142,12 @@ impl<S: Floating> VectorBorrowed for VectBorrowed<'_, S> {
     /// Scales to unit length; a vector without a direction is returned unchanged.
     #[inline(always)]
     fn function_normalize(&self) -> VectOwned<S> {
-        VectOwned(normalized(self.0).unwrap_or_else(|| self.0.to_vec()))
+        self.try_normalize().unwrap_or_else(|| self.own())
+    }
+
+    #[inline(always)]
+    fn try_normalize(&self) -> Option<VectOwned<S>> {
+        normalized(self.0).map(VectOwned)
     }
 }
 

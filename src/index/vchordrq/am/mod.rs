@@ -300,7 +300,7 @@ pub unsafe extern "C-unwind" fn amcostestimate(
         // 18 compares disabled nodes first) and give them a dominating finite
         // cost (before PostgreSQL 18, `disable_cost` is additive) (#32).
         // Clauses on the filter key column, or arrays of spheres, give no vector.
-        if !crate::index::hook::usable_path(path) {
+        if !crate::index::hook::usable_path(root, path) {
             #[cfg(any(feature = "pg18", feature = "pg19"))]
             {
                 (*path).path.disabled_nodes += 1;
@@ -661,21 +661,125 @@ pub unsafe extern "C-unwind" fn ambeginscan(
     scan
 }
 
+#[pgrx::pg_guard]
+unsafe extern "C-unwind" fn planstate_has_volatile(
+    node: *mut pgrx::pg_sys::PlanState,
+    context: *mut std::ffi::c_void,
+) -> bool {
+    if node.is_null() {
+        return false;
+    }
+    unsafe {
+        use pgrx::pg_sys::{Node, NodeTag, contain_volatile_functions as volatile};
+        let plan = (*node).plan;
+        if plan.is_null() {
+            return true;
+        }
+        if volatile((*plan).qual.cast()) || volatile((*plan).targetlist.cast()) {
+            return true;
+        }
+        let extra = match (*plan).type_ {
+            NodeTag::T_SeqScan
+            | NodeTag::T_BitmapHeapScan
+            | NodeTag::T_SubqueryScan
+            | NodeTag::T_Material
+            | NodeTag::T_Sort
+            | NodeTag::T_IncrementalSort
+            | NodeTag::T_Memoize
+            | NodeTag::T_Unique
+            | NodeTag::T_SetOp
+            | NodeTag::T_Group
+            | NodeTag::T_Agg
+            | NodeTag::T_Append
+            | NodeTag::T_MergeAppend
+            | NodeTag::T_Gather
+            | NodeTag::T_GatherMerge
+            | NodeTag::T_BitmapAnd
+            | NodeTag::T_BitmapOr => false,
+            NodeTag::T_TidScan => {
+                volatile((*(plan.cast::<pgrx::pg_sys::TidScan>())).tidquals.cast())
+            }
+            NodeTag::T_Hash => volatile((*(plan.cast::<pgrx::pg_sys::Hash>())).hashkeys.cast()),
+            NodeTag::T_IndexScan => {
+                let p = &*(plan.cast::<pgrx::pg_sys::IndexScan>());
+                volatile(p.indexqual.cast()) || volatile(p.indexorderby.cast())
+            }
+            NodeTag::T_IndexOnlyScan => {
+                let p = &*(plan.cast::<pgrx::pg_sys::IndexOnlyScan>());
+                volatile(p.indexqual.cast())
+                    || volatile(p.indexorderby.cast())
+                    || volatile(p.recheckqual.cast())
+            }
+            NodeTag::T_BitmapIndexScan => volatile(
+                (*(plan.cast::<pgrx::pg_sys::BitmapIndexScan>()))
+                    .indexqual
+                    .cast(),
+            ),
+            NodeTag::T_Result => volatile(
+                (*(plan.cast::<pgrx::pg_sys::Result>()))
+                    .resconstantqual
+                    .cast::<Node>(),
+            ),
+            NodeTag::T_NestLoop => volatile(
+                (*(plan.cast::<pgrx::pg_sys::NestLoop>()))
+                    .join
+                    .joinqual
+                    .cast(),
+            ),
+            NodeTag::T_HashJoin => {
+                let p = &*(plan.cast::<pgrx::pg_sys::HashJoin>());
+                volatile(p.join.joinqual.cast())
+                    || volatile(p.hashclauses.cast())
+                    || volatile(p.hashkeys.cast())
+            }
+            NodeTag::T_MergeJoin => {
+                let p = &*(plan.cast::<pgrx::pg_sys::MergeJoin>());
+                volatile(p.join.joinqual.cast()) || volatile(p.mergeclauses.cast())
+            }
+            NodeTag::T_Limit => {
+                let p = &*(plan.cast::<pgrx::pg_sys::Limit>());
+                volatile(p.limitOffset) || volatile(p.limitCount)
+            }
+            NodeTag::T_ValuesScan => volatile(
+                (*(plan.cast::<pgrx::pg_sys::ValuesScan>()))
+                    .values_lists
+                    .cast(),
+            ),
+            NodeTag::T_FunctionScan => volatile(
+                (*(plan.cast::<pgrx::pg_sys::FunctionScan>()))
+                    .functions
+                    .cast(),
+            ),
+            _ => return true,
+        };
+        if extra {
+            return true;
+        }
+        pgrx::pg_sys::planstate_tree_walker(node, Some(planstate_has_volatile), context)
+    }
+}
+
 /// Prefiltering evaluates the executor's qual inside the index scan, and the
 /// executor evaluates it again on returned rows. Keep quals with volatile
-/// functions or SubPlans (whose plans `contain_volatile_functions` does not
-/// inspect) in the executor only (#34).
+/// functions (including inside attached SubPlans) in the executor only (#34).
 unsafe fn prefilter_safe(hack: Option<NonNull<pgrx::pg_sys::IndexScanState>>) -> bool {
     let Some(hack) = hack else {
         return true;
     };
     unsafe {
-        let plan = (*hack.as_ptr()).ss.ps.plan;
+        let ps = &mut (*hack.as_ptr()).ss.ps;
+        let plan = ps.plan;
         if plan.is_null() {
             return true;
         }
         let qual = (*plan).qual.cast::<pgrx::pg_sys::Node>();
-        !(pgrx::pg_sys::contain_volatile_functions(qual) || pgrx::pg_sys::contain_subplans(qual))
+        if pgrx::pg_sys::contain_volatile_functions(qual) {
+            return false;
+        }
+        if !pgrx::pg_sys::contain_subplans(qual) {
+            return true;
+        }
+        !pgrx::pg_sys::planstate_tree_walker(ps, Some(planstate_has_volatile), std::ptr::null_mut())
     }
 }
 
@@ -700,18 +804,23 @@ pub unsafe extern "C-unwind" fn amrescan(
         } else {
             &[]
         };
-        use pgrx::pg_sys::{SK_SEARCHARRAY, SK_SEARCHNOTNULL, SK_SEARCHNULL};
+        use pgrx::pg_sys::{SK_ISNULL, SK_SEARCHARRAY, SK_SEARCHNOTNULL, SK_SEARCHNULL};
         let null_test = |key: &pgrx::pg_sys::ScanKeyData| {
             key.sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL) as i32 != 0
         };
-        // An array of spheres gives no search vector: the recheck takes it, as a NULL sphere.
+        // Sphere operators are STRICT, so a NULL sphere or NULL array matches nothing.
+        let null_sphere = keys.iter().any(|key| {
+            key.sk_attno == 1 && (key.sk_flags & SK_ISNULL as i32) != 0 && !null_test(key)
+        });
+        // An array of spheres gives no search vector: the recheck takes it.
         let is_vector_key = |key: &pgrx::pg_sys::ScanKeyData| {
             key.sk_attno == 1 && key.sk_flags & SK_SEARCHARRAY as i32 == 0 && !null_test(key)
         };
         // NULL vectors are not indexed.
         let null_vector =
             (keys.iter()).any(|key| key.sk_attno == 1 && key.sk_flags & SK_SEARCHNULL as i32 != 0);
-        if (*scan).numberOfOrderBys == 0 && !keys.iter().any(is_vector_key) {
+        let has_vector_key = keys.iter().any(is_vector_key);
+        if (*scan).numberOfOrderBys == 0 && !has_vector_key {
             pgrx::error!(
                 "vector search with no WHERE clause and no ORDER BY clause is not supported"
             );
@@ -720,9 +829,16 @@ pub unsafe extern "C-unwind" fn amrescan(
         scanner.searched = false;
         drop(scanner.scanning.take());
         scanner.bump.reset();
-        if crate::index::scanners::null_order(scan) {
+        if null_sphere {
+            return;
+        }
+        if crate::index::scanners::null_order(scan) && !has_vector_key {
+            let max_scan_tuples = gucs::vchordrq_max_scan_tuples();
             scanner.scanning = Some(LazyCell::new(Box::new(move || {
-                Box::new(crate::index::scanners::NullOrderRows::new(scan))
+                Box::new(crate::index::scanners::NullOrderRows::new(
+                    scan,
+                    max_scan_tuples,
+                ))
             })));
             return;
         }
@@ -821,14 +937,14 @@ pub unsafe extern "C-unwind" fn amrescan(
                 for i in 0..(*scan).numberOfOrderBys {
                     let data = (*scan).orderByData.add(i as usize);
                     let value = (*data).sk_argument;
-                    let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    let is_null = ((*data).sk_flags & SK_ISNULL as i32) != 0;
                     builder.add((*data).sk_strategy, (!is_null).then_some(value));
                 }
                 for key in keys
                     .iter()
                     .filter(|key| key.sk_attno == 1 && !null_test(key))
                 {
-                    let is_null = (key.sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    let is_null = (key.sk_flags & SK_ISNULL as i32) != 0;
                     let value = (is_vector_key(key) && !is_null).then_some(key.sk_argument);
                     builder.add(key.sk_strategy, value);
                 }
@@ -846,11 +962,11 @@ pub unsafe extern "C-unwind" fn amrescan(
                 for i in 0..(*scan).numberOfOrderBys {
                     let data = (*scan).orderByData.add(i as usize);
                     let value = (*data).sk_argument;
-                    let is_null = ((*data).sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    let is_null = ((*data).sk_flags & SK_ISNULL as i32) != 0;
                     builder.add((*data).sk_strategy, (!is_null).then_some(value));
                 }
                 for key in keys.iter().filter(|key| !null_test(key)) {
-                    let is_null = (key.sk_flags & pgrx::pg_sys::SK_ISNULL as i32) != 0;
+                    let is_null = (key.sk_flags & SK_ISNULL as i32) != 0;
                     builder.add(key.sk_strategy, (!is_null).then_some(key.sk_argument));
                 }
                 LazyCell::new(Box::new(move || {

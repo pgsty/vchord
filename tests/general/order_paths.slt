@@ -229,6 +229,24 @@ EXECUTE parameter_multi(NULL);
 ----
 2
 
+# IS DISTINCT FROM keeps the vector index on both NOT NULL and nullable columns;
+# literal ORDER BY v <-> NULL without a sphere falls back to streaming SeqScan.
+statement ok
+CREATE TABLE order_not_null (id int, v vector(2) NOT NULL);
+INSERT INTO order_not_null VALUES (1,'[1,0]'), (2,'[-1,0]'), (3,'[2,0]');
+CREATE INDEX order_not_null_rq ON order_not_null USING vchordrq (v vector_l2_ops);
+
+query TTTI
+SELECT order_plan('SELECT id FROM order_not_null WHERE v IS DISTINCT FROM ''[1,0]'' ORDER BY v <-> ''[1,0]'' LIMIT 2') LIKE '%order_not_null_rq%',
+  order_plan('SELECT id FROM order_not_null WHERE v IS NULL OR id = 1 ORDER BY v <-> ''[0,0]'' LIMIT 2') LIKE '%order_not_null_rq%',
+  order_plan('SELECT id FROM order_not_null ORDER BY v <-> NULL LIMIT 2') NOT LIKE '%order_not_null_rq%',
+  (SELECT count(*) FROM (SELECT id FROM order_not_null WHERE v IS DISTINCT FROM '[1,0]' ORDER BY v <-> '[1,0]' LIMIT 2) s);
+----
+t t t 2
+
+statement ok
+DROP TABLE order_not_null;
+
 statement ok
 DEALLOCATE parameter_multi;
 DEALLOCATE parameter_key;

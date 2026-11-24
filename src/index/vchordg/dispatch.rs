@@ -93,40 +93,35 @@ where
     }
 }
 
-pub fn maintain<R>(
-    opfamily: Opfamily,
-    index: &R,
-    check: impl Fn(),
-    memory_limit: usize,
-) -> vchordg::Maintained
+pub fn maintain<R>(opfamily: Opfamily, index: &R, check: impl Fn()) -> vchordg::Maintained
 where
     R: RelationRead + RelationWrite,
     R::Page: Page<Opaque = vchordg::Opaque>,
 {
     match (opfamily.vector_kind(), opfamily.distance_kind()) {
         (VectorKind::Vecf32, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<VectOwned<f32>, L2S>>(index, &check, memory_limit)
+            vchordg::maintain::<_, Op<VectOwned<f32>, L2S>>(index, &check)
         }
         (VectorKind::Vecf32, DistanceKind::Dot) => {
-            vchordg::maintain::<_, Op<VectOwned<f32>, Dot>>(index, &check, memory_limit)
+            vchordg::maintain::<_, Op<VectOwned<f32>, Dot>>(index, &check)
         }
         (VectorKind::Vecf16, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<VectOwned<f16>, L2S>>(index, &check, memory_limit)
+            vchordg::maintain::<_, Op<VectOwned<f16>, L2S>>(index, &check)
         }
         (VectorKind::Vecf16, DistanceKind::Dot) => {
-            vchordg::maintain::<_, Op<VectOwned<f16>, Dot>>(index, &check, memory_limit)
+            vchordg::maintain::<_, Op<VectOwned<f16>, Dot>>(index, &check)
         }
         (VectorKind::Rabitq8, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<Rabitq8Owned, L2S>>(index, &check, memory_limit)
+            vchordg::maintain::<_, Op<Rabitq8Owned, L2S>>(index, &check)
         }
         (VectorKind::Rabitq8, DistanceKind::Dot) => {
-            vchordg::maintain::<_, Op<Rabitq8Owned, Dot>>(index, &check, memory_limit)
+            vchordg::maintain::<_, Op<Rabitq8Owned, Dot>>(index, &check)
         }
         (VectorKind::Rabitq4, DistanceKind::L2S) => {
-            vchordg::maintain::<_, Op<Rabitq4Owned, L2S>>(index, &check, memory_limit)
+            vchordg::maintain::<_, Op<Rabitq4Owned, L2S>>(index, &check)
         }
         (VectorKind::Rabitq4, DistanceKind::Dot) => {
-            vchordg::maintain::<_, Op<Rabitq4Owned, Dot>>(index, &check, memory_limit)
+            vchordg::maintain::<_, Op<Rabitq4Owned, Dot>>(index, &check)
         }
     }
 }
@@ -296,8 +291,7 @@ impl RandomProject for VectBorrowed<'_, f16> {
         let output = f16::vector_from_f32(&rotate(&input));
         // A rotation keeps the norm, not the largest component: a component
         // above 65504 becomes infinite in f16 and every distance NaN (#35).
-        // This runs on the build, insert and query paths.
-        if output.iter().any(|x| !x.to_f32().is_finite()) {
+        if output.iter().any(|x| (x.to_bits() & 0x7c00) == 0x7c00) {
             pgrx::error!(
                 "halfvec value is out of range for vchordg: a rotated component exceeds the halfvec range"
             );
