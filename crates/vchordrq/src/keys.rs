@@ -347,6 +347,9 @@ impl<'a> Columns<'a> {
     }
     /// Appends the row's columns, as an appendable tuple stores them.
     pub fn extend(self, keys: &Keys, row: &mut Vec<u8>) {
+        if keys.is_empty() {
+            return;
+        }
         if self.row.is_none() {
             row.extend_from_slice(&self.bytes[..keys.columns()]);
             return;

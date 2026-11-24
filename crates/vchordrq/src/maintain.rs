@@ -29,6 +29,11 @@ pub trait MaintainChooser {
     fn skip_unchanged(&self) -> bool {
         false
     }
+    /// Whether the caller owns the index exclusively (CREATE INDEX build
+    /// compaction), so no concurrent readers or writers access the lists.
+    fn is_exclusive(&self) -> bool {
+        false
+    }
 }
 
 pub struct Maintain {
@@ -39,12 +44,20 @@ pub struct Maintain {
     pub number_of_tuples: u64,
 }
 
-/// The pages a maintain holds unpublished or not yet freed: a list's new ones, then its old ones.
 #[derive(Default)]
-pub struct Pending(RefCell<Vec<u32>>);
+struct PendingPages {
+    /// Unpublished pages allocated for the list currently being compacted.
+    in_flight: Vec<u32>,
+    /// Retired pages from finished lists, kept locally for reuse by later lists.
+    reusable: Vec<u32>,
+}
+
+/// The pages a maintain holds unpublished or locally reusable before returning to `freepages`.
+#[derive(Default)]
+pub struct Pending(RefCell<PendingPages>);
 
 impl Pending {
-    /// Frees them, where the maintain holding them locks no page, as in its `check`.
+    /// Frees all held pages when maintain aborts with no page locked, as in its `check`.
     pub fn give_back<R: RelationRead + RelationWrite>(&self, index: &R)
     where
         R::Page: Page<Opaque = Opaque>,
@@ -53,24 +66,33 @@ impl Pending {
         let meta_bytes = meta_guard.get(1).expect("data corruption");
         let freepages_first = MetaTuple::deserialize_ref(meta_bytes).freepages_first();
         drop(meta_guard);
-        self.free(index, freepages_first, || ());
+        self.free_in_flight(index, freepages_first);
+        self.free_reusable(index, freepages_first, || ());
     }
-    fn free<R: RelationWrite>(
+    fn free_in_flight<R: RelationWrite>(&self, index: &R, freepages_first: u32)
+    where
+        R::Page: Page<Opaque = Opaque>,
+    {
+        loop {
+            let Some(id) = self.0.borrow_mut().in_flight.pop() else {
+                return;
+            };
+            freepages::free(index, freepages_first, id);
+        }
+    }
+    fn free_reusable<R: RelationWrite>(
         &self,
         index: &R,
         freepages_first: u32,
         mut between: impl FnMut(),
-    ) -> usize
-    where
+    ) where
         R::Page: Page<Opaque = Opaque>,
     {
-        let mut n = 0;
         loop {
-            let Some(id) = self.0.borrow_mut().pop() else {
-                return n;
+            let Some(id) = self.0.borrow_mut().reusable.pop() else {
+                return;
             };
             freepages::free(index, freepages_first, id);
-            n += 1;
             between();
         }
     }
@@ -96,7 +118,9 @@ where
     let height_of_root = meta_tuple.height_of_root();
     let freepages_first = meta_tuple.freepages_first();
     let keys = Keys::of_meta(meta_tuple);
+    let keyed = !keys.is_empty();
     let summarized = keys.summaries() != 0;
+    let exclusive = chooser.is_exclusive();
 
     type State = Vec<u32>;
     let mut state: State = vec![meta_tuple.first()];
@@ -134,17 +158,23 @@ where
     let hooked_index = RelationHooked(index, {
         id_3(|index: &R, opaque: Opaque, tracking_freespace: bool| {
             let mut buffers = buffers.borrow_mut();
-            let guard = if !tracking_freespace
-                && let Some(mut guard) = freepages::alloc(index, freepages_first)
-            {
-                buffers.number_of_formerly_allocated_pages += 1;
-                guard.clear(opaque);
-                guard
-            } else {
-                buffers.number_of_freshly_allocated_pages += 1;
-                index.extend(opaque, tracking_freespace)
-            };
-            pending.0.borrow_mut().push(guard.id());
+            let guard =
+                if !tracking_freespace && let Some(id) = pending.0.borrow_mut().reusable.pop() {
+                    buffers.number_of_formerly_allocated_pages += 1;
+                    let mut guard = index.write(id, false);
+                    guard.clear(opaque);
+                    guard
+                } else if !tracking_freespace
+                    && let Some(mut guard) = freepages::alloc(index, freepages_first)
+                {
+                    buffers.number_of_formerly_allocated_pages += 1;
+                    guard.clear(opaque);
+                    guard
+                } else {
+                    buffers.number_of_freshly_allocated_pages += 1;
+                    index.extend(opaque, tracking_freespace)
+                };
+            pending.0.borrow_mut().in_flight.push(guard.id());
             guard
         })
     });
@@ -176,93 +206,241 @@ where
 
         let mut trace = Vec::new();
         let mut tuples = 0_u64;
-        let rows = RefCell::new(Rows::new(dim as _));
-        let mut push = id_2(|row| {
-            rows.borrow_mut().push(row, &keys);
-            tuples += 1;
-        });
-        // at each page the frozen tape moves on to, it is unlocked for `check`
-        let freeze = |tape: &mut FrozenTapeWriter<'_, _>, branch, columns: &[u8]| {
-            let last = tape.last();
-            tape.push(branch, columns);
-            if tape.last() != last {
-                tape.unlock();
-                check();
+        let frozen_accessor = || {
+            FunctionalAccessor::new(
+                Vec::<[u8; 16]>::new(),
+                Vec::<[u8; 16]>::extend_from_slice,
+                id_1(
+                    |elements: Vec<_>, (metadata, delta): (&[[f32; 32]; 4], &[f32; 32])| {
+                        let unpacked = unpack(&elements);
+                        std::array::from_fn(|i| {
+                            let f = |&x| [x & 1 != 0, x & 2 != 0, x & 4 != 0, x & 8 != 0];
+                            let signs = unpacked[i].iter().flat_map(f).collect::<Vec<_>>();
+                            (
+                                (
+                                    rabitq::bit::CodeMetadata {
+                                        dis_u_2: metadata[0][i],
+                                        factor_cnt: metadata[1][i],
+                                        factor_ip: metadata[2][i],
+                                        factor_err: metadata[3][i],
+                                    },
+                                    signs,
+                                ),
+                                delta[i],
+                            )
+                        })
+                    },
+                ),
+            )
+        };
+
+        let mut tape: Option<FrozenTapeWriter<'_, _>> = None;
+        let mut pages_written = 0_usize;
+        const UNLOCK_INTERVAL_PAGES: usize = 16;
+        let mut freeze = |tape: &mut Option<FrozenTapeWriter<'_, _>>, branch, columns: &[u8]| {
+            let writer =
+                tape.get_or_insert_with(|| FrozenTapeWriter::create(&hooked_index, &keys, false));
+            let last = writer.last();
+            writer.push(branch, columns);
+            if !exclusive && writer.last() != last {
+                pages_written += 1;
+                if pages_written >= UNLOCK_INTERVAL_PAGES {
+                    pages_written = 0;
+                    writer.unlock();
+                    check();
+                }
             }
         };
-        let mut tape = FrozenTapeWriter::create(&hooked_index, &keys, false);
-        let mut between = || {
-            // a list larger than `memory` is written as sorted runs
-            if rows.borrow().bytes() > memory {
+
+        let mut at = (appendable_first, 0);
+        let mut pass = 0_usize;
+        let rows = RefCell::new(Rows::new(dim as _));
+        let stream_batch: RefCell<Vec<Branch<NonZero<u64>>>> = RefCell::new(Vec::new());
+        const STREAM_BATCH_ROWS: usize = 256;
+
+        if exclusive {
+            if !keyed {
+                let mut push = id_2(|row| {
+                    freeze(&mut tape, branch_of_row(row, dim as _), &[]);
+                    tuples += 1;
+                });
+                let pages = tape::read_directory_words::<R>(
+                    tape::by_next(index, directory_first).inspect(|guard| trace.push(guard.id())),
+                    &mut words,
+                    true,
+                );
+                tape::read_frozen_tape::<R, _, _>(
+                    tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied())
+                        .inspect(|guard| trace.push(guard.id())),
+                    tape::All,
+                    frozen_accessor,
+                    (),
+                    &mut push,
+                );
+                let appendable_guards =
+                    tape::by_next(index, appendable_first).inspect(|guard| trace.push(guard.id()));
+                let access = |metadata, elements: &[u64], delta| {
+                    (unpack_code(metadata, elements, dim as _), delta)
+                };
+                tape::read_appendable_tape::<R, _>(appendable_guards, 0, access, (), &mut push);
+            } else {
+                let mut push = id_2(|row| {
+                    let mut r = rows.borrow_mut();
+                    r.push(row, &keys);
+                    tuples += 1;
+                    if r.bytes() > memory {
+                        r.flush(&keys, |branch, columns| freeze(&mut tape, branch, columns));
+                    }
+                });
+                let pages = tape::read_directory_words::<R>(
+                    tape::by_next(index, directory_first).inspect(|guard| trace.push(guard.id())),
+                    &mut words,
+                    true,
+                );
+                tape::read_frozen_tape::<R, _, _>(
+                    tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied())
+                        .inspect(|guard| trace.push(guard.id())),
+                    tape::All,
+                    frozen_accessor,
+                    (),
+                    &mut push,
+                );
+                let appendable_guards =
+                    tape::by_next(index, appendable_first).inspect(|guard| trace.push(guard.id()));
+                let access = |metadata, elements: &[u64], delta| {
+                    (unpack_code(metadata, elements, dim as _), delta)
+                };
+                tape::read_appendable_tape::<R, _>(appendable_guards, 0, access, (), &mut push);
                 rows.borrow_mut()
                     .flush(&keys, |branch, columns| freeze(&mut tape, branch, columns));
             }
-            tape.unlock();
-            check();
-        };
-        let pages = tape::read_directory_words::<R>(
-            paced(tape::by_next(index, directory_first), &mut between)
-                .inspect(|guard| trace.push(guard.id())),
-            &mut words,
-            true,
-        );
-        tape::read_frozen_tape::<R, _, _>(
-            paced(
-                tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied()),
-                &mut between,
-            )
-            .inspect(|guard| trace.push(guard.id())),
-            tape::All,
-            || {
-                FunctionalAccessor::new(
-                    Vec::<[u8; 16]>::new(),
-                    Vec::<[u8; 16]>::extend_from_slice,
-                    id_1(
-                        |elements: Vec<_>, (metadata, delta): (&[[f32; 32]; 4], &[f32; 32])| {
-                            let unpacked = unpack(&elements);
-                            std::array::from_fn(|i| {
-                                let f = |&x| [x & 1 != 0, x & 2 != 0, x & 4 != 0, x & 8 != 0];
-                                let signs = unpacked[i].iter().flat_map(f).collect::<Vec<_>>();
-                                (
-                                    (
-                                        rabitq::bit::CodeMetadata {
-                                            dis_u_2: metadata[0][i],
-                                            factor_cnt: metadata[1][i],
-                                            factor_ip: metadata[2][i],
-                                            factor_err: metadata[3][i],
-                                        },
-                                        signs,
-                                    ),
-                                    delta[i],
-                                )
-                            })
-                        },
-                    ),
+        } else if !keyed {
+            let mut push = id_2(|row| {
+                stream_batch.borrow_mut().push(branch_of_row(row, dim as _));
+                tuples += 1;
+            });
+            let mut between = || {
+                if stream_batch.borrow().len() >= STREAM_BATCH_ROWS {
+                    for branch in stream_batch.borrow_mut().drain(..) {
+                        freeze(&mut tape, branch, &[]);
+                    }
+                    if let Some(writer) = tape.as_mut() {
+                        writer.unlock();
+                    }
+                }
+                check();
+            };
+            let pages = tape::read_directory_words::<R>(
+                paced(tape::by_next(index, directory_first), &mut between)
+                    .inspect(|guard| trace.push(guard.id())),
+                &mut words,
+                true,
+            );
+            tape::read_frozen_tape::<R, _, _>(
+                paced(
+                    tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied()),
+                    &mut between,
                 )
-            },
-            (),
-            &mut push,
-        );
-        // the appendable tape in passes, each through the tail it starts with: into the sort, then copied
-        let mut at = (appendable_first, 0);
-        trace.push(appendable_first);
-        let mut pass = read_appendable(index, &mut at, &mut trace, &mut between, &mut push, dim);
+                .inspect(|guard| trace.push(guard.id())),
+                tape::All,
+                frozen_accessor,
+                (),
+                &mut push,
+            );
+            trace.push(appendable_first);
+            pass = read_appendable(
+                index,
+                &mut at,
+                &mut trace,
+                ReadLimit::InitialTail,
+                &mut between,
+                &mut push,
+                dim,
+            );
+            for branch in stream_batch.borrow_mut().drain(..) {
+                freeze(&mut tape, branch, &[]);
+            }
+        } else {
+            let mut push = id_2(|row| {
+                rows.borrow_mut().push(row, &keys);
+                tuples += 1;
+            });
+            let mut between = || {
+                // a list larger than `memory` is written as sorted runs
+                if rows.borrow().bytes() > memory {
+                    rows.borrow_mut()
+                        .flush(&keys, |branch, columns| freeze(&mut tape, branch, columns));
+                    if let Some(writer) = tape.as_mut() {
+                        writer.unlock();
+                    }
+                }
+                check();
+            };
+            let pages = tape::read_directory_words::<R>(
+                paced(tape::by_next(index, directory_first), &mut between)
+                    .inspect(|guard| trace.push(guard.id())),
+                &mut words,
+                true,
+            );
+            tape::read_frozen_tape::<R, _, _>(
+                paced(
+                    tape::by_directory(&mut prefetch_h0_tuples, words[..pages].iter().copied()),
+                    &mut between,
+                )
+                .inspect(|guard| trace.push(guard.id())),
+                tape::All,
+                frozen_accessor,
+                (),
+                &mut push,
+            );
+            // the appendable tape in passes, each through the tail it starts with: into the sort, then copied
+            trace.push(appendable_first);
+            pass = read_appendable(
+                index,
+                &mut at,
+                &mut trace,
+                ReadLimit::InitialTail,
+                &mut between,
+                &mut push,
+                dim,
+            );
+            rows.borrow_mut()
+                .flush(&keys, |branch, columns| freeze(&mut tape, branch, columns));
+        }
 
-        rows.borrow_mut()
-            .flush(&keys, |branch, columns| freeze(&mut tape, branch, columns));
+        let tape = tape.unwrap_or_else(|| FrozenTapeWriter::create(&hooked_index, &keys, false));
         let (frozen_tape, branches, columns) = tape.into_inner();
         let frozen_first = { frozen_tape }.first();
 
         let mut directory = tape::Layout::new(keys.summaries());
-        for guard in paced(tape::by_next(index, frozen_first), &check) {
-            directory.page(guard.id());
-            if summarized {
-                for i in 1..=guard.len() {
-                    let bytes = guard.get(i).expect("data corruption");
-                    directory.tuple(match FrozenTuple::deserialize_ref(bytes) {
-                        FrozenTupleReader::_0(x) => Some(keys.summarize(x.payload(), x.columns())),
-                        FrozenTupleReader::_1(_) => None,
-                    });
+        if exclusive {
+            for guard in tape::by_next(index, frozen_first) {
+                directory.page(guard.id());
+                if summarized {
+                    for i in 1..=guard.len() {
+                        let bytes = guard.get(i).expect("data corruption");
+                        directory.tuple(match FrozenTuple::deserialize_ref(bytes) {
+                            FrozenTupleReader::_0(x) => {
+                                Some(keys.summarize(x.payload(), x.columns()))
+                            }
+                            FrozenTupleReader::_1(_) => None,
+                        });
+                    }
+                }
+            }
+        } else {
+            for guard in paced(tape::by_next(index, frozen_first), &check) {
+                directory.page(guard.id());
+                if summarized {
+                    for i in 1..=guard.len() {
+                        let bytes = guard.get(i).expect("data corruption");
+                        directory.tuple(match FrozenTuple::deserialize_ref(bytes) {
+                            FrozenTupleReader::_0(x) => {
+                                Some(keys.summarize(x.payload(), x.columns()))
+                            }
+                            FrozenTupleReader::_1(_) => None,
+                        });
+                    }
                 }
             }
         }
@@ -279,49 +457,115 @@ where
         for (i, branch) in branches.into_iter().enumerate() {
             appendable_tape.push(appendable(branch, &columns[i * width..][..width]));
         }
-        let copy = |tape: &mut tape::TapeWriter<_, _>| {
-            rows.borrow_mut().flush(&keys, |branch, columns| {
-                tape.push(appendable(branch, columns));
+
+        if exclusive {
+            let appendable_first = { appendable_tape }.first();
+            let mut jump_guard = index.write(first, false);
+            let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
+            let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
+            *jump_tuple.directory_first() = directory_first;
+            *jump_tuple.frozen_first() = frozen_first;
+            *jump_tuple.appendable_first() = appendable_first;
+            *jump_tuple.tuples() = tuples;
+            number_of_tuples += tuples;
+            drop(jump_guard);
+            number_of_freed_pages += trace.len();
+            {
+                let mut held = pending.0.borrow_mut();
+                held.in_flight.clear();
+                held.reusable.extend(trace);
+            }
+            check();
+        } else {
+            let mut push_tail = id_2(|row| {
+                if keyed {
+                    rows.borrow_mut().push(row, &keys);
+                } else {
+                    stream_batch.borrow_mut().push(branch_of_row(row, dim as _));
+                }
+                tuples += 1;
             });
-        };
-        // another pass only while they shrink: the lock waits for what is appended during the last
-        loop {
-            let n = read_appendable(
+            let copy = |tape: &mut tape::TapeWriter<_, _>| -> bool {
+                if keyed {
+                    if rows.borrow().len() == 0 {
+                        return false;
+                    }
+                    rows.borrow_mut().flush(&keys, |branch, columns| {
+                        tape.push(appendable(branch, columns));
+                    });
+                    true
+                } else {
+                    if stream_batch.borrow().is_empty() {
+                        return false;
+                    }
+                    for branch in stream_batch.borrow_mut().drain(..) {
+                        tape.push(appendable(branch, &[]));
+                    }
+                    true
+                }
+            };
+            appendable_tape.unlock();
+            // another pass only while they shrink: the lock waits for what is appended during the last
+            loop {
+                let n = read_appendable(
+                    index,
+                    &mut at,
+                    &mut trace,
+                    ReadLimit::MaxPages(pass),
+                    || {
+                        if copy(&mut appendable_tape) {
+                            appendable_tape.unlock();
+                        }
+                        check();
+                    },
+                    &mut push_tail,
+                    dim,
+                );
+                if n >= pass {
+                    break;
+                }
+                pass = n;
+            }
+            if copy(&mut appendable_tape) {
+                appendable_tape.unlock();
+            }
+
+            // inserts append under the jump page's share lock, so none is under way
+            let mut jump_guard = index.write(first, false);
+            read_appendable(
                 index,
                 &mut at,
                 &mut trace,
-                || {
-                    copy(&mut appendable_tape);
-                    appendable_tape.unlock();
-                    check();
-                },
-                &mut push,
+                ReadLimit::ToEnd,
+                || (),
+                &mut push_tail,
                 dim,
             );
-            if n >= pass {
-                break;
+            copy(&mut appendable_tape);
+            let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
+            let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
+            *jump_tuple.directory_first() = directory_first;
+            *jump_tuple.frozen_first() = frozen_first;
+            *jump_tuple.appendable_first() = { appendable_tape }.first();
+            *jump_tuple.tuples() = tuples;
+            number_of_tuples += tuples;
+
+            // dropping the guard publishes the new tapes; readers of the old ones hold its share lock
+            drop(jump_guard);
+            number_of_freed_pages += trace.len();
+            {
+                let mut held = pending.0.borrow_mut();
+                held.in_flight.clear();
+                held.reusable.extend(trace);
             }
-            pass = n;
+            check();
         }
-        copy(&mut appendable_tape);
-        appendable_tape.unlock();
+    }
 
-        // inserts append under the jump page's share lock, so none is under way
-        let mut jump_guard = index.write(first, false);
-        read_appendable(index, &mut at, &mut trace, || (), &mut push, dim);
-        copy(&mut appendable_tape);
-        let jump_bytes = jump_guard.get_mut(1).expect("data corruption");
-        let mut jump_tuple = JumpTuple::deserialize_mut(jump_bytes);
-        *jump_tuple.directory_first() = directory_first;
-        *jump_tuple.frozen_first() = frozen_first;
-        *jump_tuple.appendable_first() = { appendable_tape }.first();
-        *jump_tuple.tuples() = tuples;
-        number_of_tuples += tuples;
-
-        // dropping the guard publishes the new tapes; readers of the old ones hold its share lock
-        drop(jump_guard);
-        *pending.0.borrow_mut() = trace;
-        number_of_freed_pages += pending.free(index, freepages_first, &check);
+    if exclusive {
+        pending.free_reusable(index, freepages_first, || ());
+    } else {
+        pending.free_reusable(index, freepages_first, &check);
     }
 
     let buffers = RefCell::into_inner(buffers);
@@ -334,6 +578,19 @@ where
     }
 }
 
+fn branch_of_row(row: tape::Row<'_, (rabitq::bit::Code, f32)>, dim: usize) -> Branch<NonZero<u64>> {
+    let ((metadata, mut signs), delta) = row.value;
+    signs.truncate(dim);
+    Branch {
+        code: (metadata, signs),
+        delta,
+        prefetch: row.prefetch.to_vec(),
+        head: row.head,
+        norm: 0.0,
+        extra: row.payload,
+    }
+}
+
 /// `pages`, with `between` run before each is read.
 fn paced<I: Iterator>(mut pages: I, mut between: impl FnMut()) -> impl Iterator<Item = I::Item> {
     std::iter::from_fn(move || {
@@ -342,11 +599,19 @@ fn paced<I: Iterator>(mut pages: I, mut between: impl FnMut()) -> impl Iterator<
     })
 }
 
-/// Reads the appendable tape on from `at`, a page and its tuples read, through the tail it starts with; returns its pages.
+#[derive(Clone, Copy)]
+enum ReadLimit {
+    InitialTail,
+    MaxPages(usize),
+    ToEnd,
+}
+
+/// Reads the appendable tape on from `at`, a page and its tuples read; returns its pages read.
 fn read_appendable<'b, R: RelationRead + 'b>(
     index: &'b R,
     at: &mut (u32, u16),
     trace: &mut Vec<u32>,
+    limit: ReadLimit,
     mut between: impl FnMut(),
     callback: &mut impl for<'a> FnMut(tape::Row<'a, (rabitq::bit::Code, f32)>),
     dim: u32,
@@ -354,8 +619,24 @@ fn read_appendable<'b, R: RelationRead + 'b>(
 where
     R::Page: Page<Opaque = Opaque>,
 {
-    let tail = tape::by_next(index, at.0).last().expect("a page").id();
     let (first, skip) = *at;
+    let stop_at = match limit {
+        ReadLimit::InitialTail => {
+            let guard = index.read(first);
+            let next_id = guard.get_opaque().next;
+            drop(guard);
+            if next_id == u32::MAX {
+                Some(first)
+            } else {
+                Some(tape::by_next(index, next_id).last().expect("a page").id())
+            }
+        }
+        ReadLimit::MaxPages(_) | ReadLimit::ToEnd => None,
+    };
+    let max_pages = match limit {
+        ReadLimit::MaxPages(n) => Some(n),
+        ReadLimit::InitialTail | ReadLimit::ToEnd => None,
+    };
     let mut pages = 0;
     let mut next = Some(first);
     let guards = std::iter::from_fn(|| {
@@ -365,9 +646,12 @@ where
             trace.push(id);
         }
         let guard = index.read(id);
-        next = (id != tail).then(|| guard.get_opaque().next);
+        let next_id = guard.get_opaque().next;
         *at = (id, guard.len());
         pages += 1;
+        let stop =
+            next_id == u32::MAX || stop_at == Some(id) || max_pages.is_some_and(|cap| pages >= cap);
+        next = (!stop).then_some(next_id);
         Some(guard)
     });
     let access =
@@ -407,6 +691,20 @@ where
     let jump_guard = index.read(first);
     let jump_bytes = jump_guard.get(1).expect("data corruption");
     let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
+    // Check the short appendable tape first so insert-heavy lists bail out
+    // without scanning the entire frozen tape.
+    let mut appendable = 0_u64;
+    for guard in tape::by_next(index, jump_tuple.appendable_first()) {
+        for i in 1..=guard.len() {
+            let bytes = guard.get(i).expect("data corruption");
+            // a deleted entry: the list needs compacting
+            AppendableTuple::deserialize_ref(bytes).payload()?;
+            appendable += 1;
+        }
+        if appendable >= 32 {
+            return None;
+        }
+    }
     let mut frozen = 0_u64;
     let mut words = Vec::new();
     let directory = tape::by_next(index, jump_tuple.directory_first());
@@ -421,18 +719,6 @@ where
                 }
                 frozen += 32;
             }
-        }
-    }
-    let mut appendable = 0_u64;
-    for guard in tape::by_next(index, jump_tuple.appendable_first()) {
-        for i in 1..=guard.len() {
-            let bytes = guard.get(i).expect("data corruption");
-            // a deleted entry: the list needs compacting
-            AppendableTuple::deserialize_ref(bytes).payload()?;
-            appendable += 1;
-        }
-        if appendable >= 32 {
-            return None;
         }
     }
     drop(jump_guard);
