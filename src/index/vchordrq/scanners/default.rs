@@ -137,7 +137,10 @@ impl SearchBuilder for DefaultBuilder {
             }
             _ => radius,
         });
-        let bound = threshold.map(|radius| opfamily.bound(radius));
+        let ball = threshold.map(|radius| vchordrq::Ball {
+            bound: opfamily.bound(radius),
+            reach: opfamily.reach(radius),
+        });
         let needs_recheck = has_spheres || filter_inexact;
         if self.empty {
             return Box::new(std::iter::empty());
@@ -179,7 +182,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::new(projected), bound, options.search, bump)
+                        (index, Rc::new(projected), ball, options.search, bump)
                     );
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
@@ -191,7 +194,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::new(projected), bound, options.search, bump)
+                        (index, Rc::new(projected), ball, options.search, bump)
                     );
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
@@ -203,7 +206,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::new(projected), bound, options.search, bump)
+                        (index, Rc::new(projected), ball, options.search, bump)
                     );
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
@@ -215,7 +218,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::new(projected), bound, options.search, bump)
+                        (index, Rc::new(projected), ball, options.search, bump)
                     );
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
@@ -226,7 +229,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::clone(&unprojected), bound, options.search, bump)
+                        (index, Rc::clone(&unprojected), ball, options.search, bump)
                     );
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
@@ -237,7 +240,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::clone(&unprojected), bound, options.search, bump)
+                        (index, Rc::clone(&unprojected), ball, options.search, bump)
                     );
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
@@ -248,7 +251,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::clone(&unprojected), bound, options.search, bump)
+                        (index, Rc::clone(&unprojected), ball, options.search, bump)
                     );
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
@@ -259,7 +262,7 @@ impl SearchBuilder for DefaultBuilder {
                         index,
                         options.io_search,
                         default_search::<_, Op>,
-                        (index, Rc::clone(&unprojected), bound, options.search, bump)
+                        (index, Rc::clone(&unprojected), ball, options.search, bump)
                     );
                     rerank::<_, Op>(index, candidates, unprojected, reranking, fetcher, opfamily)
                 }
