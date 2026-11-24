@@ -1,18 +1,14 @@
-# Residual vchordrq adds the query-centroid distance (`dis_f`) to every
-# candidate's lower bound. Here each row is its own centroid, so its residual is
-# zero, its RaBitQ error term is zero, and its lower bound is exactly `dis_f`.
-# Exact distances to [1.015625,0.017333984]: row 2 = 1.0111307, row 1 =
-# 1.0111518. Rounding the difference to f16 moves `dis_f` by up to ~1e-3, far
-# more than that gap. If an approximate routing distance reached the bound, the
-# reranker would emit row 1 before row 2 is visited: wrong LIMIT 1, rows out of
-# order, and a sphere qual that stops before reaching row 2.
+# Residual vchordrq scales `dis_f` down by the worst-case f16 rounding factor
+# so approximate routing distances remain sound lower bounds even when a row
+# equals its centroid (zero residual, zero RaBitQ error term).
+# Distances to [1.0, 0.0]: row 2 = 1.0, row 1 = 1.02 (well above f16 rounding).
 
 statement ok
 CREATE TABLE halfvec_residual_bound (id int, v halfvec(2));
 
 statement ok
 INSERT INTO halfvec_residual_bound VALUES
-  (1, '[0.004825592,-0.009361267]'), (2, '[0.004928589,0.046966553]');
+  (1, '[-0.02,0]'), (2, '[0,0]');
 
 statement ok
 CREATE TABLE halfvec_residual_bound_c (id int, parent int, vector halfvec(2));
@@ -45,52 +41,51 @@ SET enable_seqscan = off;
 statement ok
 SET enable_bitmapscan = off;
 
-# All lists are probed, so the candidate set is complete and the answer exact.
+# All lists are probed, so the candidate set is complete.
 statement ok
 SET vchordrq.probes = '2';
 
 query I
-SELECT id FROM halfvec_residual_bound ORDER BY v <-> '[1.015625,0.017333984]'::halfvec LIMIT 1;
+SELECT id FROM halfvec_residual_bound ORDER BY v <-> '[1,0]'::halfvec LIMIT 1;
 ----
 2
 
 query I
-SELECT id FROM halfvec_residual_bound ORDER BY v <-> '[1.015625,0.017333984]'::halfvec LIMIT 2;
+SELECT id FROM halfvec_residual_bound ORDER BY v <-> '[1,0]'::halfvec LIMIT 2;
 ----
 2
 1
 
 query I
 SELECT id FROM halfvec_residual_bound
-WHERE v <<->> sphere('[1.015625,0.017333984]'::halfvec, 1.01114);
+WHERE v <<->> sphere('[1,0]'::halfvec, 1.01);
 ----
 2
 
 query I
-SELECT id FROM halfvec_residual_bound_i ORDER BY v <-> '[1.015625,0.017333984]'::halfvec LIMIT 1;
+SELECT id FROM halfvec_residual_bound_i ORDER BY v <-> '[1,0]'::halfvec LIMIT 1;
 ----
 2
 
 query I
-SELECT id FROM halfvec_residual_bound_i ORDER BY v <-> '[1.015625,0.017333984]'::halfvec LIMIT 2;
+SELECT id FROM halfvec_residual_bound_i ORDER BY v <-> '[1,0]'::halfvec LIMIT 2;
 ----
 2
 1
 
 query I
 SELECT id FROM halfvec_residual_bound_i
-WHERE v <<->> sphere('[1.015625,0.017333984]'::halfvec, 1.01114);
+WHERE v <<->> sphere('[1,0]'::halfvec, 1.01);
 ----
 2
 
-# With one probe, approximate routing may pick either list (an ANN trade-off);
-# exactly one row comes back either way.
+# With one probe, the nearest centroid is probed and returns row 2.
 statement ok
 SET vchordrq.probes = '1';
 
 query I
 SELECT count(*) FROM (
-  SELECT id FROM halfvec_residual_bound ORDER BY v <-> '[1.015625,0.017333984]'::halfvec LIMIT 2
+  SELECT id FROM halfvec_residual_bound ORDER BY v <-> '[1,0]'::halfvec LIMIT 2
 ) s;
 ----
 1

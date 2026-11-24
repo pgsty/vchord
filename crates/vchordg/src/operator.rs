@@ -9,8 +9,8 @@
 use crate::types::DistanceKind;
 use distance::Distance;
 use index_accessor::{
-    Accessor1, Accessor2, ByteDistanceAccessor, DefaultWithDimension, DistanceAccessor, Dot,
-    HalfbyteDistanceAccessor, L2S,
+    Accessor1, Accessor2, ApproximateL2S, ByteDistanceAccessor, DefaultWithDimension,
+    DistanceAccessor, Dot, HalfbyteDistanceAccessor, L2S,
 };
 use rabitq::bits::Bits;
 use simd::{Floating, f16};
@@ -351,7 +351,7 @@ impl Operator for Op<VectOwned<f16>, L2S> {
 
     type Vector = VectOwned<f16>;
 
-    type DistanceAccessor = DistanceAccessor<VectOwned<f16>, L2S>;
+    type DistanceAccessor = DistanceAccessor<VectOwned<f16>, ApproximateL2S>;
 
     fn process(
         bits: Bits,
@@ -376,7 +376,7 @@ impl Operator for Op<VectOwned<f16>, L2S> {
         rhs: <Self::Vector as VectorOwned>::Borrowed<'_>,
     ) -> Distance {
         // Graph pruning is approximate; search results use DistanceAccessor.
-        Distance::from_f32(f16::reduce_sum_of_d2_approx(lhs.slice(), rhs.slice()))
+        Distance::from_f32_non_nan(f16::reduce_sum_of_d2_approx(lhs.slice(), rhs.slice()))
     }
 }
 

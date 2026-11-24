@@ -46,6 +46,12 @@ impl Distance {
     #[inline(always)]
     pub const fn from_f32(value: f32) -> Self {
         let value = if value.is_nan() { f32::NAN } else { value };
+        Self::from_f32_non_nan(value)
+    }
+
+    /// Converts a non-NaN `f32` without a NaN-canonicalization check.
+    #[inline(always)]
+    pub const fn from_f32_non_nan(value: f32) -> Self {
         let bits = value.to_bits() as i32;
         let mask = ((bits >> 31) as u32) >> 1;
         let res = bits ^ (mask as i32);

@@ -93,7 +93,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
             head,
             LAccess::new(
                 O::Vector::unpack(vector),
-                O::RoutingAccessor::default_with_dimension(dim),
+                O::DistanceAccessor::default_with_dimension(dim),
             ),
         );
         let norm = meta_tuple.centroid_norm();
@@ -146,7 +146,7 @@ pub fn insert<'b, R: RelationRead + RelationWrite, O: Operator>(
                     head,
                     LAccess::new(
                         O::Vector::unpack(vector),
-                        O::RoutingAccessor::default_with_dimension(dim),
+                        O::DistanceAccessor::default_with_dimension(dim),
                     ),
                 );
                 cache.push((Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first)));

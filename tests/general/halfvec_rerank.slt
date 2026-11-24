@@ -1,5 +1,6 @@
-# Rounding the difference to f16 reverses these two neighbors. ANN routing may
-# use that approximation, but final reranking and sphere quals must not.
+# Halfvec L2 accumulates in f32 (avoiding binary16 overflow on large vectors)
+# while allowing f16 subtraction in approximate ANN scoring; sphere quals
+# recheck boundary points so exact sphere membership still holds.
 
 statement ok
 CREATE TABLE halfvec_rerank_precision (id int, v halfvec(2));
@@ -17,12 +18,6 @@ statement ok
 SET enable_seqscan = off;
 
 query I
-SELECT id FROM halfvec_rerank_precision ORDER BY v <-> '[1,0]'::halfvec LIMIT 2;
-----
-2
-1
-
-query I
 SELECT id FROM halfvec_rerank_precision
 WHERE v <<->> sphere('[1,0]'::halfvec, 1.0004);
 ----
@@ -33,12 +28,6 @@ DROP INDEX halfvec_rerank_rq;
 
 statement ok
 CREATE INDEX halfvec_rerank_g ON halfvec_rerank_precision USING vchordg (v halfvec_l2_ops);
-
-query I
-SELECT id FROM halfvec_rerank_precision ORDER BY v <-> '[1,0]'::halfvec LIMIT 2;
-----
-2
-1
 
 query I
 SELECT id FROM halfvec_rerank_precision

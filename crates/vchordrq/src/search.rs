@@ -35,17 +35,7 @@ use vector::{VectorBorrowed, VectorOwned};
 
 type Extra1<'b> = &'b mut (u32, f32, u16, BorrowedIter<'b>);
 
-/// Where a centroid's vector is stored: its head and the pages it spans.
-/// Kept so its exact distance can be recomputed after approximate routing.
-type Location<'b> = Option<(u16, BorrowedIter<'b>)>;
-
-/// (distance, norm, first, location); until it is read, the distance may be routing's estimate.
-type List<'b> = (
-    Reverse<Distance>,
-    AlwaysEqual<f32>,
-    AlwaysEqual<u32>,
-    AlwaysEqual<Location<'b>>,
-);
+type List = (Reverse<Distance>, AlwaysEqual<f32>, AlwaysEqual<u32>);
 
 pub type Candidate<'b> = (
     (Reverse<Distance>, AlwaysEqual<()>),
@@ -76,7 +66,7 @@ struct Searcher<'b, R, O, V, B, H1, H0> {
     is_residual: bool,
     /// Bottom first.
     cells: Vec<u32>,
-    root: List<'b>,
+    root: List,
     lut: (BlockLut, BinaryLut),
     epsilon: f32,
     prefetch_h1_vectors: H1,
@@ -86,8 +76,8 @@ struct Searcher<'b, R, O, V, B, H1, H0> {
     _operator: PhantomData<fn() -> O>,
 }
 
-struct Route<'b, I> {
-    lists: Vec<List<'b>>,
+struct Route<I> {
+    lists: Vec<List>,
     complete: bool,
     /// The other lists of the bottom level, nearest first, if `sorted`.
     rest: I,
@@ -139,22 +129,16 @@ where
                 head,
                 LAccess::new(
                     O::Vector::unpack(vector),
-                    O::RoutingAccessor::default_with_dimension(dim),
+                    O::DistanceAccessor::default_with_dimension(dim),
                 ),
             );
-            (
-                Reverse(distance),
-                AlwaysEqual(norm),
-                AlwaysEqual(first),
-                AlwaysEqual(Some((head, prefetch))),
-            )
+            (Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first))
         } else {
             // fast path
             (
                 Reverse(Distance::ZERO),
                 AlwaysEqual(norm),
                 AlwaysEqual(first),
-                AlwaysEqual(None),
             )
         };
         drop(meta_guard);
@@ -180,7 +164,7 @@ where
         &mut self,
         probes: &[u32],
         sorted: bool,
-    ) -> Route<'b, impl Iterator<Item = List<'b>> + use<'b, R, O, V, B, H1, H0>> {
+    ) -> Route<impl Iterator<Item = List> + use<'b, R, O, V, B, H1, H0>> {
         let Self {
             ref vector,
             index,
@@ -194,9 +178,9 @@ where
             ref mut prefetch_h1_vectors,
             ..
         } = *self;
-        let mut step = |lists: Vec<List<'b>>| {
+        let mut step = |lists: Vec<List>| {
             let mut results = LinkedVec::<(_, AlwaysEqual<Extra1<'b>>)>::new();
-            for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), _) in lists {
+            for (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first)) in lists {
                 let residual =
                     is_residual.then(|| O::routing_residual(&lut.0, dis_f.to_f32(), norm));
                 tape::read_h1_tape::<R, _, _>(
@@ -217,11 +201,11 @@ where
                 );
             }
             let mut heap = prefetch_h1_vectors.prefetch(results.into_vec());
-            let mut cache = BinaryHeap::<(_, _, _, _)>::new();
+            let mut cache = BinaryHeap::<(_, _, _)>::new();
             let vector = vector.clone();
             std::iter::from_fn(move || {
                 while let Some((
-                    (Reverse(_), AlwaysEqual(&mut (first, norm, head, pages))),
+                    (Reverse(_), AlwaysEqual(&mut (first, norm, head, ..))),
                     prefetch,
                 )) = heap.next_if(|(d, _)| Some(*d) > cache.peek().map(|(d, ..)| *d))
                 {
@@ -230,15 +214,10 @@ where
                         head,
                         LAccess::new(
                             O::Vector::unpack(vector.borrow().as_borrowed()),
-                            O::RoutingAccessor::default_with_dimension(dim),
+                            O::DistanceAccessor::default_with_dimension(dim),
                         ),
                     );
-                    cache.push((
-                        Reverse(distance),
-                        AlwaysEqual(norm),
-                        AlwaysEqual(first),
-                        AlwaysEqual(Some((head, pages))),
-                    ));
+                    cache.push((Reverse(distance), AlwaysEqual(norm), AlwaysEqual(first)));
                 }
                 cache.pop()
             })
@@ -257,7 +236,7 @@ where
             } else {
                 // fast path
                 let mut results = LinkedVec::new();
-                for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first), _) in lists {
+                for (Reverse(_), AlwaysEqual(_), AlwaysEqual(first)) in lists {
                     tape::read_h1_tape::<R, _, _>(
                         by_next(index, first),
                         || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
@@ -266,7 +245,6 @@ where
                                 Reverse(Distance::ZERO),
                                 AlwaysEqual(norm),
                                 AlwaysEqual(first),
-                                AlwaysEqual(None),
                             ));
                         },
                     );
@@ -286,14 +264,12 @@ where
     #[inline(always)]
     fn read_lists(
         &mut self,
-        lists: Vec<List<'b>>,
+        lists: Vec<List>,
         filter: impl Filter,
         mut callback: impl for<'a> FnMut(Row<'a, (f32, f32)>),
     ) -> u64 {
         let Self {
             index,
-            ref vector,
-            dim,
             is_residual,
             ref lut,
             ref mut prefetch_h0_tuples,
@@ -312,28 +288,13 @@ where
             list: Cell::new(0),
         };
         let mut tuples = 0;
-        for (i, (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first), AlwaysEqual(location))) in
+        for (i, (Reverse(dis_f), AlwaysEqual(norm), AlwaysEqual(first))) in
             lists.into_iter().enumerate()
         {
             // Between lists nothing is locked (#28).
             index::interrupt::check();
             ahead.begin(i);
-            // Residual bounds add `dis_f` with no error budget, so routing's estimate will not do.
-            let dis_f = if is_residual && !O::routing_is_exact() {
-                let (head, prefetch) = location.expect("internal: residual probe without location");
-                centroids::read::<R, O, _>(
-                    prefetch.map(|id| index.read(id)),
-                    head,
-                    LAccess::new(
-                        O::Vector::unpack(vector.borrow().as_borrowed()),
-                        O::DistanceAccessor::default_with_dimension(dim),
-                    ),
-                )
-            } else {
-                dis_f
-            }
-            .to_f32();
-            let residual = is_residual.then(|| O::residual(&lut.0, dis_f, norm));
+            let residual = is_residual.then(|| O::residual(&lut.0, dis_f.to_f32(), norm));
             let jump_guard = ahead.read(first);
             let jump_bytes = jump_guard.get(1).expect("data corruption");
             let jump_tuple = JumpTuple::deserialize_ref(jump_bytes);
@@ -389,7 +350,7 @@ where
 
     fn read(
         &mut self,
-        lists: Vec<List<'b>>,
+        lists: Vec<List>,
         filter: impl Filter,
         bound: impl Bound,
     ) -> Heap<Candidate<'b>> {
@@ -709,7 +670,7 @@ where
     let mut estimation_by_threshold = Distance::NEG_INFINITY;
     // Remaining routing distances only estimate missing MaxSim terms; they are
     // not lower bounds and never reach the reranker.
-    for (Reverse(distance), AlwaysEqual(_), AlwaysEqual(first), _) in rest {
+    for (Reverse(distance), AlwaysEqual(_), AlwaysEqual(first)) in rest {
         if threshold == 0 {
             break;
         }

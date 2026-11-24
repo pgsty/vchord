@@ -343,7 +343,7 @@ impl Accessor2<f32, f32, (), ()> for DistanceAccessor<VectOwned<f32>, L2S> {
 
     #[inline(always)]
     fn finish(self, (): (), (): ()) -> Self::Output {
-        Distance::from_f32(self.0)
+        Distance::from_f32_non_nan(self.0)
     }
 }
 
@@ -371,7 +371,7 @@ impl Accessor2<f16, f16, (), ()> for DistanceAccessor<VectOwned<f16>, L2S> {
 
     #[inline(always)]
     fn finish(self, (): (), (): ()) -> Self::Output {
-        Distance::from_f32(self.0)
+        Distance::from_f32_non_nan(self.0)
     }
 }
 
@@ -385,7 +385,7 @@ impl Accessor2<f16, f16, (), ()> for DistanceAccessor<VectOwned<f16>, Dot> {
 
     #[inline(always)]
     fn finish(self, (): (), (): ()) -> Self::Output {
-        Distance::from_f32(-self.0)
+        Distance::from_f32_non_nan(-self.0)
     }
 }
 
@@ -399,7 +399,7 @@ impl Accessor2<f16, f16, (), ()> for DistanceAccessor<VectOwned<f16>, Approximat
 
     #[inline(always)]
     fn finish(self, (): (), (): ()) -> Self::Output {
-        Distance::from_f32(self.0)
+        Distance::from_f32_non_nan(self.0)
     }
 }
 

@@ -422,21 +422,6 @@ pub trait Operator: 'static + Debug + Copy {
     /// added to every candidate's lower bound with no error budget (a vector
     /// equal to its centroid has `err = 0`), and the reranker emits a result
     /// once no unvisited lower bound is smaller.
-    type RoutingAccessor: DefaultWithDimension
-        + Accessor2<
-            <Self::Vector as Vector>::Element,
-            <Self::Vector as Vector>::Element,
-            <Self::Vector as Vector>::Metadata,
-            <Self::Vector as Vector>::Metadata,
-            Output = Distance,
-        >;
-
-    /// Whether `RoutingAccessor` returns exactly what `DistanceAccessor`
-    /// returns on this CPU. If not, residual search recomputes the selected
-    /// centroids' distances with `DistanceAccessor` before using them as
-    /// `dis_f`.
-    fn routing_is_exact() -> bool;
-
     /// Centered on the query's projection on the centroid; L2 cannot be, lacking `<r, c>`.
     fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual;
 
@@ -476,12 +461,6 @@ impl Operator for Op<VectOwned<f32>, L2S> {
     type Vector = VectOwned<f32>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f32>, L2S>;
-
-    type RoutingAccessor = Self::DistanceAccessor;
-
-    fn routing_is_exact() -> bool {
-        true
-    }
 
     fn residual(_lut: &BlockLut, dis_f: f32, _norm: f32) -> Residual {
         Residual::l2(dis_f)
@@ -561,12 +540,6 @@ impl Operator for Op<VectOwned<f32>, Dot> {
     type Vector = VectOwned<f32>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f32>, Dot>;
-
-    type RoutingAccessor = Self::DistanceAccessor;
-
-    fn routing_is_exact() -> bool {
-        true
-    }
 
     fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
         Residual::dot(lut, dis_f, norm, rabitq::bit::projection(dis_f, norm))
@@ -649,16 +622,22 @@ impl Operator for Op<VectOwned<f32>, Dot> {
 impl Operator for Op<VectOwned<f16>, L2S> {
     type Vector = VectOwned<f16>;
 
-    type DistanceAccessor = DistanceAccessor<VectOwned<f16>, L2S>;
-
-    type RoutingAccessor = DistanceAccessor<VectOwned<f16>, ApproximateL2S>;
-
-    fn routing_is_exact() -> bool {
-        f16::reduce_sum_of_d2_approx_is_exact()
-    }
+    type DistanceAccessor = DistanceAccessor<VectOwned<f16>, ApproximateL2S>;
 
     fn residual(_lut: &BlockLut, dis_f: f32, _norm: f32) -> Residual {
-        Residual::l2(dis_f)
+        if f16::reduce_sum_of_d2_approx_is_exact() {
+            Residual::l2(dis_f)
+        } else {
+            // `reduce_sum_of_d2_approx` rounds `q - c` to f16 (rel error <= 2^-11):
+            // scale `dis_f` down and `norm` up so lower bounds hold without re-reading centroids.
+            const LOWER: f32 = 1.0 / ((1.0 + 1.0 / 2048.0) * (1.0 + 1.0 / 2048.0));
+            const UPPER: f32 = 1.0 / (1.0 - 1.0 / 2048.0);
+            Residual {
+                dis_f: dis_f * LOWER,
+                lambda: 1.0,
+                norm: dis_f.sqrt() * UPPER,
+            }
+        }
     }
 
     fn block_access(
@@ -736,12 +715,6 @@ impl Operator for Op<VectOwned<f16>, Dot> {
     type Vector = VectOwned<f16>;
 
     type DistanceAccessor = DistanceAccessor<VectOwned<f16>, Dot>;
-
-    type RoutingAccessor = Self::DistanceAccessor;
-
-    fn routing_is_exact() -> bool {
-        true
-    }
 
     fn residual(lut: &BlockLut, dis_f: f32, norm: f32) -> Residual {
         Residual::dot(lut, dis_f, norm, rabitq::bit::projection(dis_f, norm))
@@ -827,12 +800,6 @@ impl Operator for Op<Rabitq8Owned, L2S> {
 
     type DistanceAccessor = ByteDistanceAccessor<Rabitq8Owned, L2S>;
 
-    type RoutingAccessor = Self::DistanceAccessor;
-
-    fn routing_is_exact() -> bool {
-        true
-    }
-
     fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
         unreachable!("residual quantization is not supported for rabitq8")
     }
@@ -883,12 +850,6 @@ impl Operator for Op<Rabitq8Owned, Dot> {
     type Vector = Rabitq8Owned;
 
     type DistanceAccessor = ByteDistanceAccessor<Rabitq8Owned, Dot>;
-
-    type RoutingAccessor = Self::DistanceAccessor;
-
-    fn routing_is_exact() -> bool {
-        true
-    }
 
     fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
         unreachable!("residual quantization is not supported for rabitq8")
@@ -941,12 +902,6 @@ impl Operator for Op<Rabitq4Owned, L2S> {
 
     type DistanceAccessor = HalfbyteDistanceAccessor<Rabitq4Owned, L2S>;
 
-    type RoutingAccessor = Self::DistanceAccessor;
-
-    fn routing_is_exact() -> bool {
-        true
-    }
-
     fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
         unreachable!("residual quantization is not supported for rabitq4")
     }
@@ -997,12 +952,6 @@ impl Operator for Op<Rabitq4Owned, Dot> {
     type Vector = Rabitq4Owned;
 
     type DistanceAccessor = HalfbyteDistanceAccessor<Rabitq4Owned, Dot>;
-
-    type RoutingAccessor = Self::DistanceAccessor;
-
-    fn routing_is_exact() -> bool {
-        true
-    }
 
     fn residual(_: &BlockLut, _: f32, _: f32) -> Residual {
         unreachable!("residual quantization is not supported for rabitq4")
