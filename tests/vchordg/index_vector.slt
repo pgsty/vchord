@@ -1,3 +1,7 @@
+# A fixed insertion order makes the expected graph neighbours reproducible.
+statement ok
+SET max_parallel_maintenance_workers = 0;
+
 statement ok
 SET enable_seqscan TO off;
 
@@ -136,3 +140,6 @@ DROP INDEX ti;
 
 statement ok
 DROP TABLE t;
+
+statement ok
+RESET max_parallel_maintenance_workers;

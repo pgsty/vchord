@@ -1,6 +1,6 @@
 # vchordg edge repair (#21): when the two-level repair would leave a vertex
 # without a live neighbour, VACUUM keeps expanding through deleted vertices
-# (without a limit for the start vertex, through which every search enters)
+# within a larger budget for the start vertex, through which searches enter,
 # instead of writing an empty neighbour list.
 
 # Clustered delete: the start vertex lies in a deleted cluster. Before the
