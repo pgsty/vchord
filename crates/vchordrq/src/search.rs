@@ -280,7 +280,7 @@ where
     }
 
     /// Returns how many rows the lists hold.
-    // Inlined with its callback, whose per-row work is most of a scan's.
+    // Inlined with its per-row callback; tapes take it by `&mut` so `#[inline(always)]` holds.
     #[inline(always)]
     fn read_lists(
         &mut self,
@@ -390,30 +390,91 @@ where
         lists: Vec<List<'b>>,
         filter: impl Filter,
         bump: &'a impl Bump,
-        bound: Option<Distance>,
+        bound: impl Bound,
     ) -> Candidates<'a> {
         let epsilon = self.epsilon;
         let mut results = LinkedVec::new();
         self.read_lists(
             lists,
             filter,
-            id_2(|row| {
-                let (rough, err) = row.value;
-                let lowerbound = Distance::from_f32(rough - err * epsilon);
-                if bound.is_some_and(|radius| lowerbound >= radius) {
-                    return;
-                }
-                results.push((
-                    (Reverse(lowerbound), AlwaysEqual(())),
-                    AlwaysEqual(PackedRefMut4(bump.alloc((
-                        row.payload,
-                        row.head,
-                        BorrowedIter::from_slice(row.prefetch, |x| bump.alloc_slice(x)),
-                    )))),
-                ));
-            }),
+            id_2(
+                #[inline(always)]
+                |row| {
+                    let (rough, err) = row.value;
+                    let lowerbound = Distance::from_f32(rough - err * epsilon);
+                    if !bound.admits(lowerbound) {
+                        return;
+                    }
+                    results.push((
+                        (Reverse(lowerbound), AlwaysEqual(())),
+                        AlwaysEqual(PackedRefMut4(bump.alloc((
+                            row.payload,
+                            row.head,
+                            BorrowedIter::from_slice(row.prefetch, |x| bump.alloc_slice(x)),
+                        )))),
+                    ));
+                },
+            ),
         );
         Heap::from(results.into_vec())
+    }
+
+    /// The rest of [`default_search`], with the bound chosen at compile time.
+    #[inline(always)]
+    fn search(mut self, params: SearchParams, bound: impl Bound) -> Search<'b>
+    where
+        Self: 'b,
+    {
+        let bump = self.bump;
+        let SearchParams {
+            mut probes,
+            filter,
+            max_probes,
+            ..
+        } = params;
+        let Route {
+            lists,
+            mut complete,
+            rest,
+        } = self.route(&probes, false);
+        let Some(filter) = filter else {
+            return Search::Single(self.read(lists, (), bump, bound));
+        };
+        let max_probes = max_probes.map_or(usize::MAX, |x| x as usize);
+        if complete || lists.len() >= max_probes {
+            return Search::Single(self.read(lists, &filter, bump, bound));
+        }
+        let mut read = lists.iter().map(|list| list.2.0).collect::<HashSet<_>>();
+        let mut pending = lists.into_iter();
+        // Below a root alone, routing's ranking of every list gives each round its further lists.
+        let mut rest = (probes.len() == 1).then_some(rest);
+        Search::Refill(Box::new(move |scratch| {
+            if let Some(list) = pending.next() {
+                return Some(self.read(vec![list], &filter, scratch, bound));
+            }
+            while !complete && read.len() < max_probes {
+                for x in probes.iter_mut() {
+                    *x = x.saturating_mul(2).max(1);
+                }
+                let mut lists = if let Some(rest) = rest.as_mut() {
+                    complete = probes[0] >= self.cells[0];
+                    rest.take(probes[0] as usize - read.len()).collect()
+                } else {
+                    let route = self.route(&probes, false);
+                    complete = route.complete;
+                    let mut lists = route.lists;
+                    lists.retain(|list| !read.contains(&list.2.0));
+                    lists
+                };
+                lists.truncate(max_probes - read.len());
+                read.extend(lists.iter().map(|list| list.2.0));
+                pending = lists.into_iter();
+                if let Some(list) = pending.next() {
+                    return Some(self.read(vec![list], &filter, scratch, bound));
+                }
+            }
+            None
+        }))
     }
 }
 
@@ -521,6 +582,25 @@ pub enum Search<'b> {
     Refill(Refill<'b>),
 }
 
+/// A sphere's radius, which a candidate's lower bound must stay under, or `()` for no sphere.
+trait Bound: Copy + 'static {
+    fn admits(self, lowerbound: Distance) -> bool;
+}
+
+impl Bound for () {
+    #[inline(always)]
+    fn admits(self, _: Distance) -> bool {
+        true
+    }
+}
+
+impl Bound for Distance {
+    #[inline(always)]
+    fn admits(self, lowerbound: Distance) -> bool {
+        lowerbound < self
+    }
+}
+
 /// Candidates past `bound` are dropped; with a filter, refills double the probes to `max_probes`.
 // Inlined into each scanner arm, which compiles the halfvec search to fewer instructions.
 #[inline(always)]
@@ -536,7 +616,7 @@ pub fn default_search<'b, R: RelationRead, O: Operator>(
 where
     R::Page: Page<Opaque = Opaque>,
 {
-    let mut searcher = Searcher::<_, O, _, _, _, _>::new(
+    let searcher = Searcher::<_, O, _, _, _, _>::new(
         index,
         vector,
         &params,
@@ -544,55 +624,10 @@ where
         prefetch_h1_vectors,
         prefetch_h0_tuples,
     );
-    let SearchParams {
-        mut probes,
-        filter,
-        max_probes,
-        ..
-    } = params;
-    let Route {
-        lists,
-        mut complete,
-        rest,
-    } = searcher.route(&probes, false);
-    let Some(filter) = filter else {
-        return Search::Single(searcher.read(lists, (), bump, bound));
-    };
-    let max_probes = max_probes.map_or(usize::MAX, |x| x as usize);
-    if complete || lists.len() >= max_probes {
-        return Search::Single(searcher.read(lists, &filter, bump, bound));
+    match bound {
+        Some(radius) => searcher.search(params, radius),
+        None => searcher.search(params, ()),
     }
-    let mut read = lists.iter().map(|list| list.2.0).collect::<HashSet<_>>();
-    let mut pending = lists.into_iter();
-    // Below a root alone, routing's ranking of every list gives each round its further lists.
-    let mut rest = (probes.len() == 1).then_some(rest);
-    Search::Refill(Box::new(move |scratch| {
-        if let Some(list) = pending.next() {
-            return Some(searcher.read(vec![list], &filter, scratch, bound));
-        }
-        while !complete && read.len() < max_probes {
-            for x in probes.iter_mut() {
-                *x = x.saturating_mul(2).max(1);
-            }
-            let mut lists = if let Some(rest) = rest.as_mut() {
-                complete = probes[0] >= searcher.cells[0];
-                rest.take(probes[0] as usize - read.len()).collect()
-            } else {
-                let route = searcher.route(&probes, false);
-                complete = route.complete;
-                let mut lists = route.lists;
-                lists.retain(|list| !read.contains(&list.2.0));
-                lists
-            };
-            lists.truncate(max_probes - read.len());
-            read.extend(lists.iter().map(|list| list.2.0));
-            pending = lists.into_iter();
-            if let Some(list) = pending.next() {
-                return Some(searcher.read(vec![list], &filter, scratch, bound));
-            }
-        }
-        None
-    }))
 }
 
 pub fn maxsim_search<'b, R: RelationRead, O: Operator>(

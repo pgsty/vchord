@@ -328,7 +328,7 @@ pub fn read_frozen_tape<'b, R, A, T>(
     mut blocks: impl Blocks,
     accessor: impl Fn() -> A,
     filter: impl Filter,
-    mut callback: impl for<'a> FnMut(Row<'a, T>),
+    callback: &mut impl for<'a> FnMut(Row<'a, T>),
 ) where
     R: RelationRead + 'b,
     A: for<'a> Accessor1<[u8; 16], (&'a [[f32; 32]; 4], &'a [f32; 32]), Output = [T; 32]>,
@@ -576,7 +576,7 @@ pub fn read_appendable_tape<'b, R, T>(
     mut skip: u16,
     mut access: impl for<'a> FnMut([f32; 4], &'a [u64], f32) -> T,
     filter: impl Filter,
-    mut callback: impl for<'a> FnMut(Row<'a, T>),
+    callback: &mut impl for<'a> FnMut(Row<'a, T>),
 ) where
     R: RelationRead + 'b,
 {

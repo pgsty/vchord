@@ -92,7 +92,7 @@ where
                     tape::All,
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                     (),
-                    id_2(|_| {
+                    &mut id_2(|_| {
                         results.push(());
                     }),
                 );
@@ -102,7 +102,7 @@ where
                     tape::All,
                     || FunctionalAccessor::new((), id_0(|_, _| ()), id_1(|_, _| [(); _])),
                     (),
-                    id_2(|_| {
+                    &mut id_2(|_| {
                         results.push(());
                     }),
                 );
@@ -112,7 +112,7 @@ where
                 0,
                 |_, _, _| (),
                 (),
-                id_2(|_| {
+                &mut id_2(|_| {
                     results.push(());
                 }),
             );
